@@ -149,3 +149,15 @@ def test_load_config_rejects_non_boolean_resume(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="runtime.resume"):
         load_config(config_path)
+
+
+def test_load_config_rejects_noncanonical_min_q_override(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("min_q: 1.0e-30", "min_q: 1.0e-20"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"curvature.min_q.*1e-30"):
+        load_config(config_path)

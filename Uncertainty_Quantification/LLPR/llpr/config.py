@@ -187,9 +187,9 @@ def load_config(path: Path) -> LLPRConfig:
     try:
         min_q = float(curvature_data.get("min_q", 1.0e-30))
     except (TypeError, ValueError) as error:
-        raise ValueError("curvature.min_q must be a positive, finite float") from error
-    if not math.isfinite(min_q) or min_q <= 0:
-        raise ValueError("curvature.min_q must be a positive, finite float")
+        raise ValueError("curvature.min_q must be the fixed positive floor 1e-30") from error
+    if not math.isfinite(min_q) or min_q != 1.0e-30:
+        raise ValueError("curvature.min_q must be the fixed positive floor 1e-30")
     curvature = CurvatureConfig(
         variants=variants,
         min_q=min_q,
