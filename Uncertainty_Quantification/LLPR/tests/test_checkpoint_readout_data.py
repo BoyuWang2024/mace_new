@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from mace.modules.models import ScaleShiftMACE as RealScaleShiftMACE
 
 from Uncertainty_Quantification.LLPR.llpr.artifacts import sha256_file
 from Uncertainty_Quantification.LLPR.llpr.checkpoint import load_checkpoint
@@ -28,6 +29,21 @@ class ScaleShiftMACE(torch.nn.Module):
         self.register_buffer("r_max", torch.tensor(6.0))
         self.register_buffer("atomic_numbers", torch.tensor([1, 8]))
         self.heads = ["default"]
+
+
+def _real_checkpoint_model(
+    *,
+    readout_size: int = 2192,
+    heads: list[str] | None = None,
+    r_max: float = 6.0,
+) -> RealScaleShiftMACE:
+    model = RealScaleShiftMACE.__new__(RealScaleShiftMACE)
+    torch.nn.Module.__init__(model)
+    model.readouts = torch.nn.ModuleList([torch.nn.Linear(readout_size - 1, 1)])
+    model.register_buffer("r_max", torch.tensor(r_max))
+    model.register_buffer("atomic_numbers", torch.tensor([1, 8]))
+    model.heads = ["default"] if heads is None else heads
+    return model
 
 
 def _write_one_structure(path: Path, *, structure_id: str | None = None) -> None:
@@ -73,7 +89,7 @@ def test_discover_readout_rejects_wrong_expected_size() -> None:
 
 def test_load_checkpoint_builds_validated_identity(tmp_path: Path) -> None:
     path = tmp_path / "model.pt"
-    torch.save(ScaleShiftMACE(), path)
+    torch.save(_real_checkpoint_model(), path)
 
     loaded = load_checkpoint(
         PathIdentity(path=path, expected_sha256=sha256_file(path)),
@@ -89,6 +105,63 @@ def test_load_checkpoint_builds_validated_identity(tmp_path: Path) -> None:
     assert loaded.identity.r_max == 6.0
     assert loaded.identity.atomic_numbers == (1, 8)
     assert loaded.identity.dtype == torch.float32
+
+
+def test_load_checkpoint_rejects_wrong_readout_size(tmp_path: Path) -> None:
+    path = tmp_path / "model.pt"
+    torch.save(_real_checkpoint_model(readout_size=7), path)
+
+    with pytest.raises(ValueError, match=r"readout size.*2192"):
+        load_checkpoint(PathIdentity(path), torch.device("cpu"))
+
+
+def test_load_checkpoint_rejects_same_name_fake_class(tmp_path: Path) -> None:
+    path = tmp_path / "model.pt"
+    torch.save(ScaleShiftMACE(), path)
+
+    with pytest.raises(ValueError, match="ScaleShiftMACE"):
+        load_checkpoint(PathIdentity(path), torch.device("cpu"))
+
+
+def test_load_checkpoint_rejects_non_default_selection(tmp_path: Path) -> None:
+    path = tmp_path / "model.pt"
+    torch.save(_real_checkpoint_model(heads=["default", "other"]), path)
+
+    with pytest.raises(ValueError, match="selected_head.*default"):
+        load_checkpoint(
+            PathIdentity(path),
+            torch.device("cpu"),
+            selected_head="other",
+        )
+
+
+def test_load_checkpoint_rejects_missing_default_head(tmp_path: Path) -> None:
+    path = tmp_path / "model.pt"
+    torch.save(_real_checkpoint_model(heads=["other"]), path)
+
+    with pytest.raises(ValueError, match="default"):
+        load_checkpoint(PathIdentity(path), torch.device("cpu"))
+
+
+def test_load_checkpoint_rejects_wrong_r_max(tmp_path: Path) -> None:
+    path = tmp_path / "model.pt"
+    torch.save(_real_checkpoint_model(r_max=5.0), path)
+
+    with pytest.raises(ValueError, match="r_max"):
+        load_checkpoint(PathIdentity(path), torch.device("cpu"))
+
+
+def test_load_checkpoint_rejects_wrong_sha_before_deserialization(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "not-a-checkpoint.pt"
+    path.write_bytes(b"not a checkpoint")
+
+    with pytest.raises(ValueError, match="SHA256"):
+        load_checkpoint(
+            PathIdentity(path, expected_sha256="0" * 64),
+            torch.device("cpu"),
+        )
 
 
 def test_build_dataset_rejects_wrong_sha_before_parsing(tmp_path: Path) -> None:
