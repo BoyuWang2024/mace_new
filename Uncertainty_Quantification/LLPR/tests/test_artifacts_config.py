@@ -123,3 +123,29 @@ def test_sha256_file_matches_known_literal(tmp_path: Path) -> None:
         == "ba7816bf8f01cfea414140de5dae2223"
         "b00361a396177a9cb410ff61f20015ad"
     )
+
+@pytest.mark.parametrize("min_q", ["0.0", "-1.0", ".nan", ".inf"])
+def test_load_config_rejects_non_positive_or_non_finite_min_q(
+    tmp_path: Path, min_q: str
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("min_q: 1.0e-30", f"min_q: {min_q}"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="curvature.min_q"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_non_boolean_resume(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace("resume: true", 'resume: "false"'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="runtime.resume"):
+        load_config(config_path)

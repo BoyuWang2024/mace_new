@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
@@ -151,6 +152,9 @@ def load_config(path: Path) -> LLPRConfig:
     chunk_size = runtime_data.get("force_component_chunk_size", 1)
     if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
         raise ValueError("runtime.force_component_chunk_size must be a positive integer")
+    resume = runtime_data.get("resume", False)
+    if not isinstance(resume, bool):
+        raise ValueError("runtime.resume must be a boolean")
     runtime = RuntimeConfig(
         device=str(runtime_data.get("device", "cpu")),
         force_component_chunk_size=chunk_size,
@@ -158,7 +162,7 @@ def load_config(path: Path) -> LLPRConfig:
             runtime_data.get("save_every_structures", 1), "runtime.save_every_structures"
         )
         or 1,
-        resume=bool(runtime_data.get("resume", False)),
+        resume=resume,
         max_structures=_optional_positive_int(
             runtime_data.get("max_structures"), "runtime.max_structures"
         ),
@@ -180,9 +184,15 @@ def load_config(path: Path) -> LLPRConfig:
     variants = tuple(curvature_data.get("variants", _CANONICAL_CURVATURE_VARIANTS))
     if variants != _CANONICAL_CURVATURE_VARIANTS:
         raise ValueError("curvature.variants must be [he, hf, hef]")
+    try:
+        min_q = float(curvature_data.get("min_q", 1.0e-30))
+    except (TypeError, ValueError) as error:
+        raise ValueError("curvature.min_q must be a positive, finite float") from error
+    if not math.isfinite(min_q) or min_q <= 0:
+        raise ValueError("curvature.min_q must be a positive, finite float")
     curvature = CurvatureConfig(
         variants=variants,
-        min_q=float(curvature_data.get("min_q", 1.0e-30)),
+        min_q=min_q,
     )
 
     return LLPRConfig(
