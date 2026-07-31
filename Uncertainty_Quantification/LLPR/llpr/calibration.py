@@ -29,7 +29,7 @@ from .curvature import run_root
 from .data import DatasetHandle, build_dataset, iter_samples
 from .observables import compute_structure_jacobians
 from .readout import ReadoutLayout, discover_readout_layout
-from .ridge import RidgeRecord, choose_ridge
+from .ridge import RidgeRecord, condition_number_ridge
 
 
 _VARIANTS = ("he", "hf", "hef")
@@ -274,6 +274,152 @@ def _matching_identity(actual: Mapping[str, Any], expected: Mapping[str, Any]) -
     return canonical_json(actual) == canonical_json(expected)
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _load_strict_json(path: Path) -> Any:
+    try:
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError("complete calibration diagnostics are invalid strict JSON") from error
+
+
+def _finite_number(value: Any, field: str, *, non_negative: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"complete calibration diagnostics {field} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or (non_negative and result < 0.0):
+        raise ValueError(f"complete calibration diagnostics {field} must be finite")
+    return result
+
+
+def _close_float(actual: float, expected: float) -> bool:
+    return math.isclose(actual, expected, rel_tol=1.0e-12, abs_tol=1.0e-15)
+
+
+def _validate_complete_row_counts(
+    progress: Mapping[str, Any], target_structures: int
+) -> None:
+    structures = progress["structures"]
+    if structures != target_structures or structures <= 0:
+        raise ValueError("complete calibration row count disagrees with structures")
+    accumulators = progress["accumulators"]
+    energy_rows = [accumulators[variant]["energy"]["rows"] for variant in _VARIANTS]
+    if any(rows != structures for rows in energy_rows):
+        raise ValueError("complete calibration energy row count must equal structures")
+    force_rows = [accumulators[variant]["forces"]["rows"] for variant in _VARIANTS]
+    if any(rows <= 0 for rows in force_rows) or len(set(force_rows)) != 1:
+        raise ValueError("complete calibration force row count mismatch across variants")
+
+
+def _validate_record_keys(records: Any) -> None:
+    if not isinstance(records, list) or len(records) != 6:
+        raise ValueError("complete calibration artifact records must contain six rows")
+    keys: list[tuple[Any, Any]] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise ValueError("complete calibration artifact record must be a mapping")
+        key = (record.get("variant"), record.get("target"))
+        keys.append(key)
+        rows = record.get("rows")
+        if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
+            raise ValueError("complete calibration record row count must be positive")
+        for field in ("ridge", "alpha", "mean_residual_squared_over_q"):
+            value = record.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ValueError(f"complete calibration record {field} is invalid")
+    expected = {(variant, target) for variant in _VARIANTS for target in _TARGETS}
+    if len(set(keys)) != 6 or set(keys) != expected:
+        raise ValueError("complete calibration record keys must be unique")
+
+
+def _validate_ridge_diagnostics(
+    diagnostics: Any,
+    identity: Mapping[str, Any],
+    ridges: Mapping[str, RidgeRecord],
+    spectra: Mapping[str, tuple[float, float]],
+) -> None:
+    if not isinstance(diagnostics, Mapping) or set(diagnostics) != {
+        "identity",
+        "status",
+        "variants",
+    }:
+        raise ValueError("complete calibration diagnostics schema mismatch")
+    diagnostics_identity = diagnostics.get("identity")
+    if not isinstance(diagnostics_identity, Mapping):
+        raise ValueError("complete calibration diagnostics identity mismatch")
+    require_identity(diagnostics_identity, identity)
+    if diagnostics.get("status") != "complete":
+        raise ValueError("complete calibration diagnostics status mismatch")
+    source_variants = diagnostics.get("variants")
+    if not isinstance(source_variants, Mapping) or set(source_variants) != set(_VARIANTS):
+        raise ValueError("complete calibration diagnostics variants mismatch")
+
+    fields = {
+        "ridge_mode",
+        "ridge",
+        "eigenvalue_min",
+        "eigenvalue_max",
+        "regularized_condition_number",
+    }
+    for variant in _VARIANTS:
+        source = source_variants[variant]
+        if not isinstance(source, Mapping) or set(source) != fields:
+            raise ValueError("complete calibration diagnostics variant schema mismatch")
+        ridge = ridges[variant]
+        if source.get("ridge_mode") != ridge.mode:
+            raise ValueError("complete calibration diagnostics ridge mode mismatch")
+        stored_ridge = _finite_number(source.get("ridge"), "ridge", non_negative=True)
+        if not _close_float(stored_ridge, ridge.value):
+            raise ValueError("complete calibration diagnostics ridge mismatch")
+        minimum = _finite_number(source.get("eigenvalue_min"), "eigenvalue_min")
+        maximum = _finite_number(source.get("eigenvalue_max"), "eigenvalue_max")
+        if maximum < minimum and not _close_float(maximum, minimum):
+            raise ValueError("complete calibration diagnostics eigenvalue range mismatch")
+        if variant in spectra:
+            expected_minimum, expected_maximum = spectra[variant]
+            if not _close_float(minimum, expected_minimum) or not _close_float(
+                maximum, expected_maximum
+            ):
+                raise ValueError("complete calibration diagnostics eigenvalues mismatch")
+        regularized_minimum = minimum + stored_ridge
+        regularized_maximum = maximum + stored_ridge
+        expected_condition = (
+            regularized_maximum / regularized_minimum
+            if regularized_minimum > 0.0
+            else None
+        )
+        condition = source.get("regularized_condition_number")
+        if expected_condition is None:
+            if condition is not None:
+                raise ValueError("complete calibration diagnostics condition mismatch")
+        else:
+            stored_condition = _finite_number(
+                condition, "regularized_condition_number", non_negative=True
+            )
+            if not _close_float(stored_condition, expected_condition):
+                raise ValueError("complete calibration diagnostics condition mismatch")
+
+
 def _validate_complete_artifacts(
     artifact_path: Path,
     csv_path: Path,
@@ -281,7 +427,7 @@ def _validate_complete_artifacts(
     identity: Mapping[str, Any],
     progress: Mapping[str, Any],
     ridges: Mapping[str, RidgeRecord],
-    variants: Mapping[str, Tensor],
+    spectra: Mapping[str, tuple[float, float]],
     target_structures: int,
 ) -> None:
     for path in (artifact_path, csv_path, diagnostics_path):
@@ -293,6 +439,7 @@ def _validate_complete_artifacts(
         or progress.get("structures") != target_structures
     ):
         raise ValueError("complete calibration progress count mismatch")
+    _validate_complete_row_counts(progress, target_structures)
 
     expected_records = _records_from_progress(progress, ridges)
     expected_rows = [asdict(record) for record in expected_records]
@@ -302,6 +449,7 @@ def _validate_complete_artifacts(
     require_identity(artifact.get("identity", {}), identity)
     if artifact.get("status") != "complete":
         raise ValueError("complete calibration artifact has an invalid status")
+    _validate_record_keys(artifact.get("records"))
     if canonical_json(artifact.get("records")) != canonical_json(expected_rows):
         raise ValueError("complete calibration artifact records mismatch")
 
@@ -339,13 +487,8 @@ def _validate_complete_artifacts(
     if canonical_json(csv_rows) != canonical_json(expected_rows):
         raise ValueError("complete calibration CSV records mismatch")
 
-    try:
-        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("complete calibration diagnostics are invalid") from error
-    expected_diagnostics = _ridge_diagnostics(identity, variants, ridges)
-    if canonical_json(diagnostics) != canonical_json(expected_diagnostics):
-        raise ValueError("complete calibration diagnostics mismatch")
+    diagnostics = _load_strict_json(diagnostics_path)
+    _validate_ridge_diagnostics(diagnostics, identity, ridges, spectra)
 
 
 def _atomic_csv_dump(path: Path, records: list[CalibrationRecord]) -> None:
@@ -374,16 +517,52 @@ def _atomic_csv_dump(path: Path, records: list[CalibrationRecord]) -> None:
         raise
 
 
+def _compute_spectra(
+    variants: Mapping[str, Tensor],
+) -> dict[str, tuple[float, float]]:
+    spectra: dict[str, tuple[float, float]] = {}
+    for variant in _VARIANTS:
+        eigenvalues = torch.linalg.eigvalsh(variants[variant])
+        spectra[variant] = (float(eigenvalues.min()), float(eigenvalues.max()))
+    return spectra
+
+
+def _select_ridges(
+    config: LLPRConfig,
+    variants: Mapping[str, Tensor],
+) -> tuple[dict[str, RidgeRecord], dict[str, tuple[float, float]]]:
+    if config.ridge.mode == "fixed":
+        return (
+            {
+                variant: RidgeRecord(mode="fixed", value=float(config.ridge.value))
+                for variant in _VARIANTS
+            },
+            {},
+        )
+    if config.ridge.mode != "condition_number":
+        raise ValueError(f"unsupported ridge mode: {config.ridge.mode}")
+    spectra = _compute_spectra(variants)
+    ridges = {
+        variant: RidgeRecord(
+            mode="condition_number",
+            value=condition_number_ridge(
+                torch.tensor(spectra[variant], dtype=torch.float64),
+                config.ridge.max_condition_number,
+            ),
+        )
+        for variant in _VARIANTS
+    }
+    return ridges, spectra
+
+
 def _ridge_diagnostics(
     identity: Mapping[str, Any],
-    variants: Mapping[str, Tensor],
+    spectra: Mapping[str, tuple[float, float]],
     ridges: Mapping[str, RidgeRecord],
 ) -> dict[str, Any]:
     diagnostics: dict[str, Any] = {}
     for variant in _VARIANTS:
-        eigenvalues = torch.linalg.eigvalsh(variants[variant])
-        minimum = float(eigenvalues.min())
-        maximum = float(eigenvalues.max())
+        minimum, maximum = spectra[variant]
         regularized_minimum = minimum + ridges[variant].value
         regularized_maximum = maximum + ridges[variant].value
         condition_number = (
@@ -454,10 +633,7 @@ def run_calibrate(config: LLPRConfig) -> Path:
     curvature_identity, variants = _load_curvature(
         curvature_path, loaded.identity, layout
     )
-    ridges = {
-        variant: choose_ridge(variants[variant], config.ridge)
-        for variant in _VARIANTS
-    }
+    ridges, spectra = _select_ridges(config, variants)
     identity = _calibration_identity(
         config, loaded.identity, dataset, curvature_identity, ridges
     )
@@ -475,18 +651,20 @@ def run_calibrate(config: LLPRConfig) -> Path:
     if config.runtime.max_structures is not None:
         target_structures = min(target_structures, config.runtime.max_structures)
 
+    internal_artifacts = (artifact_path, csv_path, diagnostics_path)
     progress: dict[str, Any] | None = None
+    if not progress_path.exists() and any(path.exists() for path in internal_artifacts):
+        raise ValueError("calibration artifact exists without progress")
     if progress_path.exists():
         candidate = load_torch_artifact(progress_path)
         if not isinstance(candidate, Mapping):
             raise ValueError("calibration progress must be a mapping")
         candidate_identity = candidate.get("identity", {})
-        if (
-            candidate.get("status") == "complete"
-            and isinstance(candidate_identity, Mapping)
-            and _matching_identity(candidate_identity, identity)
-        ):
-            _validate_progress(candidate)
+        if not isinstance(candidate_identity, Mapping):
+            raise ValueError("calibration progress identity mismatch")
+        require_identity(candidate_identity, identity)
+        _validate_progress(candidate)
+        if candidate.get("status") == "complete":
             _validate_complete_artifacts(
                 artifact_path,
                 csv_path,
@@ -494,13 +672,11 @@ def run_calibrate(config: LLPRConfig) -> Path:
                 identity,
                 candidate,
                 ridges,
-                variants,
+                spectra,
                 target_structures,
             )
             return artifact_path
         if config.runtime.resume:
-            require_identity(candidate_identity, identity)
-            _validate_progress(candidate)
             progress = dict(candidate)
 
     solvers = {
@@ -591,9 +767,11 @@ def run_calibrate(config: LLPRConfig) -> Path:
     }
     atomic_torch_save(artifact_path, artifact)
     _atomic_csv_dump(csv_path, records)
+    if not spectra:
+        spectra = _compute_spectra(variants)
     atomic_json_dump(
         diagnostics_path,
-        _ridge_diagnostics(identity, variants, ridges),
+        _ridge_diagnostics(identity, spectra, ridges),
     )
     progress["status"] = "complete"
     atomic_torch_save(progress_path, progress)

@@ -133,6 +133,40 @@ def _matching_identity(
     return canonical_json(actual) == canonical_json(expected)
 
 
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _load_strict_json(path: Path) -> Any:
+    try:
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ValueError("complete curvature diagnostics are invalid strict JSON") from error
+
+
+def _require_scale_aware_symmetry(matrix: Tensor, variant: str) -> None:
+    scale = max(1.0, float(matrix.abs().max()))
+    tolerance = 64.0 * torch.finfo(torch.float64).eps * scale
+    asymmetry = float((matrix - matrix.T).abs().max())
+    if asymmetry > tolerance:
+        raise ValueError(
+            f"complete curvature {variant} matrix must be symmetric"
+        )
+
+
 def _load_complete(
     artifact_path: Path,
     diagnostics_path: Path,
@@ -180,6 +214,7 @@ def _load_complete(
         ):
             raise ValueError(f"complete curvature {variant} matrix is invalid")
         variants[variant] = matrix
+        _require_scale_aware_symmetry(matrix, variant)
     if not torch.equal(variants["he"], progress["he"]) or not torch.equal(
         variants["hf"], progress["hf"]
     ):
@@ -187,10 +222,7 @@ def _load_complete(
     if not torch.equal(variants["hef"], variants["he"] + variants["hf"]):
         raise ValueError("complete curvature hef must equal he plus hf")
 
-    try:
-        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError("complete curvature diagnostics are invalid") from error
+    diagnostics = _load_strict_json(diagnostics_path)
     expected_diagnostics = {
         "identity": dict(identity),
         "status": "complete",
@@ -230,17 +262,20 @@ def run_build(config: LLPRConfig) -> Path:
     artifact_path = curvature_dir / "base_curvature.pt"
     diagnostics_path = curvature_dir / "diagnostics.json"
 
+    internal_artifacts = (artifact_path, diagnostics_path)
     progress: dict[str, Any] | None = None
+    if not progress_path.exists() and any(path.exists() for path in internal_artifacts):
+        raise ValueError("curvature artifact exists without progress")
     if progress_path.exists():
         candidate = load_torch_artifact(progress_path)
         if not isinstance(candidate, Mapping):
             raise ValueError("curvature progress must be a mapping")
         candidate_identity = candidate.get("identity", {})
-        if (
-            candidate.get("status") == "complete"
-            and _matching_identity(candidate_identity, identity)
-        ):
-            _validate_progress(candidate, layout.size)
+        if not isinstance(candidate_identity, Mapping):
+            raise ValueError("curvature progress identity mismatch")
+        require_identity(candidate_identity, identity)
+        _validate_progress(candidate, layout.size)
+        if candidate.get("status") == "complete":
             _load_complete(
                 artifact_path,
                 diagnostics_path,
@@ -251,8 +286,6 @@ def run_build(config: LLPRConfig) -> Path:
             )
             return artifact_path
         if config.runtime.resume:
-            require_identity(candidate_identity, identity)
-            _validate_progress(candidate, layout.size)
             progress = dict(candidate)
 
     loaded.model.to(requested_device)

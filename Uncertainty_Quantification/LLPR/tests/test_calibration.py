@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -408,3 +409,195 @@ def test_run_calibrate_rejects_resume_identity_mismatch(
     _install_fake_pipeline(monkeypatch, changed)
     with pytest.raises(ValueError, match="identity mismatch"):
         run_calibrate(changed)
+
+
+def test_run_calibrate_identity_mismatch_is_fail_closed_when_resume_is_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, resume=False)
+    calls: list[int] = []
+    _install_fake_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_calibrate(config)
+    calibration_dir = artifact_path.parent
+    progress_path = calibration_dir / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    progress["identity"]["formula_version"] = "wrong"
+    atomic_torch_save(progress_path, progress)
+    before = {path.name: path.read_bytes() for path in calibration_dir.iterdir()}
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        run_calibrate(config)
+
+    assert {path.name: path.read_bytes() for path in calibration_dir.iterdir()} == before
+    assert calls == [0]
+
+
+@pytest.mark.parametrize(
+    "orphan",
+    ("calibrations.pt", "calibrations.csv", "ridge_diagnostics.json"),
+)
+def test_run_calibrate_rejects_internal_artifact_without_progress_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    orphan: str,
+) -> None:
+    config = _config(tmp_path)
+    calls: list[int] = []
+    _install_fake_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_calibrate(config)
+    calibration_dir = artifact_path.parent
+    (calibration_dir / "progress.pt").unlink()
+    for name in (
+        "calibrations.pt",
+        "calibrations.csv",
+        "ridge_diagnostics.json",
+    ):
+        if name != orphan:
+            (calibration_dir / name).unlink()
+    before = {path.name: path.read_bytes() for path in calibration_dir.iterdir()}
+
+    with pytest.raises(ValueError, match="without progress"):
+        run_calibrate(config)
+
+    assert {path.name: path.read_bytes() for path in calibration_dir.iterdir()} == before
+    assert calls == [0]
+
+
+def test_fixed_complete_cache_performs_no_eigendecomposition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    artifact_path = run_calibrate(config)
+    real_eigvalsh = torch.linalg.eigvalsh
+    calls = 0
+
+    def counting_eigvalsh(matrix: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return real_eigvalsh(matrix)
+
+    monkeypatch.setattr(torch.linalg, "eigvalsh", counting_eigvalsh)
+
+    assert run_calibrate(config) == artifact_path
+    assert calls == 0
+
+
+@pytest.mark.parametrize("complete_cache", (False, True))
+def test_adaptive_calibration_performs_at_most_one_eigendecomposition_per_variant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    complete_cache: bool,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        ridge=RidgeConfig("condition_number", 0.0, 1.0e6),
+    )
+    _install_fake_pipeline(monkeypatch, config)
+    artifact_path = None
+    if complete_cache:
+        artifact_path = run_calibrate(config)
+    real_eigvalsh = torch.linalg.eigvalsh
+    calls = 0
+
+    def counting_eigvalsh(matrix: torch.Tensor) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        return real_eigvalsh(matrix)
+
+    monkeypatch.setattr(torch.linalg, "eigvalsh", counting_eigvalsh)
+    result = run_calibrate(config)
+
+    if artifact_path is not None:
+        assert result == artifact_path
+    assert 0 < calls <= 3
+
+
+def test_complete_cache_accepts_one_ulp_diagnostics_roundoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    artifact_path = run_calibrate(config)
+    diagnostics_path = artifact_path.parent / "ridge_diagnostics.json"
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    value = diagnostics["variants"]["he"]["eigenvalue_min"]
+    diagnostics["variants"]["he"]["eigenvalue_min"] = math.nextafter(
+        value, math.inf
+    )
+    diagnostics_path.write_text(json.dumps(diagnostics), encoding="utf-8")
+
+    assert run_calibrate(config) == artifact_path
+
+
+@pytest.mark.parametrize("tamper", ("all_energy_rows", "one_force_rows"))
+def test_run_calibrate_rejects_coordinated_row_count_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    artifact_path = run_calibrate(config)
+    calibration_dir = artifact_path.parent
+    progress_path = calibration_dir / "progress.pt"
+    csv_path = calibration_dir / "calibrations.csv"
+    progress = load_torch_artifact(progress_path)
+    artifact = load_torch_artifact(artifact_path)
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        csv_rows = list(csv.DictReader(handle))
+
+    affected = (
+        {(variant, "energy") for variant in ("he", "hf", "hef")}
+        if tamper == "all_energy_rows"
+        else {("he", "forces")}
+    )
+    for variant, target in affected:
+        accumulator = progress["accumulators"][variant][target]
+        accumulator["rows"] += 1
+        mean = float(accumulator["sum"]) / accumulator["rows"]
+        for row in artifact["records"]:
+            if (row["variant"], row["target"]) == (variant, target):
+                row["rows"] = accumulator["rows"]
+                row["mean_residual_squared_over_q"] = mean
+                row["alpha"] = math.sqrt(mean)
+        for row in csv_rows:
+            if (row["variant"], row["target"]) == (variant, target):
+                row["rows"] = str(accumulator["rows"])
+                row["mean_residual_squared_over_q"] = str(mean)
+                row["alpha"] = str(math.sqrt(mean))
+
+    atomic_torch_save(progress_path, progress)
+    atomic_torch_save(artifact_path, artifact)
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(csv_rows[0]))
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    with pytest.raises(ValueError, match="row count"):
+        run_calibrate(config)
+
+
+@pytest.mark.parametrize("invalid", ("duplicate", "non_finite"))
+def test_run_calibrate_strictly_rejects_invalid_diagnostics_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid: str,
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    artifact_path = run_calibrate(config)
+    diagnostics_path = artifact_path.parent / "ridge_diagnostics.json"
+    text = diagnostics_path.read_text(encoding="utf-8")
+    if invalid == "duplicate":
+        marker = '"status":"complete"'
+        assert marker in text
+        text = text.replace(marker, marker + ',"status":"complete"', 1)
+    else:
+        marker = '"eigenvalue_min":1.0'
+        assert marker in text
+        text = text.replace(marker, '"eigenvalue_min":NaN', 1)
+    diagnostics_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strict JSON"):
+        run_calibrate(config)

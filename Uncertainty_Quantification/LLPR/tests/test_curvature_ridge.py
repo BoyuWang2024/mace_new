@@ -424,3 +424,116 @@ def test_run_build_validates_complete_cache_on_cpu_before_requested_device(
 
     assert run_build(cuda_config) == artifact_path
     assert load_devices == [torch.device("cpu")]
+
+
+@pytest.mark.parametrize("variant", ("he", "hf", "hef"))
+def test_run_build_rejects_each_asymmetric_complete_variant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variant: str,
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    artifact_path = run_build(config)
+
+    artifact = load_torch_artifact(artifact_path)
+    artifact["variants"][variant][0, 1] += 0.25
+    atomic_torch_save(artifact_path, artifact)
+
+    with pytest.raises(ValueError, match=rf"{variant}.*symmetric"):
+        run_build(config)
+
+
+def test_run_build_accepts_scale_aware_float64_symmetry_roundoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    artifact_path = run_build(config)
+    progress_path = artifact_path.with_name("progress.pt")
+
+    artifact = load_torch_artifact(artifact_path)
+    progress = load_torch_artifact(progress_path)
+    rounded = torch.nextafter(
+        artifact["variants"]["he"][0, 1],
+        torch.tensor(float("inf"), dtype=torch.float64),
+    )
+    artifact["variants"]["he"][0, 1] = rounded
+    progress["he"][0, 1] = rounded
+    artifact["variants"]["hef"] = (
+        artifact["variants"]["he"] + artifact["variants"]["hf"]
+    )
+    atomic_torch_save(artifact_path, artifact)
+    atomic_torch_save(progress_path, progress)
+
+    assert run_build(config) == artifact_path
+
+
+def test_run_build_identity_mismatch_is_fail_closed_when_resume_is_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, resume=False)
+    calls: list[int] = []
+    _install_fake_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_build(config)
+    curvature_dir = artifact_path.parent
+    progress_path = curvature_dir / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    progress["identity"]["formula_version"] = "wrong"
+    atomic_torch_save(progress_path, progress)
+    before = {path.name: path.read_bytes() for path in curvature_dir.iterdir()}
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        run_build(config)
+
+    assert {path.name: path.read_bytes() for path in curvature_dir.iterdir()} == before
+    assert calls == [0, 1]
+
+
+@pytest.mark.parametrize("orphan", ("base_curvature.pt", "diagnostics.json"))
+def test_run_build_rejects_internal_artifact_without_progress_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    orphan: str,
+) -> None:
+    config = _config(tmp_path)
+    calls: list[int] = []
+    _install_fake_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_build(config)
+    curvature_dir = artifact_path.parent
+    (curvature_dir / "progress.pt").unlink()
+    for name in ("base_curvature.pt", "diagnostics.json"):
+        if name != orphan:
+            (curvature_dir / name).unlink()
+    before = {path.name: path.read_bytes() for path in curvature_dir.iterdir()}
+
+    with pytest.raises(ValueError, match="without progress"):
+        run_build(config)
+
+    assert {path.name: path.read_bytes() for path in curvature_dir.iterdir()} == before
+    assert calls == [0, 1]
+
+
+@pytest.mark.parametrize("invalid", ("duplicate", "non_finite"))
+def test_run_build_strictly_rejects_invalid_diagnostics_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid: str,
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    artifact_path = run_build(config)
+    diagnostics_path = artifact_path.with_name("diagnostics.json")
+    text = diagnostics_path.read_text(encoding="utf-8")
+    if invalid == "duplicate":
+        marker = '"status":"complete"'
+        assert marker in text
+        text = text.replace(marker, marker + ',"status":"complete"', 1)
+    else:
+        marker = '"matrix_size":2'
+        assert marker in text
+        text = text.replace(marker, '"matrix_size":NaN', 1)
+    diagnostics_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="strict JSON"):
+        run_build(config)
