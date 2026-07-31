@@ -18,7 +18,6 @@ from .artifacts import (
     SCHEMA_VERSION,
     atomic_json_dump,
     atomic_torch_save,
-    canonical_json,
     load_torch_artifact,
     require_identity,
     sha256_file,
@@ -416,13 +415,23 @@ def _new_progress(identity: Mapping[str, Any], writers: Mapping[str, Transaction
     }
 
 
-def _validate_progress(progress: Mapping[str, Any]) -> None:
+def _validate_progress(progress: Mapping[str, Any], target_structures: int) -> None:
     if progress.get("status") not in ("in_progress", "complete"):
         raise ValueError("evaluation progress has an invalid status")
     for field in ("next_index", "structures"):
         value = progress.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"evaluation progress {field} must be non-negative")
+    next_index = int(progress["next_index"])
+    structures = int(progress["structures"])
+    if next_index != structures:
+        raise ValueError("evaluation progress next_index must equal structures")
+    if next_index > target_structures:
+        raise ValueError("evaluation progress next_index exceeds the test limit")
+    if progress.get("status") == "complete" and next_index != target_structures:
+        raise ValueError(
+            f"evaluation complete progress expected {target_structures} structures"
+        )
     offsets = progress.get("csv_offsets")
     expected = {
         _writer_key(variant, filename)
@@ -700,22 +709,158 @@ def _append_structure(
         )
 
 
+def _csv_integer(row: Mapping[str, str], field: str, source: str) -> int:
+    try:
+        return int(row[field])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{source} has an invalid {field}") from error
+
+
 def _validate_complete_outputs(
     evaluation_dir: Path,
     progress: Mapping[str, Any],
+    max_force_components_per_structure: int | None,
 ) -> None:
-    writers = _open_writers(evaluation_dir, reset=False)
-    try:
-        _restore_writers(writers, progress["csv_offsets"])
-    finally:
-        _close_writers(writers)
+    structures = int(progress["structures"])
+    offsets = progress["csv_offsets"]
+    csv_rows: dict[tuple[str, str], list[dict[str, str]]] = {}
+    summaries: dict[str, Mapping[str, Any]] = {}
+
     for variant in _VARIANTS:
-        summary_path = evaluation_dir / variant / "summary.json"
-        if not summary_path.exists():
-            raise ValueError(f"complete evaluation is missing {variant}/summary.json")
+        for filename, fields in _CSV_SPECS.items():
+            key = _writer_key(variant, filename)
+            path = evaluation_dir / key
+            if not path.is_file():
+                raise ValueError(f"complete evaluation is missing {key}")
+            actual_size = path.stat().st_size
+            expected_size = int(offsets[key])
+            if actual_size != expected_size:
+                raise ValueError(
+                    f"CSV offset mismatch for {key}: "
+                    f"expected {expected_size}, actual {actual_size}"
+                )
+            csv_rows[(variant, filename)] = _read_csv(path, fields)
+
+        summary_key = f"{variant}/summary.json"
+        summary_path = evaluation_dir / summary_key
+        if not summary_path.is_file():
+            raise ValueError(f"complete evaluation is missing {summary_key}")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if not isinstance(summary, Mapping) or summary.get("variant") != variant:
             raise ValueError(f"invalid completed summary for {variant}")
+        summaries[variant] = summary
+
+    energy_baseline: list[tuple[Any, ...]] | None = None
+    force_baseline: list[tuple[Any, ...]] | None = None
+    for variant in _VARIANTS:
+        energy_rows = csv_rows[(variant, "energy.csv")]
+        force_rows = csv_rows[(variant, "force_components.csv")]
+        structure_rows = csv_rows[(variant, "force_structure.csv")]
+
+        for source, rows, target in (
+            (f"{variant}/energy.csv", energy_rows, "energy"),
+            (f"{variant}/force_components.csv", force_rows, "forces"),
+            (f"{variant}/force_structure.csv", structure_rows, "forces"),
+        ):
+            if any(row.get("variant") != variant for row in rows):
+                raise ValueError(f"{source} variant column mismatch")
+            if any(row.get("target") != target for row in rows):
+                raise ValueError(f"{source} target column mismatch")
+
+        if len(energy_rows) != structures:
+            raise ValueError(f"{variant} energy row count mismatch")
+        if len(structure_rows) != structures:
+            raise ValueError(f"{variant} force-structure row count mismatch")
+
+        structure_keys: list[tuple[str, int]] = []
+        energy_observations: list[tuple[Any, ...]] = []
+        expected_force_keys: list[tuple[str, int, int, int]] = []
+        expected_component_counts: list[int] = []
+        for row in energy_rows:
+            source = f"{variant}/energy.csv"
+            num_atoms = _csv_integer(row, "num_atoms", source)
+            if num_atoms <= 0:
+                raise ValueError(f"{source} num_atoms must be positive")
+            values = [
+                _finite_float(row[field], f"{source} {field}")
+                for field in ("reference", "prediction", "residual", "q", "variance", "std")
+            ]
+            if values[3] <= 0.0 or values[4] < 0.0 or values[5] < 0.0:
+                raise ValueError(f"{source} has invalid uncertainty values")
+            key = (row["structure_id"], num_atoms)
+            structure_keys.append(key)
+            energy_observations.append((*key, *values[:3]))
+            component_count = num_atoms * 3
+            if max_force_components_per_structure is not None:
+                component_count = min(
+                    component_count, max_force_components_per_structure
+                )
+            expected_component_counts.append(component_count)
+            expected_force_keys.extend(
+                (row["structure_id"], num_atoms, index // 3, index % 3)
+                for index in range(component_count)
+            )
+
+        if len({key[0] for key in structure_keys}) != structures:
+            raise ValueError(f"{variant} energy structure_id values must be unique")
+
+        actual_structure_keys: list[tuple[str, int]] = []
+        for index, row in enumerate(structure_rows):
+            source = f"{variant}/force_structure.csv"
+            num_atoms = _csv_integer(row, "num_atoms", source)
+            components = _csv_integer(row, "components", source)
+            if components != expected_component_counts[index]:
+                raise ValueError(f"{variant} force component count mismatch")
+            for field in ("mae", "rmse", "mean_q", "mean_variance"):
+                _finite_float(row[field], f"{source} {field}")
+            actual_structure_keys.append((row["structure_id"], num_atoms))
+        if actual_structure_keys != structure_keys:
+            raise ValueError(
+                f"variant alignment mismatch for {variant} structure rows"
+            )
+
+        if len(force_rows) != len(expected_force_keys):
+            raise ValueError(f"{variant} force component count mismatch")
+        force_observations: list[tuple[Any, ...]] = []
+        for row, expected_key in zip(force_rows, expected_force_keys):
+            source = f"{variant}/force_components.csv"
+            actual_key = (
+                row["structure_id"],
+                _csv_integer(row, "num_atoms", source),
+                _csv_integer(row, "atom_index", source),
+                _csv_integer(row, "direction", source),
+            )
+            if actual_key != expected_key:
+                raise ValueError(
+                    f"variant alignment mismatch for {variant} force component keys"
+                )
+            values = [
+                _finite_float(row[field], f"{source} {field}")
+                for field in ("reference", "prediction", "residual", "q", "variance", "std")
+            ]
+            if values[3] <= 0.0 or values[4] < 0.0 or values[5] < 0.0:
+                raise ValueError(f"{source} has invalid uncertainty values")
+            force_observations.append((*actual_key, *values[:3]))
+
+        counts = summaries[variant].get("counts")
+        expected_counts = {
+            "structures": structures,
+            "force_components": len(force_rows),
+            "force_structures": structures,
+        }
+        if not isinstance(counts, Mapping) or any(
+            counts.get(key) != value for key, value in expected_counts.items()
+        ):
+            raise ValueError(f"{variant} summary count mismatch")
+
+        if energy_baseline is None:
+            energy_baseline = energy_observations
+            force_baseline = force_observations
+        elif (
+            energy_observations != energy_baseline
+            or force_observations != force_baseline
+        ):
+            raise ValueError("variant alignment mismatch for formal CSV observations")
 
 
 def run_evaluate(config: LLPRConfig) -> Path:
@@ -761,21 +906,44 @@ def run_evaluate(config: LLPRConfig) -> Path:
 
     evaluation_dir = root / "evaluation" / "deterministic"
     progress_path = evaluation_dir / "progress.pt"
+    target_structures = dataset.size
+    if config.runtime.max_structures is not None:
+        target_structures = min(target_structures, config.runtime.max_structures)
     progress: dict[str, Any] | None = None
     if progress_path.exists():
         candidate = load_torch_artifact(progress_path)
         if not isinstance(candidate, Mapping):
             raise ValueError("evaluation progress must be a mapping")
         candidate_identity = candidate.get("identity", {})
-        matching = canonical_json(candidate_identity) == canonical_json(identity)
-        if candidate.get("status") == "complete" and matching:
-            _validate_progress(candidate)
-            _validate_complete_outputs(evaluation_dir, candidate)
+        require_identity(candidate_identity, identity)
+        _validate_progress(candidate, target_structures)
+        if candidate.get("status") == "complete":
+            _validate_complete_outputs(
+                evaluation_dir,
+                candidate,
+                config.runtime.max_force_components_per_structure,
+            )
             return evaluation_dir
-        if config.runtime.resume:
-            require_identity(candidate_identity, identity)
-            _validate_progress(candidate)
-            progress = dict(candidate)
+        if not config.runtime.resume:
+            raise ValueError(
+                "in-progress evaluation exists but runtime.resume is false"
+            )
+        progress = dict(candidate)
+    else:
+        existing_formal_outputs = [
+            evaluation_dir / variant / filename
+            for variant in _VARIANTS
+            for filename in (*_CSV_SPECS, "summary.json")
+            if (evaluation_dir / variant / filename).exists()
+        ]
+        if existing_formal_outputs:
+            names = ", ".join(
+                str(path.relative_to(evaluation_dir))
+                for path in existing_formal_outputs
+            )
+            raise ValueError(
+                "formal evaluation output exists without progress: " + names
+            )
 
     writers = _open_writers(evaluation_dir, reset=progress is None)
     try:
@@ -785,11 +953,6 @@ def run_evaluate(config: LLPRConfig) -> Path:
         else:
             _restore_writers(writers, progress["csv_offsets"])
 
-        target_structures = dataset.size
-        if config.runtime.max_structures is not None:
-            target_structures = min(target_structures, config.runtime.max_structures)
-        if progress["next_index"] > target_structures:
-            raise ValueError("evaluation progress next_index exceeds the test limit")
 
         solvers = {
             variant: CholeskyQuadraticForm(

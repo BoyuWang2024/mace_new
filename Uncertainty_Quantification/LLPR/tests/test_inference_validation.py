@@ -44,6 +44,28 @@ from Uncertainty_Quantification.LLPR.llpr.readout import ReadoutLayout
 
 
 _VARIANTS = ("he", "hf", "hef")
+def _formal_output_bytes(evaluation_dir: Path) -> dict[str, bytes]:
+    result = {}
+    for variant in _VARIANTS:
+        for filename in (
+            "energy.csv",
+            "force_components.csv",
+            "force_structure.csv",
+            "summary.json",
+        ):
+            path = evaluation_dir / variant / filename
+            if path.exists():
+                result[f"{variant}/{filename}"] = path.read_bytes()
+    return result
+def _replace_committed_csv(
+    evaluation_dir: Path, relative_path: str, frame: pd.DataFrame
+) -> None:
+    path = evaluation_dir / relative_path
+    frame.to_csv(path, index=False)
+    progress_path = evaluation_dir / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    progress["csv_offsets"][relative_path] = path.stat().st_size
+    atomic_torch_save(progress_path, progress)
 
 
 def _config(tmp_path: Path, *, resume: bool = True) -> LLPRConfig:
@@ -223,7 +245,7 @@ def _samples() -> tuple[list[StructureSample], dict[int, StructureJacobians]]:
             num_atoms=1,
             batch=0,
             reference_energy_per_atom=torch.tensor(3.0),
-            reference_forces=torch.tensor([[3.0, 6.0, 99.0]]),
+            reference_forces=torch.tensor([[3.0, 6.0, 9.0]]),
         ),
         StructureSample(
             index=1,
@@ -231,24 +253,24 @@ def _samples() -> tuple[list[StructureSample], dict[int, StructureJacobians]]:
             num_atoms=1,
             batch=1,
             reference_energy_per_atom=torch.tensor(5.0),
-            reference_forces=torch.tensor([[1.0, 4.0, 99.0]]),
+            reference_forces=torch.tensor([[1.0, 4.0, 7.0]]),
         ),
     ]
     jacobians = {
         0: StructureJacobians(
             energy_per_atom=1.0,
-            forces=torch.tensor([[1.0, 2.0, -50.0]]),
+            forces=torch.tensor([[1.0, 2.0, 3.0]]),
             g_energy=torch.tensor([1.0, 2.0]),
-            g_forces=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-            force_indices=torch.tensor([0, 1]),
+            g_forces=torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+            force_indices=torch.tensor([0, 1, 2]),
             chunk_size=2,
         ),
         1: StructureJacobians(
             energy_per_atom=2.0,
-            forces=torch.tensor([[0.0, 1.0, -50.0]]),
+            forces=torch.tensor([[0.0, 1.0, 2.0]]),
             g_energy=torch.tensor([1.0, 2.0]),
-            g_forces=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-            force_indices=torch.tensor([0, 1]),
+            g_forces=torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+            force_indices=torch.tensor([0, 1, 2]),
             chunk_size=2,
         ),
     }
@@ -442,7 +464,7 @@ def test_run_evaluate_reuses_one_prediction_for_three_variants_and_writes_formul
         assert list(forces.columns) == FORCE_FIELDS
         assert list(structures.columns) == FORCE_STRUCTURE_FIELDS
         assert len(energy) == 2
-        assert len(forces) == 4
+        assert len(forces) == 6
         assert len(structures) == 2
         assert energy["variant"].tolist() == [variant, variant]
         assert energy["target"].tolist() == ["energy", "energy"]
@@ -459,19 +481,21 @@ def test_run_evaluate_reuses_one_prediction_for_three_variants_and_writes_formul
     assert he_forces[["atom_index", "direction"]].values.tolist() == [
         [0, 0],
         [0, 1],
+        [0, 2],
         [0, 0],
         [0, 1],
+        [0, 2],
     ]
     assert he_forces.iloc[0]["residual"] == pytest.approx(2.0)
     assert he_forces.iloc[0]["q"] == pytest.approx(0.5)
     assert he_forces.iloc[0]["variance"] == pytest.approx(4.5)
 
     he_structure = pd.read_csv(result / "he" / "force_structure.csv").iloc[0]
-    assert he_structure["components"] == 2
-    assert he_structure["mae"] == pytest.approx(3.0)
-    assert he_structure["rmse"] == pytest.approx(10.0**0.5)
-    assert he_structure["mean_q"] == pytest.approx(0.375)
-    assert he_structure["mean_variance"] == pytest.approx(3.375)
+    assert he_structure["components"] == 3
+    assert he_structure["mae"] == pytest.approx(4.0)
+    assert he_structure["rmse"] == pytest.approx((56.0 / 3.0) ** 0.5)
+    assert he_structure["mean_q"] == pytest.approx(0.5)
+    assert he_structure["mean_variance"] == pytest.approx(4.5)
 
     summary = json.loads((result / "he" / "summary.json").read_text())
     assert summary["variant"] == "he"
@@ -479,11 +503,11 @@ def test_run_evaluate_reuses_one_prediction_for_three_variants_and_writes_formul
     assert summary["alpha"] == {"energy": 2.0, "forces": 3.0}
     assert summary["counts"] == {
         "structures": 2,
-        "force_components": 4,
+        "force_components": 6,
         "force_structures": 2,
     }
     assert summary["energy"]["mae"] == pytest.approx(2.5)
-    assert summary["forces"]["rmse"] == pytest.approx((30.0 / 4.0) ** 0.5)
+    assert summary["forces"]["rmse"] == pytest.approx((91.0 / 6.0) ** 0.5)
     assert set(summary["energy"]["coverage"]) == {
         "1sigma",
         "2sigma",
@@ -552,7 +576,7 @@ def test_run_evaluate_restores_all_csvs_to_committed_offsets(
     assert starts == [0, 1]
     for variant in _VARIANTS:
         assert len(pd.read_csv(result / variant / "energy.csv")) == 2
-        assert len(pd.read_csv(result / variant / "force_components.csv")) == 4
+        assert len(pd.read_csv(result / variant / "force_components.csv")) == 6
         assert len(pd.read_csv(result / variant / "force_structure.csv")) == 2
     completed = load_torch_artifact(progress_path)
     assert completed["status"] == "complete"
@@ -573,6 +597,150 @@ def test_run_evaluate_rejects_resume_identity_mismatch(
     _install_fake_pipeline(monkeypatch, changed)
     with pytest.raises(ValueError, match="identity mismatch"):
         run_evaluate(changed)
+def test_identity_mismatch_with_resume_false_preserves_formal_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    before = _formal_output_bytes(evaluation_dir)
+
+    other_test = tmp_path / "other-test.extxyz"
+    other_test.write_text("different", encoding="utf-8")
+    changed = replace(
+        config,
+        test=PathIdentity(other_test),
+        runtime=replace(config.runtime, resume=False),
+    )
+    _install_fake_pipeline(monkeypatch, changed, fail_at_index=0)
+
+    with pytest.raises(ValueError, match="identity mismatch"):
+        run_evaluate(changed)
+    assert _formal_output_bytes(evaluation_dir) == before
+
+
+def test_missing_progress_with_formal_outputs_fails_closed_without_modification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, resume=False)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    (evaluation_dir / "progress.pt").unlink()
+    before = _formal_output_bytes(evaluation_dir)
+    _install_fake_pipeline(monkeypatch, config, fail_at_index=0)
+
+    with pytest.raises(ValueError, match="formal evaluation output"):
+        run_evaluate(config)
+    assert _formal_output_bytes(evaluation_dir) == before
+@pytest.mark.parametrize(
+    ("next_index", "structures", "message"),
+    [
+        (3, 3, "exceeds"),
+        (2, 1, "equal structures"),
+        (1, 1, "expected 2"),
+    ],
+)
+def test_complete_cache_rejects_invalid_progress_counts_before_requested_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    next_index: int,
+    structures: int,
+    message: str,
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    progress_path = evaluation_dir / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    progress["next_index"] = next_index
+    progress["structures"] = structures
+    atomic_torch_save(progress_path, progress)
+
+    invalid_device = replace(
+        config,
+        runtime=replace(config.runtime, device="definitely-not-a-device"),
+    )
+    _install_fake_pipeline(monkeypatch, invalid_device)
+    with pytest.raises(ValueError, match=message):
+        run_evaluate(invalid_device)
+def test_complete_cache_rejects_bytes_after_committed_offset_without_truncating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    path = evaluation_dir / "he" / "energy.csv"
+    with path.open("ab") as handle:
+        handle.write(b"uncommitted,junk\n")
+    corrupted = path.read_bytes()
+    invalid_device = replace(
+        config,
+        runtime=replace(config.runtime, device="definitely-not-a-device"),
+    )
+    _install_fake_pipeline(monkeypatch, invalid_device)
+
+    with pytest.raises(ValueError, match="offset"):
+        run_evaluate(invalid_device)
+    assert path.read_bytes() == corrupted
+
+
+def test_complete_cache_rejects_missing_csv_without_recreating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    path = evaluation_dir / "he" / "energy.csv"
+    path.unlink()
+    _install_fake_pipeline(monkeypatch, config)
+
+    with pytest.raises(ValueError, match=r"missing.*he/energy.csv"):
+        run_evaluate(config)
+    assert not path.exists()
+
+
+def test_complete_cache_rejects_cross_variant_structure_misalignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    frame = pd.read_csv(evaluation_dir / "hf" / "energy.csv")
+    frame.loc[0, "structure_id"] = "different"
+    _replace_committed_csv(evaluation_dir, "hf/energy.csv", frame)
+    _install_fake_pipeline(monkeypatch, config)
+
+    with pytest.raises(ValueError, match="variant alignment"):
+        run_evaluate(config)
+
+
+def test_complete_cache_rejects_missing_force_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    frame = pd.read_csv(evaluation_dir / "he" / "force_components.csv").iloc[:-1]
+    _replace_committed_csv(evaluation_dir, "he/force_components.csv", frame)
+    _install_fake_pipeline(monkeypatch, config)
+
+    with pytest.raises(ValueError, match="force component count"):
+        run_evaluate(config)
+
+
+def test_complete_cache_rejects_wrong_variant_or_target_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    frame = pd.read_csv(evaluation_dir / "he" / "energy.csv")
+    frame.loc[0, "target"] = "forces"
+    _replace_committed_csv(evaluation_dir, "he/energy.csv", frame)
+    _install_fake_pipeline(monkeypatch, config)
+
+    with pytest.raises(ValueError, match="he/energy.*target"):
+        run_evaluate(config)
 
 
 def test_run_evaluate_complete_cache_precedes_requested_device_and_ignores_execution_only_settings(
