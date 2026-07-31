@@ -507,6 +507,12 @@ def _validate_variance_formula(
         q_value = _finite(row, "q", row_source)
         variance = _finite(row, "variance", row_source)
         expected = alpha * alpha * q_value
+        if not math.isfinite(expected) or (
+            alpha > 0.0 and q_value > 0.0 and expected == 0.0
+        ):
+            raise ValueError(
+                f"{row_source} variance alpha squared q result must be finite and representable"
+            )
         scale = max(abs(variance), abs(expected), 1.0e-30)
         if abs(variance - expected) > RELATIVE_TOLERANCE * scale:
             raise ValueError(
@@ -616,6 +622,286 @@ def _normalise_identities(identity: Mapping[str, Any]) -> dict[str, Any]:
 
 
 
+def _identity_mapping(
+    value: Any, fields: set[str], source: str
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    return value
+
+
+def _identity_string(value: Any, source: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    return value
+
+
+def _identity_sha256(value: Any, source: str) -> str:
+    text = _identity_string(value, source)
+    if len(text) != 64 or any(character not in "0123456789abcdefABCDEF" for character in text):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    return text
+
+
+def _identity_number(
+    value: Any,
+    source: str,
+    *,
+    minimum: float,
+    strict: bool = False,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    result = float(value)
+    if not math.isfinite(result) or (result <= minimum if strict else result < minimum):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    return result
+
+
+def _identity_atomic_numbers(value: Any, source: str) -> list[int]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    return value
+
+
+def _validate_checkpoint_identity(value: Any, source: str) -> Mapping[str, Any]:
+    checkpoint = _identity_mapping(
+        value,
+        {
+            "sha256",
+            "model_class",
+            "heads",
+            "selected_head",
+            "r_max",
+            "atomic_numbers",
+            "dtype",
+        },
+        source,
+    )
+    _identity_sha256(checkpoint["sha256"], f"{source}.sha256")
+    _identity_string(checkpoint["model_class"], f"{source}.model_class")
+    heads = checkpoint["heads"]
+    if (
+        not isinstance(heads, list)
+        or not heads
+        or any(not isinstance(head, str) or not head.strip() for head in heads)
+        or len(set(heads)) != len(heads)
+    ):
+        raise ValueError(f"trusted evaluation progress identity {source}.heads is invalid")
+    selected_head = _identity_string(
+        checkpoint["selected_head"], f"{source}.selected_head"
+    )
+    if selected_head not in heads:
+        raise ValueError(
+            f"trusted evaluation progress identity {source}.selected_head is invalid"
+        )
+    _identity_number(checkpoint["r_max"], f"{source}.r_max", minimum=0.0, strict=True)
+    _identity_atomic_numbers(
+        checkpoint["atomic_numbers"], f"{source}.atomic_numbers"
+    )
+    _identity_string(checkpoint["dtype"], f"{source}.dtype")
+    return checkpoint
+
+
+def _validate_readout_identity(value: Any, source: str) -> Mapping[str, Any]:
+    readout = _identity_mapping(value, {"names", "shapes", "size"}, source)
+    names = readout["names"]
+    shapes = readout["shapes"]
+    size = readout["size"]
+    if (
+        not isinstance(names, list)
+        or not names
+        or any(not isinstance(name, str) or not name.strip() for name in names)
+        or len(set(names)) != len(names)
+        or not isinstance(shapes, list)
+        or len(shapes) != len(names)
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size <= 0
+    ):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    computed_size = 0
+    for shape in shapes:
+        if not isinstance(shape, list) or any(
+            isinstance(dimension, bool)
+            or not isinstance(dimension, int)
+            or dimension <= 0
+            for dimension in shape
+        ):
+            raise ValueError(f"trusted evaluation progress identity {source}.shapes is invalid")
+        computed_size += math.prod(shape)
+    if computed_size != size:
+        raise ValueError(f"trusted evaluation progress identity {source}.size is invalid")
+    return readout
+
+
+def _validate_dataset_identity(value: Any, source: str) -> Mapping[str, Any]:
+    dataset = _identity_mapping(
+        value,
+        {"sha256", "identity", "size", "atomic_numbers", "r_max", "head"},
+        source,
+    )
+    _identity_sha256(dataset["sha256"], f"{source}.sha256")
+    _identity_string(dataset["identity"], f"{source}.identity")
+    size = dataset["size"]
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise ValueError(f"trusted evaluation progress identity {source}.size is invalid")
+    _identity_atomic_numbers(dataset["atomic_numbers"], f"{source}.atomic_numbers")
+    _identity_number(dataset["r_max"], f"{source}.r_max", minimum=0.0, strict=True)
+    _identity_string(dataset["head"], f"{source}.head")
+    return dataset
+
+
+def _validate_limits_identity(value: Any, source: str) -> Mapping[str, Any]:
+    limits = _identity_mapping(
+        value,
+        {"max_structures", "max_force_components_per_structure"},
+        source,
+    )
+    for field, field_value in limits.items():
+        if field_value is not None and (
+            isinstance(field_value, bool)
+            or not isinstance(field_value, int)
+            or field_value <= 0
+        ):
+            raise ValueError(
+                f"trusted evaluation progress identity {source}.{field} is invalid"
+            )
+    return limits
+
+
+def _validate_versions(value: Mapping[str, Any], source: str) -> None:
+    if value["schema_version"] != SCHEMA_VERSION or value["formula_version"] != FORMULA_VERSION:
+        raise ValueError(f"trusted evaluation progress identity {source} version mismatch")
+
+
+def _validate_ridge_identity(
+    value: Any, source: str, *, selected: bool
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    mode = value.get("mode")
+    active_field = "value" if mode == "fixed" else "max_condition_number"
+    fields = {"mode", active_field}
+    if selected:
+        fields.add("selected")
+    ridge = _identity_mapping(value, fields, source)
+    if mode not in {"fixed", "condition_number"}:
+        raise ValueError(f"trusted evaluation progress identity {source}.mode is invalid")
+    threshold = _identity_number(
+        ridge[active_field],
+        f"{source}.{active_field}",
+        minimum=0.0 if mode == "fixed" else 1.0,
+        strict=mode == "condition_number",
+    )
+    if not math.isfinite(threshold):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    if selected:
+        selected_values = _identity_mapping(
+            ridge["selected"], set(_VARIANTS), f"{source}.selected"
+        )
+        for variant, selected_value in selected_values.items():
+            _identity_number(
+                selected_value,
+                f"{source}.selected.{variant}",
+                minimum=0.0,
+            )
+    return ridge
+
+
+def _validate_curvature_source_identity(
+    value: Any, source: str
+) -> Mapping[str, Any]:
+    identity = _identity_mapping(
+        value,
+        {
+            "schema_version",
+            "formula_version",
+            "checkpoint",
+            "build",
+            "readout",
+            "curvature",
+            "limits",
+        },
+        source,
+    )
+    _validate_versions(identity, source)
+    _validate_checkpoint_identity(identity["checkpoint"], f"{source}.checkpoint")
+    _validate_dataset_identity(identity["build"], f"{source}.build")
+    _validate_readout_identity(identity["readout"], f"{source}.readout")
+    curvature = _identity_mapping(
+        identity["curvature"], {"energy", "forces", "variants"}, f"{source}.curvature"
+    )
+    if curvature != {
+        "energy": "outer(d(E/N)/dtheta, d(E/N)/dtheta)",
+        "forces": "G_F.T @ G_F (unweighted)",
+        "variants": list(_VARIANTS),
+    }:
+        raise ValueError(f"trusted evaluation progress identity {source}.curvature is invalid")
+    _validate_limits_identity(identity["limits"], f"{source}.limits")
+    return identity
+
+
+def _validate_calibration_source_identity(
+    value: Any, source: str
+) -> Mapping[str, Any]:
+    identity = _identity_mapping(
+        value,
+        {
+            "schema_version",
+            "formula_version",
+            "checkpoint",
+            "curvature",
+            "calibration",
+            "ridge",
+            "min_q",
+            "limits",
+        },
+        source,
+    )
+    _validate_versions(identity, source)
+    _validate_checkpoint_identity(identity["checkpoint"], f"{source}.checkpoint")
+    _validate_curvature_source_identity(identity["curvature"], f"{source}.curvature")
+    _validate_dataset_identity(identity["calibration"], f"{source}.calibration")
+    _validate_ridge_identity(identity["ridge"], f"{source}.ridge", selected=True)
+    min_q = _identity_number(
+        identity["min_q"], f"{source}.min_q", minimum=0.0, strict=True
+    )
+    if min_q != 1.0e-30:
+        raise ValueError(f"trusted evaluation progress identity {source}.min_q is invalid")
+    _validate_limits_identity(identity["limits"], f"{source}.limits")
+    return identity
+
+
+def _validate_calibration_records(value: Any, source: str) -> None:
+    variants = _identity_mapping(value, set(_VARIANTS), source)
+    for variant in _VARIANTS:
+        targets = _identity_mapping(
+            variants[variant], {"energy", "forces"}, f"{source}.{variant}"
+        )
+        for target in ("energy", "forces"):
+            record_source = f"{source}.{variant}.{target}"
+            record = _identity_mapping(
+                targets[target], {"ridge_mode", "ridge", "alpha", "rows"}, record_source
+            )
+            if record["ridge_mode"] not in {"fixed", "condition_number"}:
+                raise ValueError(
+                    f"trusted evaluation progress identity {record_source}.ridge_mode is invalid"
+                )
+            _identity_number(record["ridge"], f"{record_source}.ridge", minimum=0.0)
+            _identity_number(record["alpha"], f"{record_source}.alpha", minimum=0.0)
+            rows = record["rows"]
+            if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
+                raise ValueError(
+                    f"trusted evaluation progress identity {record_source}.rows is invalid"
+                )
+
+
 def _trusted_progress_identity(
     root: Path, explicit_identity: Mapping[str, Any] | None
 ) -> Mapping[str, Any]:
@@ -648,52 +934,82 @@ def _trusted_progress_identity(
     }
     if not required.issubset(identity):
         raise ValueError("trusted evaluation progress identity is missing required fields")
-    if identity["schema_version"] != SCHEMA_VERSION or identity[
-        "formula_version"
-    ] != FORMULA_VERSION:
-        raise ValueError("trusted evaluation progress identity version mismatch")
-    for field in (
-        "checkpoint",
-        "readout",
-        "curvature",
-        "calibration",
-        "test",
-        "ridge",
-        "limits",
-        "observables",
-    ):
-        if not isinstance(identity[field], Mapping) or not identity[field]:
-            raise ValueError(f"trusted evaluation progress identity {field} is invalid")
-    checkpoint = identity["checkpoint"]
-    if not isinstance(checkpoint.get("sha256"), str):
-        raise ValueError("trusted evaluation progress identity checkpoint is invalid")
-    readout = identity["readout"]
-    if (
-        not isinstance(readout.get("names"), list)
-        or not isinstance(readout.get("shapes"), list)
-        or isinstance(readout.get("size"), bool)
-        or not isinstance(readout.get("size"), int)
-        or readout["size"] <= 0
-    ):
-        raise ValueError("trusted evaluation progress identity readout is invalid")
-    curvature_identity = identity["curvature"].get("identity")
-    calibration_identity = identity["calibration"].get("identity")
-    build = curvature_identity.get("build") if isinstance(curvature_identity, Mapping) else None
-    calibration_data = (
-        calibration_identity.get("calibration")
-        if isinstance(calibration_identity, Mapping)
-        else None
+    if set(identity) != required:
+        raise ValueError("trusted evaluation progress identity has unexpected fields")
+    _validate_versions(identity, "root")
+    checkpoint = _validate_checkpoint_identity(identity["checkpoint"], "checkpoint")
+    readout = _validate_readout_identity(identity["readout"], "readout")
+
+    curvature = _identity_mapping(
+        identity["curvature"], {"sha256", "identity"}, "curvature"
     )
-    for field, value in (
-        ("build data", build),
-        ("calibration data", calibration_data),
-        ("test data", identity["test"]),
-    ):
-        if not isinstance(value, Mapping) or not isinstance(value.get("sha256"), str):
-            raise ValueError(f"trusted evaluation progress identity {field} is invalid")
-    min_q = identity["min_q"]
-    if isinstance(min_q, bool) or not isinstance(min_q, (int, float)) or not math.isfinite(float(min_q)) or float(min_q) <= 0.0:
+    _identity_sha256(curvature["sha256"], "curvature.sha256")
+    curvature_identity = _validate_curvature_source_identity(
+        curvature["identity"], "curvature.identity"
+    )
+
+    calibration = _identity_mapping(
+        identity["calibration"],
+        {"sha256", "diagnostics_sha256", "identity", "records"},
+        "calibration",
+    )
+    _identity_sha256(calibration["sha256"], "calibration.sha256")
+    _identity_sha256(
+        calibration["diagnostics_sha256"], "calibration.diagnostics_sha256"
+    )
+    calibration_identity = _validate_calibration_source_identity(
+        calibration["identity"], "calibration.identity"
+    )
+    _validate_calibration_records(calibration["records"], "calibration.records")
+    test = _validate_dataset_identity(identity["test"], "test")
+    ridge = _validate_ridge_identity(identity["ridge"], "ridge", selected=False)
+    min_q = _identity_number(
+        identity["min_q"], "min_q", minimum=0.0, strict=True
+    )
+    if min_q != 1.0e-30:
         raise ValueError("trusted evaluation progress identity min_q is invalid")
+    limits = _validate_limits_identity(identity["limits"], "limits")
+    observables = _identity_mapping(
+        identity["observables"],
+        {"energy", "forces", "residual", "variance"},
+        "observables",
+    )
+    if observables != {
+        "energy": "per_atom",
+        "forces": "per_cartesian_component",
+        "residual": "reference_minus_prediction",
+        "variance": "alpha_squared_times_q",
+    }:
+        raise ValueError("trusted evaluation progress identity observables is invalid")
+
+    relationships = (
+        (checkpoint, curvature_identity["checkpoint"], "curvature checkpoint"),
+        (checkpoint, calibration_identity["checkpoint"], "calibration checkpoint"),
+        (readout, curvature_identity["readout"], "curvature readout"),
+        (curvature_identity, calibration_identity["curvature"], "calibration curvature"),
+        (limits, curvature_identity["limits"], "curvature limits"),
+        (limits, calibration_identity["limits"], "calibration limits"),
+    )
+    for expected, actual, source in relationships:
+        if _strict_json_bytes(expected) != _strict_json_bytes(actual):
+            raise ValueError(
+                f"trusted evaluation progress identity {source} mismatch"
+            )
+    if test["head"] != checkpoint["selected_head"]:
+        raise ValueError("trusted evaluation progress identity test head mismatch")
+    if test["atomic_numbers"] != checkpoint["atomic_numbers"]:
+        raise ValueError("trusted evaluation progress identity test elements mismatch")
+    if float(test["r_max"]) != float(checkpoint["r_max"]):
+        raise ValueError("trusted evaluation progress identity test cutoff mismatch")
+    calibration_ridge = calibration_identity["ridge"]
+    active_field = "value" if ridge["mode"] == "fixed" else "max_condition_number"
+    if (
+        calibration_ridge["mode"] != ridge["mode"]
+        or float(calibration_ridge[active_field]) != float(ridge[active_field])
+    ):
+        raise ValueError("trusted evaluation progress identity ridge mismatch")
+    if float(calibration_identity["min_q"]) != min_q:
+        raise ValueError("trusted evaluation progress identity min_q mismatch")
     return identity
 def _publication_identities(
     root: Path, explicit_identity: Mapping[str, Any] | None

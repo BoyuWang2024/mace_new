@@ -127,12 +127,35 @@ def _layout() -> ReadoutLayout:
     )
 
 
+def _checkpoint_identity_metadata() -> dict[str, object]:
+    return {
+        "sha256": "a" * 64,
+        "model_class": "ScaleShiftMACE",
+        "heads": ["default"],
+        "selected_head": "default",
+        "r_max": 6.0,
+        "atomic_numbers": [1],
+        "dtype": "torch.float32",
+    }
+
+
+def _dataset_identity_metadata(sha256: str, identity: str) -> dict[str, object]:
+    return {
+        "sha256": sha256,
+        "identity": identity,
+        "size": 2,
+        "atomic_numbers": [1],
+        "r_max": 6.0,
+        "head": "default",
+    }
+
+
 def _curvature_identity(layout: ReadoutLayout) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
-        "checkpoint": {"sha256": "a" * 64},
-        "build": {"sha256": "b" * 64, "identity": "build-identity"},
+        "checkpoint": _checkpoint_identity_metadata(),
+        "build": _dataset_identity_metadata("b" * 64, "build-identity"),
         "readout": layout.metadata(),
         "curvature": {
             "energy": "outer(d(E/N)/dtheta, d(E/N)/dtheta)",
@@ -174,12 +197,11 @@ def _write_upstream_artifacts(config: LLPRConfig, layout: ReadoutLayout) -> None
     calibration_identity = {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
-        "checkpoint": {"sha256": "a" * 64},
+        "checkpoint": _checkpoint_identity_metadata(),
         "curvature": curvature_identity,
-        "calibration": {
-            "sha256": "c" * 64,
-            "identity": "calibration-identity",
-        },
+        "calibration": _dataset_identity_metadata(
+            "c" * 64, "calibration-identity"
+        ),
         "ridge": {
             "mode": "fixed",
             "value": 1.0,
@@ -1237,6 +1259,24 @@ def test_validation_accepts_tiny_q_when_alpha_formula_matches(
     assert validate_publication_root(root)["status"] == "valid"
 
 
+def test_validation_rejects_nonfinite_alpha_squared_q_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / "he" / "energy.csv"
+    energy = pd.read_csv(path)
+    energy.loc[0, "q"] = 2.0
+    energy.to_csv(path, index=False)
+    _rewrite_variant_summary(root, "he")
+    summary_path = root / "he" / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["alpha"]["energy"] = 1.0e308
+    atomic_json_dump(summary_path, summary)
+
+    with pytest.raises(ValueError, match="variance.*alpha.*q.*finite"):
+        validate_publication_root(root)
+
+
 def test_validation_rejects_non_positive_summary_alpha(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1320,6 +1360,78 @@ def test_validation_rejects_incomplete_or_untrusted_progress_identity(
 
     assert not (root / "manifest.json").exists()
     assert not (root / "validation.json").exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "empty_checkpoint_sha",
+        "missing_checkpoint_head",
+        "empty_checkpoint_model_class",
+        "bad_checkpoint_cutoff",
+        "empty_checkpoint_elements",
+        "bad_checkpoint_dtype",
+        "empty_readout_names",
+        "bad_readout_shapes",
+        "missing_build_size",
+        "missing_curvature_sha",
+        "missing_calibration_sha",
+        "missing_diagnostics_sha",
+        "missing_test_head",
+        "bad_test_size",
+        "ridge_mode_none",
+        "ridge_value_wrong_type",
+        "observable_none",
+        "observable_wrong_type",
+    ],
+)
+def test_validation_rejects_malformed_deep_progress_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    identity = progress["identity"]
+    if case == "empty_checkpoint_sha":
+        identity["checkpoint"]["sha256"] = ""
+    elif case == "missing_checkpoint_head":
+        identity["checkpoint"].pop("selected_head")
+    elif case == "empty_checkpoint_model_class":
+        identity["checkpoint"]["model_class"] = ""
+    elif case == "bad_checkpoint_cutoff":
+        identity["checkpoint"]["r_max"] = "six"
+    elif case == "empty_checkpoint_elements":
+        identity["checkpoint"]["atomic_numbers"] = []
+    elif case == "bad_checkpoint_dtype":
+        identity["checkpoint"]["dtype"] = None
+    elif case == "empty_readout_names":
+        identity["readout"]["names"] = []
+    elif case == "bad_readout_shapes":
+        identity["readout"]["shapes"] = ["not-a-shape"]
+    elif case == "missing_build_size":
+        identity["curvature"]["identity"]["build"].pop("size")
+    elif case == "missing_curvature_sha":
+        identity["curvature"].pop("sha256")
+    elif case == "missing_calibration_sha":
+        identity["calibration"].pop("sha256")
+    elif case == "missing_diagnostics_sha":
+        identity["calibration"].pop("diagnostics_sha256")
+    elif case == "missing_test_head":
+        identity["test"].pop("head")
+    elif case == "bad_test_size":
+        identity["test"]["size"] = "two"
+    elif case == "ridge_mode_none":
+        identity["ridge"]["mode"] = None
+    elif case == "ridge_value_wrong_type":
+        identity["ridge"]["value"] = "one"
+    elif case == "observable_none":
+        identity["observables"]["energy"] = None
+    else:
+        identity["observables"]["forces"] = 3
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match="progress identity"):
+        validate_publication_root(root)
 
 
 @pytest.mark.parametrize(
