@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing as mp
+import shutil
 import time
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from Uncertainty_Quantification.LLPR.llpr.plotting import (
     PLOTTING_STATISTICS_FIELDS,
     run_plot,
 )
+from Uncertainty_Quantification.LLPR.llpr.validation import validate_publication_root
 from Uncertainty_Quantification.LLPR.tests import (
     test_inference_validation as publication_support,
 )
@@ -48,10 +50,27 @@ EXPECTED_FIGURE_STEMS = (
     "standardized_residual_cdf",
 )
 
+SNAPSHOT_SOURCE_NAMES = (
+    "progress.pt",
+    "manifest.json",
+    *(
+        f"{variant}/{filename}"
+        for variant in ("he", "hf", "hef")
+        for filename in (
+            "energy.csv",
+            "force_components.csv",
+            "force_structure.csv",
+            "summary.json",
+        )
+    ),
+)
+
 
 def _publication_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    return publication_support._evaluated_publication_root(tmp_path, monkeypatch)
+    root = publication_support._evaluated_publication_root(tmp_path, monkeypatch)
+    validate_publication_root(root)
+    return root
 
 
 def _sha256(path: Path) -> str:
@@ -86,6 +105,30 @@ def _rewrite_energy_with_zero_pair(root: Path) -> None:
                 cholesky_diagnostics=previous["cholesky_diagnostics"],
             ),
         )
+
+
+def _refresh_publication_validation(root: Path) -> None:
+    (root / "manifest.json").unlink(missing_ok=True)
+    (root / "validation.json").unlink(missing_ok=True)
+    validate_publication_root(root)
+
+
+def _make_distinct_publication(root: Path) -> None:
+    _rewrite_energy_with_zero_pair(root)
+    _refresh_publication_validation(root)
+
+
+def _copy_publication_sources(source: Path, destination: Path) -> None:
+    for name in SNAPSHOT_SOURCE_NAMES:
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source / name, target)
+
+
+def _fallback_snapshot_copy(source: Path, snapshot: Path, name: str) -> None:
+    target = snapshot / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source / name, target)
 
 
 def _lock_worker(output: str, events: object) -> None:
@@ -169,6 +212,7 @@ def test_zero_values_are_excluded_only_from_log_rendering_not_statistics(
 ) -> None:
     root = _publication_root(tmp_path, monkeypatch)
     _rewrite_energy_with_zero_pair(root)
+    _refresh_publication_validation(root)
     result = run_plot(root, output_dir=tmp_path / "plots")
     statistics = pd.read_csv(result / "plotting_statistics.csv")
     row = statistics.query("variant == 'he' and data_level == 'energy'").iloc[0]
@@ -214,7 +258,7 @@ def test_plotting_manifest_is_strict_deterministic_and_hashes_every_consumed_inp
         "config", "selected", "units", "figures", "shared_axes",
         "standardized_residual_counts",
     }
-    expected_inputs = {"manifest.json", "validation.json"} | {
+    expected_inputs = {"progress.pt", "manifest.json", "validation.json"} | {
         f"{variant}/{filename}"
         for variant in ("he", "hf", "hef")
         for filename in (
@@ -283,6 +327,7 @@ def test_constant_and_zero_statistics_are_finite_and_ecdf_counts_zero_zero(
             ),
         )
 
+    _refresh_publication_validation(root)
     result = run_plot(root, output_dir=tmp_path / "plots")
 
     statistics = pd.read_csv(result / "plotting_statistics.csv")
@@ -404,8 +449,6 @@ def test_output_symlink_escape_is_rejected_before_validation_or_mutation(
         if path.is_file() and not path.is_symlink()
     }
     assert formal_after == formal_before
-    assert not (root / "manifest.json").exists()
-    assert not (root / "validation.json").exists()
 
 
 def test_output_lock_serializes_independent_processes(tmp_path: Path) -> None:
@@ -511,3 +554,130 @@ def test_input_change_during_render_aborts_before_publication(
     assert after == before
     assert marker.read_text(encoding="utf-8") == "old"
     assert not list(output.parent.glob(f".{output.name}.stale-*"))
+
+
+def test_snapshot_copy_validates_replacement_publication_before_rendering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path / "a", monkeypatch)
+    replacement = _publication_root(tmp_path / "b", monkeypatch)
+    _make_distinct_publication(replacement)
+    expected_hash = _sha256(replacement / "he" / "energy.csv")
+    expected_mae = float(
+        np.mean(np.abs(pd.read_csv(replacement / "he" / "energy.csv")["residual"]))
+    )
+    original_mae = float(
+        np.mean(np.abs(pd.read_csv(root / "he" / "energy.csv")["residual"]))
+    )
+    assert expected_mae != original_mae
+    real_copy = getattr(
+        plotting, "_copy_snapshot_input", _fallback_snapshot_copy
+    )
+    replaced = False
+
+    def replace_before_first_copy(
+        source: Path, snapshot: Path, name: str
+    ) -> None:
+        nonlocal replaced
+        if not replaced:
+            _copy_publication_sources(replacement, root)
+            replaced = True
+        real_copy(source, snapshot, name)
+
+    monkeypatch.setattr(
+        plotting, "_copy_snapshot_input", replace_before_first_copy, raising=False
+    )
+    result = run_plot(root, output_dir=tmp_path / "plots")
+
+    statistics = pd.read_csv(result / "plotting_statistics.csv")
+    row = statistics.query("variant == 'he' and data_level == 'energy'").iloc[0]
+    manifest = _strict_json(result / "plotting_manifest.json")
+    assert row["mae"] == pytest.approx(expected_mae)
+    assert manifest["inputs"]["he/energy.csv"] == expected_hash
+    assert _sha256(root / "he" / "energy.csv") == expected_hash
+    assert not list(tmp_path.glob(".plots.snapshot-*"))
+
+
+def test_snapshot_render_is_immune_to_live_input_aba(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path / "a", monkeypatch)
+    replacement = _publication_root(tmp_path / "b", monkeypatch)
+    _make_distinct_publication(replacement)
+    validate_publication_root(root)
+    saved = tmp_path / "saved-a"
+    _copy_publication_sources(root, saved)
+    expected_hash = _sha256(root / "he" / "energy.csv")
+    expected_mae = float(
+        np.mean(np.abs(pd.read_csv(root / "he" / "energy.csv")["residual"]))
+    )
+    replacement_mae = float(
+        np.mean(np.abs(pd.read_csv(replacement / "he" / "energy.csv")["residual"]))
+    )
+    assert expected_mae != replacement_mae
+    real_load = plotting._load_plot_data
+
+    def load_during_live_aba(source: Path) -> object:
+        _copy_publication_sources(replacement, root)
+        try:
+            return real_load(source)
+        finally:
+            _copy_publication_sources(saved, root)
+
+    monkeypatch.setattr(plotting, "_load_plot_data", load_during_live_aba)
+    result = run_plot(root, output_dir=tmp_path / "plots")
+
+    statistics = pd.read_csv(result / "plotting_statistics.csv")
+    row = statistics.query("variant == 'he' and data_level == 'energy'").iloc[0]
+    manifest = _strict_json(result / "plotting_manifest.json")
+    assert row["mae"] == pytest.approx(expected_mae)
+    assert manifest["inputs"]["he/energy.csv"] == expected_hash
+    assert _sha256(root / "he" / "energy.csv") == expected_hash
+    assert not list(tmp_path.glob(".plots.snapshot-*"))
+
+
+def test_mixed_snapshot_validation_failure_preserves_old_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path / "a", monkeypatch)
+    replacement = _publication_root(tmp_path / "b", monkeypatch)
+    _make_distinct_publication(replacement)
+    output = run_plot(root, output_dir=tmp_path / "plots")
+    (output / "old-only.txt").write_text("old", encoding="utf-8")
+    before = {
+        path.relative_to(output): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    real_copy = getattr(
+        plotting, "_copy_snapshot_input", _fallback_snapshot_copy
+    )
+
+    def copy_mixed_snapshot(source: Path, snapshot: Path, name: str) -> None:
+        if name == "he/energy.csv":
+            target = snapshot / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(replacement / name, target)
+        else:
+            real_copy(source, snapshot, name)
+
+    monkeypatch.setattr(
+        plotting, "_copy_snapshot_input", copy_mixed_snapshot, raising=False
+    )
+    with pytest.raises(ValueError, match="manifest SHA256 mismatch"):
+        run_plot(root, output_dir=output)
+
+    after = {
+        path.relative_to(output): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert not list(tmp_path.glob(".plots.snapshot-*"))
+    assert not list(tmp_path.glob(".plots.stale-*"))

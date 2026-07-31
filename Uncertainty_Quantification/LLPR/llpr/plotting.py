@@ -6,6 +6,7 @@ import csv
 import ctypes
 import fcntl
 import json
+import hashlib
 import math
 import os
 import shutil
@@ -75,9 +76,9 @@ PLOTTING_STATISTICS_FIELDS = (
     "shared_axis_max",
 )
 
-_INPUT_NAMES = (
+_SNAPSHOT_SOURCE_NAMES = (
+    "progress.pt",
     "manifest.json",
-    "validation.json",
     *(f"{variant}/{filename}" for variant in _VARIANTS for filename in (
         "energy.csv",
         "force_components.csv",
@@ -85,6 +86,7 @@ _INPUT_NAMES = (
         "summary.json",
     )),
 )
+_INPUT_NAMES = (*_SNAPSHOT_SOURCE_NAMES, "validation.json")
 
 
 @dataclass(frozen=True)
@@ -569,8 +571,160 @@ def _strict_json_dump(path: Path, value: Any) -> None:
     )
 
 
+def _relative_input_path(name: str) -> Path:
+    relative = Path(name)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError(f"publication input path escapes its root: {name}")
+    return relative
+
+
+def _regular_state(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _open_regular_input(root: Path, name: str) -> tuple[int, os.stat_result]:
+    relative = _relative_input_path(name)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    file_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+    directory_descriptor: int | None = None
+    descriptor: int | None = None
+    try:
+        directory_descriptor = os.open(root, directory_flags)
+        for part in relative.parts[:-1]:
+            next_descriptor = os.open(
+                part,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        descriptor = os.open(
+            relative.parts[-1],
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ValueError(
+            f"publication input must be a safe regular file: {name}"
+        ) from error
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+    state = os.fstat(descriptor)
+    if not stat.S_ISREG(state.st_mode):
+        os.close(descriptor)
+        raise ValueError(f"publication input must be a regular file: {name}")
+    return descriptor, state
+
+
+def _assert_regular_unchanged(
+    descriptor: int, before: os.stat_result, name: str
+) -> None:
+    after = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or _regular_state(after) != _regular_state(before)
+    ):
+        raise ValueError(f"publication input changed while reading: {name}")
+
+
+def _hash_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+
+
+def _regular_file_hash(root: Path, name: str) -> str:
+    descriptor, before = _open_regular_input(root, name)
+    try:
+        digest = _hash_descriptor(descriptor)
+        _assert_regular_unchanged(descriptor, before, name)
+        return digest
+    finally:
+        os.close(descriptor)
+
+
+def _regular_file_hashes(root: Path, names: Sequence[str]) -> dict[str, str]:
+    return {name: _regular_file_hash(root, name) for name in names}
+
+
+def _snapshot_target(snapshot: Path, name: str) -> Path:
+    relative = _relative_input_path(name)
+    snapshot_state = snapshot.lstat()
+    if stat.S_ISLNK(snapshot_state.st_mode) or not stat.S_ISDIR(
+        snapshot_state.st_mode
+    ):
+        raise ValueError("plot input snapshot root must be a real directory")
+    current = snapshot
+    for part in relative.parts[:-1]:
+        current = current / part
+        current.mkdir(mode=0o700, exist_ok=True)
+        state = current.lstat()
+        if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+            raise ValueError(f"plot input snapshot path is unsafe: {name}")
+    return current / relative.parts[-1]
+
+
+def _copy_snapshot_input(source: Path, snapshot: Path, name: str) -> None:
+    source_descriptor, source_before = _open_regular_input(source, name)
+    target = _snapshot_target(snapshot, name)
+    target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        target_flags |= os.O_NOFOLLOW
+    target_descriptor: int | None = None
+    digest = hashlib.sha256()
+    try:
+        target_descriptor = os.open(target, target_flags, 0o600)
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(target_descriptor, remaining)
+                remaining = remaining[written:]
+        os.fsync(target_descriptor)
+        target_state = os.fstat(target_descriptor)
+        if (
+            not stat.S_ISREG(target_state.st_mode)
+            or target_state.st_size != source_before.st_size
+        ):
+            raise ValueError(f"plot input snapshot copy is invalid: {name}")
+        _assert_regular_unchanged(source_descriptor, source_before, name)
+    finally:
+        if target_descriptor is not None:
+            os.close(target_descriptor)
+        os.close(source_descriptor)
+    if _regular_file_hash(snapshot, name) != digest.hexdigest():
+        raise ValueError(f"plot input snapshot copy hash mismatch: {name}")
+
+
 def _input_hashes(root: Path) -> dict[str, str]:
-    return {name: sha256_file(root / name) for name in _INPUT_NAMES}
+    return _regular_file_hashes(root, _INPUT_NAMES)
+
+
+def _snapshot_source_hashes(root: Path) -> dict[str, str]:
+    return _regular_file_hashes(root, _SNAPSHOT_SOURCE_NAMES)
 
 
 def _standardized_residual_counts(
@@ -768,15 +922,33 @@ def _promote_directory(staging: Path, destination: Path) -> None:
         os.replace(staging, destination)
 
 
+def _create_input_snapshot(root: Path, destination: Path) -> Path:
+    snapshot = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.snapshot-",
+            dir=destination.parent,
+        )
+    )
+    try:
+        for name in _SNAPSHOT_SOURCE_NAMES:
+            _copy_snapshot_input(root, snapshot, name)
+        validate_publication_root(snapshot)
+        return snapshot
+    except BaseException:
+        _best_effort_remove(snapshot)
+        raise
+
+
 def _run_plot_locked(
-    root: Path,
+    snapshot_root: Path,
+    live_root: Path,
     destination: Path,
     selected_paths: Sequence[tuple[str, str]],
     dpi: int,
+    snapshot_source_hashes: Mapping[str, str],
+    input_hashes: Mapping[str, str],
 ) -> Path:
-    validate_publication_root(root)
-    input_hashes = _input_hashes(root)
-    data = _load_plot_data(root)
+    data = _load_plot_data(snapshot_root)
     shared_limits = _all_shared_limits(data)
 
     import matplotlib
@@ -829,7 +1001,7 @@ def _run_plot_locked(
         }
         _strict_json_dump(staging / "plotting_manifest.json", manifest)
         _validate_staging(staging)
-        if _input_hashes(root) != input_hashes:
+        if _snapshot_source_hashes(live_root) != snapshot_source_hashes:
             raise ValueError("publication input changed during plotting")
         _promote_directory(staging, destination)
     finally:
@@ -853,4 +1025,20 @@ def run_plot(
     _reject_existing_symlink_components(destination)
     with _output_lock(destination):
         _cleanup_stale_directories(destination)
-        return _run_plot_locked(root, destination, selected_paths, dpi)
+        snapshot: Path | None = None
+        try:
+            snapshot = _create_input_snapshot(root, destination)
+            snapshot_source_hashes = _snapshot_source_hashes(snapshot)
+            input_hashes = _input_hashes(snapshot)
+            return _run_plot_locked(
+                snapshot,
+                root,
+                destination,
+                selected_paths,
+                dpi,
+                snapshot_source_hashes,
+                input_hashes,
+            )
+        finally:
+            if snapshot is not None:
+                _best_effort_remove(snapshot)
