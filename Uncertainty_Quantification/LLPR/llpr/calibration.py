@@ -402,7 +402,11 @@ def run_calibrate(config: LLPRConfig) -> Path:
         config, loaded.identity, dataset, curvature_identity, ridges
     )
 
-    calibration_dir = run_root(config, loaded.identity.sha256) / "calibration"
+    calibration_dir = (
+        run_root(config, loaded.identity.sha256)
+        / "calibration"
+        / "deterministic"
+    )
     progress_path = calibration_dir / "progress.pt"
     artifact_path = calibration_dir / "calibrations.pt"
     csv_path = calibration_dir / "calibrations.csv"

@@ -243,8 +243,13 @@ def test_run_calibrate_writes_exactly_six_shared_ridge_records(
 
     artifact_path = run_calibrate(config)
 
-    calibration_dir = artifact_path.parent
-    assert artifact_path.name == "calibrations.pt"
+    calibration_dir = (
+        run_root(config, "a" * 64) / "calibration" / "deterministic"
+    )
+    assert artifact_path == calibration_dir / "calibrations.pt"
+    assert (calibration_dir / "progress.pt").is_file()
+    assert (calibration_dir / "calibrations.csv").is_file()
+    assert (calibration_dir / "ridge_diagnostics.json").is_file()
     assert {path.name for path in calibration_dir.iterdir()} == {
         "calibrations.pt",
         "calibrations.csv",
