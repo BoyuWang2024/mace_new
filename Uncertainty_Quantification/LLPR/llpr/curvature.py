@@ -147,8 +147,8 @@ def _load_complete(
 
 def run_build(config: LLPRConfig) -> Path:
     """Build, resume, or reuse the unweighted LLPR base curvature."""
-    device = torch.device(config.runtime.device)
-    loaded = load_checkpoint(config.checkpoint, device)
+    requested_device = torch.device(config.runtime.device)
+    loaded = load_checkpoint(config.checkpoint, torch.device("cpu"))
     layout = discover_readout_layout(loaded.model)
     dataset = build_dataset(
         config.build.path,
@@ -182,6 +182,7 @@ def run_build(config: LLPRConfig) -> Path:
             _validate_progress(candidate, layout.size)
             progress = dict(candidate)
 
+    loaded.model.to(requested_device)
     if progress is None:
         progress = _new_progress(identity, layout.size)
         atomic_torch_save(progress_path, progress)
@@ -196,7 +197,7 @@ def run_build(config: LLPRConfig) -> Path:
     if remaining > 0:
         samples = iter_samples(
             dataset,
-            device=device,
+            device=requested_device,
             dtype=loaded.identity.dtype,
             start_index=progress["next_index"],
             max_structures=remaining,

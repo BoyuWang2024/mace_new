@@ -73,7 +73,7 @@ def _install_fake_pipeline(
     fail_at_index: int | None = None,
     starts: list[int] | None = None,
     calls: list[int] | None = None,
-) -> None:
+) -> LoadedCheckpoint:
     from Uncertainty_Quantification.LLPR.llpr import curvature
 
     model = torch.nn.Linear(1, 1)
@@ -177,6 +177,7 @@ def _install_fake_pipeline(
     )
     monkeypatch.setattr(curvature, "iter_samples", fake_iter_samples)
     monkeypatch.setattr(curvature, "compute_structure_jacobians", fake_compute)
+    return checkpoint
 
 
 def test_curvature_variants_are_unweighted() -> None:
@@ -351,3 +352,38 @@ def test_run_build_reuses_complete_artifact_across_execution_only_changes(
 
     assert run_build(changed_config) == artifact_path
     assert calls == [0, 1]
+
+
+def test_run_build_validates_complete_cache_on_cpu_before_requested_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import curvature
+
+    config = _config(tmp_path)
+    checkpoint = _install_fake_pipeline(monkeypatch, config)
+    artifact_path = run_build(config)
+
+    load_devices: list[torch.device] = []
+    model_moves: list[torch.device] = []
+
+    def load_for_identity(
+        source: PathIdentity,
+        device: torch.device,
+    ) -> LoadedCheckpoint:
+        assert source == config.checkpoint
+        load_devices.append(device)
+        return checkpoint
+
+    def track_model_move(device: torch.device) -> torch.nn.Module:
+        model_moves.append(torch.device(device))
+        return checkpoint.model
+
+    monkeypatch.setattr(curvature, "load_checkpoint", load_for_identity)
+    monkeypatch.setattr(checkpoint.model, "to", track_model_move)
+    cuda_config = replace(
+        config,
+        runtime=replace(config.runtime, device="cuda:99"),
+    )
+
+    assert run_build(cuda_config) == artifact_path
+    assert load_devices == [torch.device("cpu")]
