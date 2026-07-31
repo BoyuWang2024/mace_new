@@ -1007,8 +1007,8 @@ def test_validation_reports_quality_diagnostics_without_gating_and_handles_zero_
             variant=variant,
             ridge_mode="fixed",
             ridge=1.0,
-            energy_alpha=2.0,
-            force_alpha=3.0,
+            energy_alpha=previous["alpha"]["energy"],
+            force_alpha=previous["alpha"]["forces"],
             cholesky_diagnostics=previous["cholesky_diagnostics"],
         )
         atomic_json_dump(summary_path, summary)
@@ -1025,12 +1025,15 @@ def test_validation_reports_quality_diagnostics_without_gating_and_handles_zero_
     assert "Infinity" not in serialized
 
 
-def test_revalidation_after_valid_content_change_generates_matching_new_manifest(
+def test_revalidation_after_valid_content_change_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _evaluated_publication_root(tmp_path, monkeypatch)
     validate_publication_root(root)
-    first_manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    manifest_path = root / "manifest.json"
+    validation_path = root / "validation.json"
+    first_manifest = manifest_path.read_bytes()
+    first_validation = validation_path.read_bytes()
 
     for variant in _VARIANTS:
         path = root / variant / "energy.csv"
@@ -1052,15 +1055,11 @@ def test_revalidation_after_valid_content_change_generates_matching_new_manifest
         )
         atomic_json_dump(summary_path, summary)
 
-    validate_publication_root(root)
-    second_manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    with pytest.raises(ValueError, match="manifest.*SHA256"):
+        validate_publication_root(root)
 
-    assert second_manifest["files"]["he/energy.csv"] != first_manifest["files"][
-        "he/energy.csv"
-    ]
-    assert json.loads((root / "validation.json").read_text(encoding="utf-8"))[
-        "manifest_sha256"
-    ] == sha256_file(root / "manifest.json")
+    assert manifest_path.read_bytes() == first_manifest
+    assert validation_path.read_bytes() == first_validation
 
 
 def test_variant_alignment_accepts_values_within_documented_tolerance(
@@ -1090,3 +1089,257 @@ def test_variant_alignment_accepts_values_within_documented_tolerance(
     report = validate_publication_root(root)
 
     assert report["status"] == "valid"
+
+
+def test_existing_manifest_rejects_changed_canonical_bytes_and_preserves_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    validate_publication_root(root)
+    manifest_path = root / "manifest.json"
+    validation_path = root / "validation.json"
+    original_manifest = manifest_path.read_bytes()
+    original_validation = validation_path.read_bytes()
+
+    for variant in _VARIANTS:
+        path = root / variant / "energy.csv"
+        energy = pd.read_csv(path)
+        energy["q"] *= 2.0
+        energy["variance"] *= 2.0
+        energy["std"] = energy["variance"] ** 0.5
+        energy.to_csv(path, index=False)
+        summary_path = root / variant / "summary.json"
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        atomic_json_dump(
+            summary_path,
+            summarize_variant(
+                root / variant,
+                variant=variant,
+                ridge_mode=previous["ridge"]["mode"],
+                ridge=previous["ridge"]["value"],
+                energy_alpha=previous["alpha"]["energy"],
+                force_alpha=previous["alpha"]["forces"],
+                cholesky_diagnostics=previous["cholesky_diagnostics"],
+            ),
+        )
+
+    with pytest.raises(ValueError, match="manifest.*SHA256"):
+        validate_publication_root(root)
+
+    assert manifest_path.read_bytes() == original_manifest
+    assert validation_path.read_bytes() == original_validation
+
+
+@pytest.mark.parametrize(
+    "case", ["missing", "extra", "path_escape", "hash_mismatch"]
+)
+def test_existing_manifest_rejects_invalid_file_table_without_rewriting_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    validate_publication_root(root)
+    manifest_path = root / "manifest.json"
+    validation_path = root / "validation.json"
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if case == "missing":
+        document["files"].pop("he/energy.csv")
+    elif case == "extra":
+        document["files"]["he/extra.csv"] = "0" * 64
+    elif case == "path_escape":
+        document["files"]["../outside.csv"] = "0" * 64
+    else:
+        document["files"]["he/energy.csv"] = "0" * 64
+    atomic_json_dump(manifest_path, document)
+    corrupted_manifest = manifest_path.read_bytes()
+    original_validation = validation_path.read_bytes()
+
+    with pytest.raises(ValueError, match="manifest"):
+        validate_publication_root(root)
+
+    assert manifest_path.read_bytes() == corrupted_manifest
+    assert validation_path.read_bytes() == original_validation
+
+
+def _rewrite_variant_summary(root: Path, variant: str, *, energy_alpha: float | None = None) -> None:
+    summary_path = root / variant / "summary.json"
+    previous = json.loads(summary_path.read_text(encoding="utf-8"))
+    atomic_json_dump(
+        summary_path,
+        summarize_variant(
+            root / variant,
+            variant=variant,
+            ridge_mode=previous["ridge"]["mode"],
+            ridge=previous["ridge"]["value"],
+            energy_alpha=(
+                previous["alpha"]["energy"]
+                if energy_alpha is None
+                else energy_alpha
+            ),
+            force_alpha=previous["alpha"]["forces"],
+            cholesky_diagnostics=previous["cholesky_diagnostics"],
+        ),
+    )
+
+
+@pytest.mark.parametrize("target", ["energy", "forces"])
+def test_validation_rejects_variance_alpha_squared_q_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    if target == "energy":
+        path = root / "he" / "energy.csv"
+        frame = pd.read_csv(path)
+        frame["q"] *= 2.0
+        frame.to_csv(path, index=False)
+    else:
+        path = root / "he" / "force_components.csv"
+        frame = pd.read_csv(path)
+        frame["q"] *= 2.0
+        frame.to_csv(path, index=False)
+        structure_path = root / "he" / "force_structure.csv"
+        structures = pd.read_csv(structure_path)
+        structures["mean_q"] *= 2.0
+        structures.to_csv(structure_path, index=False)
+    _rewrite_variant_summary(root, "he")
+
+    with pytest.raises(ValueError, match="variance.*alpha.*q"):
+        validate_publication_root(root)
+
+
+def test_validation_rejects_tiny_q_formula_mismatch_with_scale_aware_tolerance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / "he" / "energy.csv"
+    energy = pd.read_csv(path)
+    energy.loc[0, "q"] = 1.0e-30
+    energy.loc[0, "variance"] = 8.0e-30
+    energy.loc[0, "std"] = (8.0e-30) ** 0.5
+    energy.to_csv(path, index=False)
+    _rewrite_variant_summary(root, "he")
+
+    with pytest.raises(ValueError, match="variance.*alpha.*q"):
+        validate_publication_root(root)
+
+
+def test_validation_accepts_tiny_q_when_alpha_formula_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / "he" / "energy.csv"
+    energy = pd.read_csv(path)
+    energy.loc[0, "q"] = 1.0e-30
+    energy.loc[0, "variance"] = 4.0e-30
+    energy.loc[0, "std"] = (4.0e-30) ** 0.5
+    energy.to_csv(path, index=False)
+    _rewrite_variant_summary(root, "he")
+
+    assert validate_publication_root(root)["status"] == "valid"
+
+
+def test_validation_rejects_non_positive_summary_alpha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / "he" / "energy.csv"
+    energy = pd.read_csv(path)
+    energy["variance"] = 0.0
+    energy["std"] = 0.0
+    energy.to_csv(path, index=False)
+    _rewrite_variant_summary(root, "he", energy_alpha=0.0)
+
+    with pytest.raises(ValueError, match="alpha.*positive"):
+        validate_publication_root(root)
+
+
+def test_validation_requires_trusted_progress_identity_for_first_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    (root / "progress.pt").unlink()
+
+    with pytest.raises(ValueError, match="progress identity"):
+        validate_publication_root(root)
+
+    assert not (root / "manifest.json").exists()
+    assert not (root / "validation.json").exists()
+
+
+def test_existing_manifest_cannot_be_the_only_identity_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    validate_publication_root(root)
+    manifest_path = root / "manifest.json"
+    validation_path = root / "validation.json"
+    manifest_bytes = manifest_path.read_bytes()
+    validation_bytes = validation_path.read_bytes()
+    (root / "progress.pt").unlink()
+
+    with pytest.raises(ValueError, match="progress identity"):
+        validate_publication_root(root)
+
+    assert manifest_path.read_bytes() == manifest_bytes
+    assert validation_path.read_bytes() == validation_bytes
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "in_progress",
+        "missing_checkpoint",
+        "none_checkpoint",
+        "bad_readout",
+        "missing_build_data",
+        "missing_config",
+    ],
+)
+def test_validation_rejects_incomplete_or_untrusted_progress_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    identity = progress["identity"]
+    if case == "in_progress":
+        progress["status"] = "in_progress"
+    elif case == "missing_checkpoint":
+        identity.pop("checkpoint")
+    elif case == "none_checkpoint":
+        identity["checkpoint"] = None
+    elif case == "bad_readout":
+        identity["readout"] = "not-a-layout"
+    elif case == "missing_build_data":
+        identity["curvature"]["identity"]["build"] = None
+    else:
+        identity.pop("ridge")
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match="progress identity"):
+        validate_publication_root(root)
+
+    assert not (root / "manifest.json").exists()
+    assert not (root / "validation.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [("surplus", "surplus CSV values"), ("missing", "missing CSV values")],
+)
+def test_validation_rejects_surplus_or_missing_named_csv_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    message: str,
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / "he" / "energy.csv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if case == "surplus":
+        lines[1] += ",unexpected"
+    else:
+        lines[1] = lines[1].rsplit(",", 1)[0]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        validate_publication_root(root)

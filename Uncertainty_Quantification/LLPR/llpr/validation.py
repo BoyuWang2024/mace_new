@@ -169,7 +169,17 @@ def _read_csv(path: Path, fields: Sequence[str]) -> list[dict[str, str]]:
             reader = csv.DictReader(handle)
             if reader.fieldnames != list(fields):
                 raise ValueError(f"CSV schema mismatch for {path}")
-            return list(reader)
+            rows = list(reader)
+            for row_index, row in enumerate(rows):
+                if None in row:
+                    raise ValueError(
+                        f"{path} row {row_index} contains surplus CSV values"
+                    )
+                if any(row[field] is None for field in fields):
+                    raise ValueError(
+                        f"{path} row {row_index} contains missing CSV values"
+                    )
+            return rows
     except (OSError, UnicodeError, csv.Error) as error:
         raise ValueError(f"invalid CSV file {path}") from error
 
@@ -430,7 +440,7 @@ def _validate_summary(
     energy_rows: Sequence[Mapping[str, str]],
     force_rows: Sequence[Mapping[str, str]],
     force_structure_summary: Mapping[str, Any],
-) -> None:
+) -> dict[str, float]:
     source = f"{variant}/summary.json"
     document = _require_keys(_strict_json_load(root / source), _SUMMARY_FIELDS, source)
     if document["schema_version"] != SCHEMA_VERSION:
@@ -448,8 +458,13 @@ def _validate_summary(
         raise ValueError(f"{source} summary ridge value mismatch")
     alpha = _require_keys(document["alpha"], {"energy", "forces"}, f"{source}.alpha")
     for target, value in alpha.items():
-        if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0:
-            raise ValueError(f"{source} summary {target} alpha mismatch")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+        ):
+            raise ValueError(f"{source} summary {target} alpha must be finite and positive")
     expected_counts = {
         "structures": len(energy_rows),
         "force_components": len(force_rows),
@@ -481,6 +496,24 @@ def _validate_summary(
                 raise ValueError(f"{source} summary cholesky diagnostics mismatch")
         elif isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             raise ValueError(f"{source} summary cholesky diagnostics mismatch")
+    return {target: float(value) for target, value in alpha.items()}
+
+
+def _validate_variance_formula(
+    rows: Sequence[Mapping[str, str]], alpha: float, source: str
+) -> None:
+    for row_index, row in enumerate(rows):
+        row_source = f"{source} row {row_index}"
+        q_value = _finite(row, "q", row_source)
+        variance = _finite(row, "variance", row_source)
+        expected = alpha * alpha * q_value
+        scale = max(abs(variance), abs(expected), 1.0e-30)
+        if abs(variance - expected) > RELATIVE_TOLERANCE * scale:
+            raise ValueError(
+                f"{row_source} variance does not match alpha squared times q"
+            )
+
+
 
 
 def _correlation(left: Sequence[float], right: Sequence[float]) -> float | None:
@@ -581,18 +614,91 @@ def _normalise_identities(identity: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+
+
+def _trusted_progress_identity(
+    root: Path, explicit_identity: Mapping[str, Any] | None
+) -> Mapping[str, Any]:
+    progress_path = root / "progress.pt"
+    if not progress_path.is_file():
+        raise ValueError("trusted evaluation progress identity is missing")
+    progress = load_torch_artifact(progress_path)
+    if not isinstance(progress, Mapping) or progress.get("status") != "complete":
+        raise ValueError("trusted evaluation progress identity requires complete progress")
+    identity = progress.get("identity")
+    if not isinstance(identity, Mapping):
+        raise ValueError("trusted evaluation progress identity must be a mapping")
+    if explicit_identity is not None and _strict_json_bytes(identity) != _strict_json_bytes(
+        explicit_identity
+    ):
+        raise ValueError("trusted evaluation progress identity mismatch")
+
+    required = {
+        "schema_version",
+        "formula_version",
+        "checkpoint",
+        "readout",
+        "curvature",
+        "calibration",
+        "test",
+        "ridge",
+        "min_q",
+        "limits",
+        "observables",
+    }
+    if not required.issubset(identity):
+        raise ValueError("trusted evaluation progress identity is missing required fields")
+    if identity["schema_version"] != SCHEMA_VERSION or identity[
+        "formula_version"
+    ] != FORMULA_VERSION:
+        raise ValueError("trusted evaluation progress identity version mismatch")
+    for field in (
+        "checkpoint",
+        "readout",
+        "curvature",
+        "calibration",
+        "test",
+        "ridge",
+        "limits",
+        "observables",
+    ):
+        if not isinstance(identity[field], Mapping) or not identity[field]:
+            raise ValueError(f"trusted evaluation progress identity {field} is invalid")
+    checkpoint = identity["checkpoint"]
+    if not isinstance(checkpoint.get("sha256"), str):
+        raise ValueError("trusted evaluation progress identity checkpoint is invalid")
+    readout = identity["readout"]
+    if (
+        not isinstance(readout.get("names"), list)
+        or not isinstance(readout.get("shapes"), list)
+        or isinstance(readout.get("size"), bool)
+        or not isinstance(readout.get("size"), int)
+        or readout["size"] <= 0
+    ):
+        raise ValueError("trusted evaluation progress identity readout is invalid")
+    curvature_identity = identity["curvature"].get("identity")
+    calibration_identity = identity["calibration"].get("identity")
+    build = curvature_identity.get("build") if isinstance(curvature_identity, Mapping) else None
+    calibration_data = (
+        calibration_identity.get("calibration")
+        if isinstance(calibration_identity, Mapping)
+        else None
+    )
+    for field, value in (
+        ("build data", build),
+        ("calibration data", calibration_data),
+        ("test data", identity["test"]),
+    ):
+        if not isinstance(value, Mapping) or not isinstance(value.get("sha256"), str):
+            raise ValueError(f"trusted evaluation progress identity {field} is invalid")
+    min_q = identity["min_q"]
+    if isinstance(min_q, bool) or not isinstance(min_q, (int, float)) or not math.isfinite(float(min_q)) or float(min_q) <= 0.0:
+        raise ValueError("trusted evaluation progress identity min_q is invalid")
+    return identity
 def _publication_identities(
     root: Path, explicit_identity: Mapping[str, Any] | None
 ) -> dict[str, Any]:
-    source: Mapping[str, Any] | None = explicit_identity
-    progress_path = root / "progress.pt"
-    if source is None and progress_path.is_file():
-        progress = load_torch_artifact(progress_path)
-        if not isinstance(progress, Mapping) or not isinstance(
-            progress.get("identity"), Mapping
-        ):
-            raise ValueError("evaluation progress identity is invalid")
-        source = progress["identity"]
+    source = _trusted_progress_identity(root, explicit_identity)
 
     existing_path = root / "manifest.json"
     existing: Mapping[str, Any] | None = None
@@ -645,6 +751,59 @@ def _observations_aligned(
     )
 
 
+def _canonical_file_hashes(root: Path) -> dict[str, str]:
+    return {
+        f"{variant}/{filename}": sha256_file(root / variant / filename)
+        for variant in _VARIANTS
+        for filename in _CANONICAL_FILES
+    }
+
+
+def _validate_existing_manifest(
+    root: Path, identities: Mapping[str, Any]
+) -> None:
+    source = "manifest.json"
+    document = _require_keys(
+        _strict_json_load(root / source),
+        {
+            "schema_version",
+            "formula_version",
+            "identities",
+            "units",
+            "conventions",
+            "schemas",
+            "files",
+        },
+        source,
+    )
+    if document["schema_version"] != SCHEMA_VERSION or document[
+        "formula_version"
+    ] != FORMULA_VERSION:
+        raise ValueError("manifest schema or formula identity mismatch")
+    if _strict_json_bytes(document["identities"]) != _strict_json_bytes(
+        identities
+    ):
+        raise ValueError("manifest identity mismatch")
+    if document["units"] != {"energy": "eV/atom", "forces": "eV/" + chr(197)}:
+        raise ValueError("manifest units mismatch")
+    expected_schemas = {
+        "energy.csv": list(ENERGY_FIELDS),
+        "force_components.csv": list(FORCE_FIELDS),
+        "force_structure.csv": list(FORCE_STRUCTURE_FIELDS),
+        "summary.json": sorted(_SUMMARY_FIELDS),
+    }
+    if document["schemas"] != expected_schemas:
+        raise ValueError("manifest schemas mismatch")
+    files = document["files"]
+    expected_hashes = _canonical_file_hashes(root)
+    if not isinstance(files, Mapping) or set(files) != set(expected_hashes):
+        raise ValueError("manifest files schema mismatch")
+    for relative_path, expected_hash in expected_hashes.items():
+        actual_hash = files[relative_path]
+        if not isinstance(actual_hash, str) or actual_hash != expected_hash:
+            raise ValueError(f"manifest SHA256 mismatch for {relative_path}")
+
+
 def validate_publication_root(
     publication_root: Path,
     *,
@@ -658,6 +817,11 @@ def validate_publication_root(
     root = Path(publication_root)
     if not root.is_dir():
         raise ValueError(f"publication root is not a directory: {root}")
+    identities = _publication_identities(root, identity)
+    manifest_path = root / "manifest.json"
+    manifest_exists = manifest_path.is_file()
+    if manifest_exists:
+        _validate_existing_manifest(root, identities)
 
     diagnostics: dict[str, Any] = {}
     energy_baseline: list[tuple[str, int, float, float, float]] | None = None
@@ -671,8 +835,14 @@ def validate_publication_root(
         force_structure = _validate_force_structures(
             root, variant, energy, force_rows
         )
-        _validate_summary(
+        alphas = _validate_summary(
             root, variant, energy_rows, force_rows, force_structure
+        )
+        _validate_variance_formula(
+            energy_rows, alphas["energy"], f"{variant}/energy.csv"
+        )
+        _validate_variance_formula(
+            force_rows, alphas["forces"], f"{variant}/force_components.csv"
         )
         if energy_baseline is None:
             energy_baseline = energy
@@ -690,12 +860,7 @@ def validate_publication_root(
             "forces": _quality_diagnostics(force_residuals, force_std),
         }
 
-    identities = _publication_identities(root, identity)
-    file_hashes = {
-        f"{variant}/{filename}": sha256_file(root / variant / filename)
-        for variant in _VARIANTS
-        for filename in _CANONICAL_FILES
-    }
+    file_hashes = _canonical_file_hashes(root)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
@@ -718,7 +883,8 @@ def validate_publication_root(
         },
         "files": file_hashes,
     }
-    _atomic_strict_json_dump(root / "manifest.json", manifest)
+    if not manifest_exists:
+        _atomic_strict_json_dump(manifest_path, manifest)
     report = {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
