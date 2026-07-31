@@ -1,10 +1,7 @@
-"""Entry point reserved for the LLPR command-line interface."""
+"""Module entry point for the LLPR command-line interface."""
 
-
-def main() -> None:
-    """Run the LLPR command-line interface."""
-    raise SystemExit("The LLPR command-line interface is not implemented yet.")
+from .cli import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,0 +1,7 @@
+publication_root: ../outputs/gpu_full/8f147ecffa1d/evaluation/deterministic
+output_dir: ../outputs/gpu_full/8f147ecffa1d/plots
+selected:
+  - [he, energy]
+  - [hf, forces]
+  - [hef, energy]
+  - [hef, forces]

@@ -17,6 +17,8 @@ from .artifacts import (
     sha256_file,
     stable_id,
 )
+from .config import LLPRConfig
+from .curvature import run_root
 
 
 RELATIVE_TOLERANCE = 1.0e-12
@@ -1295,3 +1297,21 @@ def validate_publication_root(
     }
     _atomic_strict_json_dump(root / "validation.json", report)
     return report
+
+
+def run_validate(config: LLPRConfig) -> dict[str, Any]:
+    """Locate and validate one workflow's deterministic evaluation output."""
+    checkpoint_sha256 = sha256_file(config.checkpoint.path)
+    expected_sha256 = config.checkpoint.expected_sha256
+    if (
+        expected_sha256 is not None
+        and checkpoint_sha256.lower() != expected_sha256.lower()
+    ):
+        raise ValueError(
+            "checkpoint SHA256 mismatch: "
+            f"expected {expected_sha256}, actual {checkpoint_sha256}"
+        )
+    publication_root = (
+        run_root(config, checkpoint_sha256) / "evaluation" / "deterministic"
+    )
+    return validate_publication_root(publication_root)
