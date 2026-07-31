@@ -41,6 +41,7 @@ from Uncertainty_Quantification.LLPR.llpr.inference import (
 )
 from Uncertainty_Quantification.LLPR.llpr.observables import StructureJacobians
 from Uncertainty_Quantification.LLPR.llpr.readout import ReadoutLayout
+from Uncertainty_Quantification.LLPR.llpr.validation import validate_publication_root
 
 
 _VARIANTS = ("he", "hf", "hef")
@@ -824,3 +825,268 @@ def test_evaluation_progress_identity_covers_all_semantic_inputs_and_is_weights_
         "resume",
     ):
         assert excluded not in identity_text
+
+
+def _evaluated_publication_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    return run_evaluate(config)
+
+
+def test_validate_publication_root_writes_deterministic_strict_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+
+    report = validate_publication_root(root)
+    first_manifest = (root / "manifest.json").read_bytes()
+    first_validation = (root / "validation.json").read_bytes()
+    second_report = validate_publication_root(root)
+
+    assert report == second_report
+    assert report["status"] == "valid"
+    assert (root / "manifest.json").read_bytes() == first_manifest
+    assert (root / "validation.json").read_bytes() == first_validation
+    manifest = json.loads(first_manifest)
+    assert manifest["schema_version"] == SCHEMA_VERSION
+    assert manifest["formula_version"] == FORMULA_VERSION
+    assert set(manifest["identities"]) == {
+        "checkpoint",
+        "data",
+        "readout",
+        "config",
+    }
+    assert manifest["units"] == {"energy": "eV/atom", "forces": "eV/" + chr(197)}
+    assert manifest["conventions"]["residual"] == "reference_minus_prediction"
+    assert set(manifest["files"]) == {
+        f"{variant}/{filename}"
+        for variant in _VARIANTS
+        for filename in (
+            "energy.csv",
+            "force_components.csv",
+            "force_structure.csv",
+            "summary.json",
+        )
+    }
+    serialized = first_manifest + first_validation
+    assert b"timestamp" not in serialized
+    assert b"NaN" not in serialized
+    assert b"Infinity" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "field", "value", "message"),
+    [
+        ("he/energy.csv", "residual", 999.0, "residual"),
+        ("he/energy.csv", "q", -1.0, "q"),
+        ("he/energy.csv", "variance", -1.0, "variance"),
+        ("he/energy.csv", "std", -1.0, "std"),
+        ("he/energy.csv", "std", 123.0, "std.*variance"),
+        ("he/energy.csv", "reference", float("inf"), "finite"),
+        ("he/force_components.csv", "direction", 3, "direction"),
+        ("he/force_components.csv", "atom_index", 1, "atom_index"),
+    ],
+)
+def test_validation_rejects_invalid_numeric_contracts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+    field: str,
+    value: float,
+    message: str,
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / relative_path
+    frame = pd.read_csv(path)
+    frame.loc[0, field] = value
+    frame.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match=message):
+        validate_publication_root(root)
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "mutation", "message"),
+    [
+        (
+            "he/energy.csv",
+            lambda frame: pd.concat([frame, frame.iloc[[0]]], ignore_index=True),
+            "duplicate",
+        ),
+        (
+            "he/force_components.csv",
+            lambda frame: frame.iloc[:-1].copy(),
+            "force component",
+        ),
+        (
+            "he/force_components.csv",
+            lambda frame: frame.iloc[::-1].reset_index(drop=True),
+            "order|alignment",
+        ),
+        (
+            "he/force_structure.csv",
+            lambda frame: frame.iloc[::-1].reset_index(drop=True),
+            "alignment",
+        ),
+    ],
+)
+def test_validation_rejects_duplicate_missing_or_reordered_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+    mutation: object,
+    message: str,
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / relative_path
+    frame = mutation(pd.read_csv(path))  # type: ignore[operator]
+    frame.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match=message):
+        validate_publication_root(root)
+
+
+def test_validation_rejects_variant_misalignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    frame = pd.read_csv(root / "hf" / "energy.csv")
+    frame.loc[0, "structure_id"] = "different"
+    frame.to_csv(root / "hf" / "energy.csv", index=False)
+
+    with pytest.raises(ValueError, match="variant alignment"):
+        validate_publication_root(root)
+
+
+def test_validation_rejects_cross_variant_force_observation_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / "hf" / "force_components.csv"
+    frame = pd.read_csv(path)
+    frame.loc[0, "prediction"] += 1.0
+    frame.loc[0, "residual"] -= 1.0
+    frame.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="variant alignment"):
+        validate_publication_root(root)
+
+
+def test_validation_rejects_stale_or_malformed_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / "he" / "summary.json"
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    summary["energy"]["mae"] = 999.0
+    atomic_json_dump(path, summary)
+
+    with pytest.raises(ValueError, match="summary"):
+        validate_publication_root(root)
+
+
+def test_validation_reports_quality_diagnostics_without_gating_and_handles_zero_std(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    for variant in _VARIANTS:
+        energy_path = root / variant / "energy.csv"
+        energy = pd.read_csv(energy_path)
+        energy["prediction"] = energy["reference"]
+        energy["residual"] = 0.0
+        energy["q"] = 0.0
+        energy["variance"] = 0.0
+        energy["std"] = 0.0
+        energy.to_csv(energy_path, index=False)
+        summary_path = root / variant / "summary.json"
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary = summarize_variant(
+            root / variant,
+            variant=variant,
+            ridge_mode="fixed",
+            ridge=1.0,
+            energy_alpha=2.0,
+            force_alpha=3.0,
+            cholesky_diagnostics=previous["cholesky_diagnostics"],
+        )
+        atomic_json_dump(summary_path, summary)
+
+    report = validate_publication_root(root)
+
+    assert report["status"] == "valid"
+    energy_diagnostics = report["diagnostics"]["he"]["energy"]
+    assert energy_diagnostics["coverage_1sigma"] == 1.0
+    assert energy_diagnostics["standardized_residual"]["rows"] == 2
+    assert energy_diagnostics["uncertainty_residual_correlation"] is None
+    serialized = (root / "validation.json").read_text(encoding="utf-8")
+    assert "NaN" not in serialized
+    assert "Infinity" not in serialized
+
+
+def test_revalidation_after_valid_content_change_generates_matching_new_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    validate_publication_root(root)
+    first_manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+
+    for variant in _VARIANTS:
+        path = root / variant / "energy.csv"
+        energy = pd.read_csv(path)
+        energy["q"] *= 2.0
+        energy["variance"] *= 2.0
+        energy["std"] = energy["variance"] ** 0.5
+        energy.to_csv(path, index=False)
+        summary_path = root / variant / "summary.json"
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary = summarize_variant(
+            root / variant,
+            variant=variant,
+            ridge_mode=previous["ridge"]["mode"],
+            ridge=previous["ridge"]["value"],
+            energy_alpha=previous["alpha"]["energy"],
+            force_alpha=previous["alpha"]["forces"],
+            cholesky_diagnostics=previous["cholesky_diagnostics"],
+        )
+        atomic_json_dump(summary_path, summary)
+
+    validate_publication_root(root)
+    second_manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+
+    assert second_manifest["files"]["he/energy.csv"] != first_manifest["files"][
+        "he/energy.csv"
+    ]
+    assert json.loads((root / "validation.json").read_text(encoding="utf-8"))[
+        "manifest_sha256"
+    ] == sha256_file(root / "manifest.json")
+
+
+def test_variant_alignment_accepts_values_within_documented_tolerance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / "hf" / "energy.csv"
+    energy = pd.read_csv(path)
+    energy.loc[0, "prediction"] += 5.0e-13
+    energy.loc[0, "residual"] -= 5.0e-13
+    energy.to_csv(path, index=False)
+    summary_path = root / "hf" / "summary.json"
+    previous = json.loads(summary_path.read_text(encoding="utf-8"))
+    atomic_json_dump(
+        summary_path,
+        summarize_variant(
+            root / "hf",
+            variant="hf",
+            ridge_mode=previous["ridge"]["mode"],
+            ridge=previous["ridge"]["value"],
+            energy_alpha=previous["alpha"]["energy"],
+            force_alpha=previous["alpha"]["forces"],
+            cholesky_diagnostics=previous["cholesky_diagnostics"],
+        ),
+    )
+
+    report = validate_publication_root(root)
+
+    assert report["status"] == "valid"
