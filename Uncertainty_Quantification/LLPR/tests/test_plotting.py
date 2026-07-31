@@ -1,0 +1,294 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+import matplotlib
+import numpy as np
+import pandas as pd
+import pytest
+from PIL import Image
+
+from Uncertainty_Quantification.LLPR.llpr.artifacts import atomic_json_dump
+from Uncertainty_Quantification.LLPR.llpr.inference import summarize_variant
+from Uncertainty_Quantification.LLPR.llpr.plotting import (
+    DEFAULT_SELECTED,
+    FIGURE_STEMS,
+    PLOTTING_STATISTICS_FIELDS,
+    run_plot,
+)
+from Uncertainty_Quantification.LLPR.tests import (
+    test_inference_validation as publication_support,
+)
+
+
+matplotlib.use("Agg", force=True)
+
+EXPECTED_STATISTICS_FIELDS = (
+    "variant", "target", "data_level", "unit", "rows", "log_plot_rows",
+    "zero_std_rows", "zero_absolute_residual_rows", "mae", "rmse",
+    "mean_std", "median_std", "coverage_1sigma", "coverage_2sigma",
+    "coverage_3sigma", "standardized_residual_rows",
+    "mean_absolute_standardized_residual", "uncertainty_residual_correlation",
+    "shared_axis_min", "shared_axis_max",
+)
+EXPECTED_FIGURE_STEMS = (
+    "selected_uncertainty_residual",
+    "energy_comparison",
+    "force_component_comparison",
+    "force_structure_comparison",
+    "reliability",
+    "standardized_residual_cdf",
+)
+
+
+def _publication_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    return publication_support._evaluated_publication_root(tmp_path, monkeypatch)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _strict_json(path: Path) -> dict[str, object]:
+    def reject_constant(value: str) -> None:
+        raise ValueError(value)
+
+    return json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_constant)
+
+
+def _rewrite_energy_with_zero_pair(root: Path) -> None:
+    for variant in ("he", "hf", "hef"):
+        path = root / variant / "energy.csv"
+        frame = pd.read_csv(path)
+        frame.loc[0, "prediction"] = frame.loc[0, "reference"]
+        frame.loc[0, ["residual", "q", "variance", "std"]] = 0.0
+        frame.to_csv(path, index=False)
+        summary_path = root / variant / "summary.json"
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        atomic_json_dump(
+            summary_path,
+            summarize_variant(
+                root / variant,
+                variant=variant,
+                ridge_mode=previous["ridge"]["mode"],
+                ridge=previous["ridge"]["value"],
+                energy_alpha=previous["alpha"]["energy"],
+                force_alpha=previous["alpha"]["forces"],
+                cholesky_diagnostics=previous["cholesky_diagnostics"],
+            ),
+        )
+
+
+def test_default_selected_paths() -> None:
+    assert DEFAULT_SELECTED == (
+        ("he", "energy"),
+        ("hf", "forces"),
+        ("hef", "energy"),
+        ("hef", "forces"),
+    )
+
+
+def test_fixed_statistics_and_figure_contracts() -> None:
+    assert PLOTTING_STATISTICS_FIELDS == EXPECTED_STATISTICS_FIELDS
+    assert FIGURE_STEMS == EXPECTED_FIGURE_STEMS
+
+
+def test_energy_plot_uses_per_atom_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _publication_root(tmp_path, monkeypatch)
+    result = run_plot(root, output_dir=tmp_path / "plots")
+    stats = pd.read_csv(result / "plotting_statistics.csv")
+    row = stats.query("variant == 'he' and target == 'energy'").iloc[0]
+    assert row["unit"] == "eV/atom"
+    assert row["rows"] == 2
+
+
+def test_run_plot_generates_real_nonempty_png_pdf_and_fixed_statistics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _publication_root(tmp_path, monkeypatch)
+    result = run_plot(root, output_dir=tmp_path / "plots")
+    expected_figures = {
+        f"{stem}.{suffix}"
+        for stem in EXPECTED_FIGURE_STEMS
+        for suffix in ("png", "pdf")
+    }
+    actual_figures = {
+        path.name for path in result.iterdir() if path.suffix in {".png", ".pdf"}
+    }
+    assert actual_figures == expected_figures
+    for stem in EXPECTED_FIGURE_STEMS:
+        png = result / f"{stem}.png"
+        pdf = result / f"{stem}.pdf"
+        assert png.stat().st_size > 1_000
+        with Image.open(png) as image:
+            image.verify()
+            assert image.width >= 600
+            assert image.height >= 400
+        pdf_bytes = pdf.read_bytes()
+        assert len(pdf_bytes) > 1_000
+        assert pdf_bytes.startswith(b"%PDF-")
+        assert pdf_bytes.rstrip().endswith(b"%%EOF")
+
+    statistics = pd.read_csv(result / "plotting_statistics.csv")
+    assert tuple(statistics.columns) == EXPECTED_STATISTICS_FIELDS
+    assert list(statistics[["data_level", "variant"]].itertuples(index=False, name=None)) == [
+        (level, variant)
+        for level in ("energy", "force_component", "force_structure")
+        for variant in ("he", "hf", "hef")
+    ]
+    assert set(statistics.query("data_level == 'energy'")["unit"]) == {"eV/atom"}
+    assert set(statistics.query("data_level != 'energy'")["unit"]) == {"eV/?"}
+    for _, group in statistics.groupby("data_level", sort=False):
+        assert group["shared_axis_min"].nunique() == 1
+        assert group["shared_axis_max"].nunique() == 1
+        assert group["shared_axis_min"].iloc[0] < group["shared_axis_max"].iloc[0]
+
+
+def test_zero_values_are_excluded_only_from_log_rendering_not_statistics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _publication_root(tmp_path, monkeypatch)
+    _rewrite_energy_with_zero_pair(root)
+    result = run_plot(root, output_dir=tmp_path / "plots")
+    statistics = pd.read_csv(result / "plotting_statistics.csv")
+    row = statistics.query("variant == 'he' and data_level == 'energy'").iloc[0]
+    source = pd.read_csv(root / "he" / "energy.csv")
+    expected_mae = float(np.mean(np.abs(source["residual"].to_numpy())))
+    assert row["rows"] == 2
+    assert row["log_plot_rows"] == 1
+    assert row["zero_std_rows"] == 1
+    assert row["zero_absolute_residual_rows"] == 1
+    assert row["mae"] == pytest.approx(expected_mae)
+    manifest = _strict_json(result / "plotting_manifest.json")
+    assert manifest["config"]["zero_strategy"] == (
+        "exclude non-positive coordinates from logarithmic rendering only; "
+        "retain every validated row in statistics"
+    )
+
+
+def test_plotting_manifest_is_strict_deterministic_and_hashes_every_consumed_input_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _publication_root(tmp_path, monkeypatch)
+    output = tmp_path / "plots"
+    first = run_plot(root, output_dir=output)
+    first_statistics = (first / "plotting_statistics.csv").read_bytes()
+    first_manifest = (first / "plotting_manifest.json").read_bytes()
+    first_hashes = {
+        path.name: _sha256(path)
+        for path in first.iterdir()
+        if path.name != "plotting_manifest.json"
+    }
+    second = run_plot(root, output_dir=output)
+    assert (second / "plotting_statistics.csv").read_bytes() == first_statistics
+    assert (second / "plotting_manifest.json").read_bytes() == first_manifest
+    assert {
+        path.name: _sha256(path)
+        for path in second.iterdir()
+        if path.name != "plotting_manifest.json"
+    } == first_hashes
+
+    manifest = _strict_json(second / "plotting_manifest.json")
+    assert set(manifest) == {
+        "schema_version", "formula_version", "status", "inputs", "outputs",
+        "config", "selected", "units", "figures", "shared_axes",
+    }
+    expected_inputs = {"manifest.json", "validation.json"} | {
+        f"{variant}/{filename}"
+        for variant in ("he", "hf", "hef")
+        for filename in (
+            "energy.csv", "force_components.csv", "force_structure.csv", "summary.json",
+        )
+    }
+    assert set(manifest["inputs"]) == expected_inputs
+    assert all(manifest["inputs"][name] == _sha256(root / name) for name in expected_inputs)
+    assert "plotting_manifest.json" not in manifest["outputs"]
+    expected_outputs = {path.name for path in second.iterdir()} - {"plotting_manifest.json"}
+    assert set(manifest["outputs"]) == expected_outputs
+    assert all(manifest["outputs"][name] == _sha256(second / name) for name in expected_outputs)
+    assert manifest["selected"] == [list(item) for item in DEFAULT_SELECTED]
+    assert manifest["units"] == {"energy": "eV/atom", "forces": "eV/?"}
+    assert not any(
+        forbidden in first_manifest.lower()
+        for forbidden in (b"timestamp", b"created_at", b"updated_at", b"nan", b"infinity")
+    )
+
+
+def test_manifest_figure_paths_follow_configured_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _publication_root(tmp_path, monkeypatch)
+    selected = (
+        ("hf", "energy"),
+        ("he", "forces"),
+        ("hef", "forces"),
+        ("hef", "energy"),
+    )
+
+    result = run_plot(root, output_dir=tmp_path / "plots", selected=selected)
+
+    manifest = _strict_json(result / "plotting_manifest.json")
+    assert manifest["selected"] == [list(item) for item in selected]
+    assert manifest["figures"]["selected_uncertainty_residual"]["paths"] == [
+        list(item) for item in selected
+    ]
+
+def test_invalid_publication_input_fails_before_replacing_existing_plots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _publication_root(tmp_path, monkeypatch)
+    output = run_plot(root, output_dir=tmp_path / "plots")
+    marker = output / "keep.txt"
+    marker.write_text("old plots", encoding="utf-8")
+    energy_path = root / "he" / "energy.csv"
+    energy_path.write_bytes(energy_path.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="manifest.*SHA256"):
+        run_plot(root, output_dir=output)
+    assert marker.read_text(encoding="utf-8") == "old plots"
+    assert not list(output.parent.glob(f".{output.name}.tmp-*"))
+
+
+def test_render_failure_preserves_existing_plots_and_cleans_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path, monkeypatch)
+    output = tmp_path / "plots"
+    output.mkdir()
+    marker = output / "keep.txt"
+    marker.write_text("old plots", encoding="utf-8")
+
+    def fail_render(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("simulated render failure")
+
+    monkeypatch.setattr(plotting, "_render_all_figures", fail_render)
+    with pytest.raises(RuntimeError, match="simulated render failure"):
+        run_plot(root, output_dir=output)
+    assert marker.read_text(encoding="utf-8") == "old plots"
+    assert not list(output.parent.glob(f".{output.name}.tmp-*"))
+
+
+@pytest.mark.parametrize("unsafe", ["root", "ancestor", "canonical_child"])
+def test_output_directory_cannot_replace_publication_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str
+) -> None:
+    root = _publication_root(tmp_path / "case", monkeypatch)
+    output = {"root": root, "ancestor": root.parent, "canonical_child": root / "he"}[unsafe]
+    before = {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*") if path.is_file()
+    }
+    with pytest.raises(ValueError, match="output_dir"):
+        run_plot(root, output_dir=output)
+    after = {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*") if path.is_file()
+    }
+    assert after == before
