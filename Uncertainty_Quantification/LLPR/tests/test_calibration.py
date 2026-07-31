@@ -349,6 +349,51 @@ def test_run_calibrate_identity_excludes_execution_only_settings_and_reuses(
     assert calls == [0]
 
 
+@pytest.mark.parametrize(
+    "corrupt",
+    ("artifact", "progress", "csv", "diagnostics"),
+)
+def test_run_calibrate_rejects_inconsistent_complete_cache_without_recomputing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corrupt: str,
+) -> None:
+    config = _config(tmp_path)
+    calls: list[int] = []
+    _install_fake_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_calibrate(config)
+    assert calls == [0]
+    calibration_dir = artifact_path.parent
+
+    if corrupt == "artifact":
+        artifact = load_torch_artifact(artifact_path)
+        artifact["records"][0]["alpha"] += 1.0
+        atomic_torch_save(artifact_path, artifact)
+    elif corrupt == "progress":
+        progress_path = calibration_dir / "progress.pt"
+        progress = load_torch_artifact(progress_path)
+        progress["accumulators"]["he"]["energy"]["sum"] += 1.0
+        atomic_torch_save(progress_path, progress)
+    elif corrupt == "csv":
+        csv_path = calibration_dir / "calibrations.csv"
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        rows[0]["alpha"] = str(float(rows[0]["alpha"]) + 1.0)
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    else:
+        diagnostics_path = calibration_dir / "ridge_diagnostics.json"
+        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        diagnostics["variants"]["he"]["ridge"] += 1.0
+        diagnostics_path.write_text(json.dumps(diagnostics), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="complete calibration"):
+        run_calibrate(config)
+    assert calls == [0]
+
+
 def test_run_calibrate_rejects_resume_identity_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

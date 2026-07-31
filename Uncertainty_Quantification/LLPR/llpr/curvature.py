@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -117,6 +119,7 @@ def _validate_progress(progress: Mapping[str, Any], size: int) -> None:
             or matrix.shape != (size, size)
             or matrix.device.type != "cpu"
             or matrix.dtype != torch.float64
+            or not torch.isfinite(matrix).all()
         ):
             raise ValueError(
                 f"curvature progress {field} must be CPU float64 with shape "
@@ -132,17 +135,72 @@ def _matching_identity(
 
 def _load_complete(
     artifact_path: Path,
+    diagnostics_path: Path,
+    progress: Mapping[str, Any],
     identity: Mapping[str, Any],
-) -> bool:
-    if not artifact_path.exists():
-        raise ValueError("complete curvature progress is missing base_curvature.pt")
+    size: int,
+    target_structures: int,
+) -> None:
+    if not artifact_path.is_file() or not diagnostics_path.is_file():
+        raise ValueError("complete curvature cache is missing an artifact")
+    if (
+        progress.get("status") != "complete"
+        or progress.get("next_index") != target_structures
+        or progress.get("structures") != target_structures
+    ):
+        raise ValueError("complete curvature progress count mismatch")
+
     artifact = load_torch_artifact(artifact_path)
     if not isinstance(artifact, Mapping):
-        raise ValueError("base curvature artifact must be a mapping")
+        raise ValueError("complete curvature artifact must be a mapping")
     require_identity(artifact.get("identity", {}), identity)
     if artifact.get("status") != "complete":
-        raise ValueError("base curvature artifact is not complete")
-    return True
+        raise ValueError("complete curvature artifact has an invalid status")
+    if artifact.get("structures") != progress.get("structures") or artifact.get(
+        "components"
+    ) != progress.get("components"):
+        raise ValueError("complete curvature artifact count mismatch")
+
+    source_variants = artifact.get("variants")
+    if not isinstance(source_variants, Mapping) or set(source_variants) != {
+        "he",
+        "hf",
+        "hef",
+    }:
+        raise ValueError("complete curvature artifact variants are invalid")
+    variants: dict[str, Tensor] = {}
+    for variant in ("he", "hf", "hef"):
+        matrix = source_variants[variant]
+        if (
+            not isinstance(matrix, Tensor)
+            or matrix.shape != (size, size)
+            or matrix.device.type != "cpu"
+            or matrix.dtype != torch.float64
+            or not torch.isfinite(matrix).all()
+        ):
+            raise ValueError(f"complete curvature {variant} matrix is invalid")
+        variants[variant] = matrix
+    if not torch.equal(variants["he"], progress["he"]) or not torch.equal(
+        variants["hf"], progress["hf"]
+    ):
+        raise ValueError("complete curvature artifact disagrees with progress")
+    if not torch.equal(variants["hef"], variants["he"] + variants["hf"]):
+        raise ValueError("complete curvature hef must equal he plus hf")
+
+    try:
+        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("complete curvature diagnostics are invalid") from error
+    expected_diagnostics = {
+        "identity": dict(identity),
+        "status": "complete",
+        "structures": progress["structures"],
+        "components": progress["components"],
+        "matrix_size": size,
+        "dtype": "torch.float64",
+    }
+    if canonical_json(diagnostics) != canonical_json(expected_diagnostics):
+        raise ValueError("complete curvature diagnostics mismatch")
 
 
 def run_build(config: LLPRConfig) -> Path:
@@ -163,6 +221,9 @@ def run_build(config: LLPRConfig) -> Path:
         loaded.identity.selected_head,
     )
     identity = _build_identity(config, loaded.identity, dataset, layout)
+    target_structures = dataset.size
+    if config.runtime.max_structures is not None:
+        target_structures = min(target_structures, config.runtime.max_structures)
 
     curvature_dir = run_root(config, loaded.identity.sha256) / "curvature"
     progress_path = curvature_dir / "progress.pt"
@@ -180,7 +241,14 @@ def run_build(config: LLPRConfig) -> Path:
             and _matching_identity(candidate_identity, identity)
         ):
             _validate_progress(candidate, layout.size)
-            _load_complete(artifact_path, identity)
+            _load_complete(
+                artifact_path,
+                diagnostics_path,
+                candidate,
+                identity,
+                layout.size,
+                target_structures,
+            )
             return artifact_path
         if config.runtime.resume:
             require_identity(candidate_identity, identity)
@@ -192,9 +260,6 @@ def run_build(config: LLPRConfig) -> Path:
         progress = _new_progress(identity, layout.size)
         atomic_torch_save(progress_path, progress)
 
-    target_structures = dataset.size
-    if config.runtime.max_structures is not None:
-        target_structures = min(target_structures, config.runtime.max_structures)
     if progress["next_index"] > target_structures:
         raise ValueError("curvature progress next_index exceeds the build limit")
 

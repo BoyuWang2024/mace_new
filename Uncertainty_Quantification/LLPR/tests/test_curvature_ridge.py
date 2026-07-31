@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from Uncertainty_Quantification.LLPR.llpr.artifacts import (
+    atomic_torch_save,
     load_torch_artifact,
 )
 from Uncertainty_Quantification.LLPR.llpr.checkpoint import (
@@ -364,6 +365,24 @@ def test_run_build_reuses_complete_artifact_across_execution_only_changes(
     _install_fake_pipeline(monkeypatch, changed_config, calls=calls)
 
     assert run_build(changed_config) == artifact_path
+    assert calls == [0, 1]
+
+
+def test_run_build_rejects_inconsistent_complete_curvature_without_recomputing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    calls: list[int] = []
+    _install_fake_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_build(config)
+    assert calls == [0, 1]
+
+    artifact = load_torch_artifact(artifact_path)
+    artifact["variants"]["hef"][0, 0] += 1.0
+    atomic_torch_save(artifact_path, artifact)
+
+    with pytest.raises(ValueError, match="complete curvature"):
+        run_build(config)
     assert calls == [0, 1]
 
 

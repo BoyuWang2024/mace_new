@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 from dataclasses import asdict, dataclass
@@ -278,19 +279,73 @@ def _validate_complete_artifacts(
     csv_path: Path,
     diagnostics_path: Path,
     identity: Mapping[str, Any],
+    progress: Mapping[str, Any],
+    ridges: Mapping[str, RidgeRecord],
+    variants: Mapping[str, Tensor],
+    target_structures: int,
 ) -> None:
     for path in (artifact_path, csv_path, diagnostics_path):
-        if not path.exists():
-            raise ValueError(f"complete calibration is missing {path.name}")
+        if not path.is_file():
+            raise ValueError(f"complete calibration cache is missing {path.name}")
+    if (
+        progress.get("status") != "complete"
+        or progress.get("next_index") != target_structures
+        or progress.get("structures") != target_structures
+    ):
+        raise ValueError("complete calibration progress count mismatch")
+
+    expected_records = _records_from_progress(progress, ridges)
+    expected_rows = [asdict(record) for record in expected_records]
     artifact = load_torch_artifact(artifact_path)
     if not isinstance(artifact, Mapping):
-        raise ValueError("calibrations artifact must be a mapping")
+        raise ValueError("complete calibration artifact must be a mapping")
     require_identity(artifact.get("identity", {}), identity)
     if artifact.get("status") != "complete":
-        raise ValueError("calibrations artifact is not complete")
-    records = artifact.get("records")
-    if not isinstance(records, list) or len(records) != 6:
-        raise ValueError("calibrations artifact must contain exactly six records")
+        raise ValueError("complete calibration artifact has an invalid status")
+    if canonical_json(artifact.get("records")) != canonical_json(expected_rows):
+        raise ValueError("complete calibration artifact records mismatch")
+
+    fields = list(CalibrationRecord.__dataclass_fields__)
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames != fields:
+                raise ValueError("complete calibration CSV schema mismatch")
+            source_rows = list(reader)
+    except (OSError, UnicodeError, csv.Error) as error:
+        raise ValueError("complete calibration CSV is invalid") from error
+    csv_rows: list[dict[str, Any]] = []
+    for row in source_rows:
+        if None in row or any(row.get(field) is None for field in fields):
+            raise ValueError("complete calibration CSV row width mismatch")
+        try:
+            csv_rows.append(
+                asdict(
+                    CalibrationRecord(
+                        variant=row["variant"],
+                        target=row["target"],
+                        ridge_mode=row["ridge_mode"],
+                        ridge=float(row["ridge"]),
+                        alpha=float(row["alpha"]),
+                        rows=int(row["rows"]),
+                        mean_residual_squared_over_q=float(
+                            row["mean_residual_squared_over_q"]
+                        ),
+                    )
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("complete calibration CSV value is invalid") from error
+    if canonical_json(csv_rows) != canonical_json(expected_rows):
+        raise ValueError("complete calibration CSV records mismatch")
+
+    try:
+        diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("complete calibration diagnostics are invalid") from error
+    expected_diagnostics = _ridge_diagnostics(identity, variants, ridges)
+    if canonical_json(diagnostics) != canonical_json(expected_diagnostics):
+        raise ValueError("complete calibration diagnostics mismatch")
 
 
 def _atomic_csv_dump(path: Path, records: list[CalibrationRecord]) -> None:
@@ -416,6 +471,9 @@ def run_calibrate(config: LLPRConfig) -> Path:
     artifact_path = calibration_dir / "calibrations.pt"
     csv_path = calibration_dir / "calibrations.csv"
     diagnostics_path = calibration_dir / "ridge_diagnostics.json"
+    target_structures = dataset.size
+    if config.runtime.max_structures is not None:
+        target_structures = min(target_structures, config.runtime.max_structures)
 
     progress: dict[str, Any] | None = None
     if progress_path.exists():
@@ -430,7 +488,14 @@ def run_calibrate(config: LLPRConfig) -> Path:
         ):
             _validate_progress(candidate)
             _validate_complete_artifacts(
-                artifact_path, csv_path, diagnostics_path, identity
+                artifact_path,
+                csv_path,
+                diagnostics_path,
+                identity,
+                candidate,
+                ridges,
+                variants,
+                target_structures,
             )
             return artifact_path
         if config.runtime.resume:
@@ -448,9 +513,6 @@ def run_calibrate(config: LLPRConfig) -> Path:
         progress = _new_progress(identity)
         atomic_torch_save(progress_path, progress)
 
-    target_structures = dataset.size
-    if config.runtime.max_structures is not None:
-        target_structures = min(target_structures, config.runtime.max_structures)
     if progress["next_index"] > target_structures:
         raise ValueError("calibration progress next_index exceeds the calibration limit")
 
