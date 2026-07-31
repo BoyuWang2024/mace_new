@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import csv
+import ctypes
+import fcntl
 import json
 import math
 import os
 import shutil
+import stat
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -62,7 +66,11 @@ PLOTTING_STATISTICS_FIELDS = (
     "coverage_3sigma",
     "standardized_residual_rows",
     "mean_absolute_standardized_residual",
+    "undefined_standardized_residual_rows",
+    "zero_zero_standardized_residual_rows",
     "uncertainty_residual_correlation",
+    "correlation_valid_rows",
+    "correlation_degenerate",
     "shared_axis_min",
     "shared_axis_max",
 )
@@ -125,7 +133,7 @@ def _load_plot_data(root: Path) -> dict[str, dict[str, _PanelData]]:
             squared_error_values=force_residual**2,
             target="forces",
             data_level="force_component",
-            unit="eV/?",
+            unit="eV/\u00c5",
         )
 
         structures = pd.read_csv(root / variant / "force_structure.csv")
@@ -138,7 +146,7 @@ def _load_plot_data(root: Path) -> dict[str, dict[str, _PanelData]]:
             squared_error_values=structure_rmse**2,
             target="forces",
             data_level="force_structure",
-            unit="eV/?",
+            unit="eV/\u00c5",
         )
     return result
 
@@ -166,11 +174,33 @@ def _all_shared_limits(
     return {level: _shared_log_limits(data[level]) for level in data}
 
 
-def _correlation(left: np.ndarray, right: np.ndarray) -> float | None:
-    if left.size < 2 or np.ptp(left) == 0.0 or np.ptp(right) == 0.0:
-        return None
-    value = float(np.corrcoef(left, right)[0, 1])
-    return value if math.isfinite(value) else None
+def _standardized_residuals(
+    panel: _PanelData,
+) -> tuple[np.ndarray, int, int]:
+    positive_std = panel.uncertainty > 0.0
+    zero_zero = (panel.uncertainty == 0.0) & (panel.signed_residual == 0.0)
+    undefined = (panel.uncertainty == 0.0) & (panel.signed_residual != 0.0)
+    values = np.abs(
+        panel.signed_residual[positive_std] / panel.uncertainty[positive_std]
+    )
+    if np.any(zero_zero):
+        values = np.concatenate(
+            (values, np.zeros(int(np.count_nonzero(zero_zero)), dtype=np.float64))
+        )
+    return values, int(np.count_nonzero(undefined)), int(np.count_nonzero(zero_zero))
+
+
+def _correlation(left: np.ndarray, right: np.ndarray) -> tuple[float, int, int]:
+    valid = np.isfinite(left) & np.isfinite(right)
+    valid_left = left[valid]
+    valid_right = right[valid]
+    count = int(valid_left.size)
+    if count < 2 or np.ptp(valid_left) == 0.0 or np.ptp(valid_right) == 0.0:
+        return 0.0, count, 1
+    value = float(np.corrcoef(valid_left, valid_right)[0, 1])
+    if not math.isfinite(value):
+        return 0.0, count, 1
+    return value, count, 0
 
 
 def _statistics_row(
@@ -181,8 +211,10 @@ def _statistics_row(
     uncertainty = panel.uncertainty
     error = panel.absolute_residual
     log_mask = (uncertainty > 0.0) & (error > 0.0)
-    standardized_mask = uncertainty > 0.0
-    standardized = error[standardized_mask] / uncertainty[standardized_mask]
+    standardized, undefined_rows, zero_zero_rows = _standardized_residuals(panel)
+    correlation, correlation_rows, correlation_degenerate = _correlation(
+        uncertainty, error
+    )
     return {
         "variant": variant,
         "target": panel.target,
@@ -201,9 +233,13 @@ def _statistics_row(
         "coverage_3sigma": float(np.mean(error <= 3.0 * uncertainty)),
         "standardized_residual_rows": int(standardized.size),
         "mean_absolute_standardized_residual": (
-            float(np.mean(standardized)) if standardized.size else None
+            float(np.mean(standardized)) if standardized.size else 0.0
         ),
-        "uncertainty_residual_correlation": _correlation(uncertainty, error),
+        "undefined_standardized_residual_rows": undefined_rows,
+        "zero_zero_standardized_residual_rows": zero_zero_rows,
+        "uncertainty_residual_correlation": correlation,
+        "correlation_valid_rows": correlation_rows,
+        "correlation_degenerate": correlation_degenerate,
         "shared_axis_min": limits[0],
         "shared_axis_max": limits[1],
     }
@@ -320,7 +356,7 @@ def _render_selected(
                 panel,
                 limits[level],
                 variant=variant,
-                title=f"{_VARIANT_LABELS[variant]} ? {target_label}",
+                title=f"{_VARIANT_LABELS[variant]} / {target_label}",
             )
         figure.suptitle("Selected LLPR uncertainty and residual paths")
         _save_figure(figure, staging, "selected_uncertainty_residual", dpi)
@@ -430,8 +466,7 @@ def _render_reliability(
 def _cdf_grid(panels: Mapping[str, _PanelData]) -> np.ndarray:
     positive: list[np.ndarray] = []
     for panel in panels.values():
-        valid = panel.uncertainty > 0.0
-        z = np.abs(panel.signed_residual[valid] / panel.uncertainty[valid])
+        z, _, _ = _standardized_residuals(panel)
         if np.any(z > 0.0):
             positive.append(z[z > 0.0])
     if not positive:
@@ -445,10 +480,10 @@ def _cdf_grid(panels: Mapping[str, _PanelData]) -> np.ndarray:
 
 
 def _empirical_cdf(panel: _PanelData, grid: np.ndarray) -> np.ndarray:
-    valid = panel.uncertainty > 0.0
-    if not np.any(valid):
+    z, _, _ = _standardized_residuals(panel)
+    if not z.size:
         return np.zeros_like(grid)
-    z = np.sort(np.abs(panel.signed_residual[valid] / panel.uncertainty[valid]))
+    z = np.sort(z)
     return np.searchsorted(z, grid, side="right") / z.size
 
 
@@ -538,6 +573,23 @@ def _input_hashes(root: Path) -> dict[str, str]:
     return {name: sha256_file(root / name) for name in _INPUT_NAMES}
 
 
+def _standardized_residual_counts(
+    data: Mapping[str, Mapping[str, _PanelData]],
+) -> dict[str, dict[str, int]]:
+    result: dict[str, dict[str, int]] = {}
+    for level in ("energy", "force_component"):
+        for variant in _VARIANTS:
+            values, undefined_rows, zero_zero_rows = _standardized_residuals(
+                data[level][variant]
+            )
+            result[f"{variant}/{level}"] = {
+                "ecdf_rows": int(values.size),
+                "undefined_rows": undefined_rows,
+                "zero_zero_rows": zero_zero_rows,
+            }
+    return result
+
+
 def _figure_manifest(
     selected: Sequence[tuple[str, str]],
 ) -> dict[str, Any]:
@@ -567,20 +619,48 @@ def _validate_selection(selected: Sequence[tuple[str, str]]) -> tuple[tuple[str,
     return normalized
 
 
+def _absolute_without_resolution(path: Path) -> Path:
+    expanded = Path(os.path.expanduser(os.fspath(path)))
+    return expanded if expanded.is_absolute() else Path.cwd() / expanded
+
+
+def _reject_existing_symlink_components(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"output_dir contains a symlink component: {current}")
+
+
 def _safe_paths(publication_root: Path, output_dir: Path) -> tuple[Path, Path]:
-    root = Path(publication_root).resolve(strict=True)
+    root_lexical = Path(os.path.abspath(_absolute_without_resolution(Path(publication_root))))
+    root = root_lexical.resolve(strict=True)
     if not root.is_dir():
         raise ValueError(f"publication root is not a directory: {root}")
-    destination = Path(output_dir).resolve(strict=False)
-    if destination == root or root.is_relative_to(destination):
-        raise ValueError("output_dir cannot equal or contain the publication root")
-    if destination.is_relative_to(root):
-        relative = destination.relative_to(root)
-        if not relative.parts or relative.parts[0] != "plots":
-            raise ValueError("output_dir cannot replace canonical publication data")
-    if destination.exists() and not destination.is_dir():
+    for name in _VARIANTS:
+        child = root_lexical / name
+        if child.is_symlink():
+            raise ValueError(f"publication canonical child must not be a symlink: {child}")
+
+    output_raw = _absolute_without_resolution(Path(output_dir))
+    _reject_existing_symlink_components(output_raw)
+    destination_lexical = Path(os.path.abspath(output_raw))
+    destination_resolved = destination_lexical.resolve(strict=False)
+    for checked_root, checked_output in (
+        (root_lexical, destination_lexical),
+        (root, destination_resolved),
+    ):
+        if checked_output == checked_root or checked_root.is_relative_to(checked_output):
+            raise ValueError("output_dir cannot equal or contain the publication root")
+        if checked_output.is_relative_to(checked_root):
+            raise ValueError("output_dir cannot be inside the publication root")
+    if destination_lexical.exists() and not destination_lexical.is_dir():
         raise ValueError("output_dir must be a directory path")
-    return root, destination
+    return root, destination_lexical
 
 
 def _validate_staging(staging: Path) -> None:
@@ -608,44 +688,94 @@ def _validate_staging(staging: Path) -> None:
         rows = list(reader)
     if reader.fieldnames != list(PLOTTING_STATISTICS_FIELDS) or len(rows) != 9:
         raise RuntimeError("plotting statistics schema or row count mismatch")
+    numeric_fields = PLOTTING_STATISTICS_FIELDS[4:]
+    for row_index, row in enumerate(rows):
+        for field in numeric_fields:
+            try:
+                value = float(row[field])
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    f"plotting statistics row {row_index} field {field} must be numeric"
+                ) from error
+            if not math.isfinite(value):
+                raise RuntimeError(
+                    f"plotting statistics row {row_index} field {field} must be finite"
+                )
     json.loads(
         (staging / "plotting_manifest.json").read_text(encoding="utf-8"),
         parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
     )
 
 
-def _promote_directory(staging: Path, destination: Path) -> None:
-    backup: Path | None = None
-    if destination.exists():
-        backup = Path(
-            tempfile.mkdtemp(prefix=f".{destination.name}.backup-", dir=destination.parent)
-        )
-        backup.rmdir()
-        os.replace(destination, backup)
+@contextmanager
+def _output_lock(destination: Path) -> Iterator[None]:
+    lock_path = destination.parent / f".{destination.name}.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
     try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _rename_exchange(first: Path, second: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(first),
+        -100,
+        os.fsencode(second),
+        2,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _best_effort_remove(path: Path) -> None:
+    try:
+        if path.is_symlink():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+    except Exception:
+        return
+
+
+def _cleanup_stale_directories(destination: Path) -> None:
+    for stale in destination.parent.glob(f".{destination.name}.stale-*"):
+        _best_effort_remove(stale)
+
+
+def _promote_directory(staging: Path, destination: Path) -> None:
+    if destination.exists():
+        _rename_exchange(staging, destination)
+        _best_effort_remove(staging)
+    else:
         os.replace(staging, destination)
-    except BaseException:
-        if backup is not None and backup.exists() and not destination.exists():
-            os.replace(backup, destination)
-        raise
-    if backup is not None:
-        shutil.rmtree(backup)
 
 
-def run_plot(
-    publication_root: Path,
-    *,
-    output_dir: Path,
-    selected: Sequence[tuple[str, str]] = DEFAULT_SELECTED,
-    dpi: int = _DEFAULT_DPI,
+def _run_plot_locked(
+    root: Path,
+    destination: Path,
+    selected_paths: Sequence[tuple[str, str]],
+    dpi: int,
 ) -> Path:
-    """Render deterministic publication artifacts from validated formal CSVs."""
-    root, destination = _safe_paths(publication_root, output_dir)
-    selected_paths = _validate_selection(selected)
-    if isinstance(dpi, bool) or not isinstance(dpi, int) or dpi <= 0:
-        raise ValueError("plot dpi must be a positive integer")
-
     validate_publication_root(root)
+    input_hashes = _input_hashes(root)
     data = _load_plot_data(root)
     shared_limits = _all_shared_limits(data)
 
@@ -664,9 +794,8 @@ def run_plot(
         }
     )
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
-        tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=destination.parent)
+        tempfile.mkdtemp(prefix=f".{destination.name}.stale-", dir=destination.parent)
     )
     try:
         _render_all_figures(data, shared_limits, selected_paths, staging, dpi)
@@ -679,7 +808,7 @@ def run_plot(
             "schema_version": SCHEMA_VERSION,
             "formula_version": FORMULA_VERSION,
             "status": "complete",
-            "inputs": _input_hashes(root),
+            "inputs": input_hashes,
             "outputs": outputs,
             "config": {
                 "dpi": dpi,
@@ -690,17 +819,38 @@ def run_plot(
                 "zero_strategy": _ZERO_STRATEGY,
             },
             "selected": [list(item) for item in selected_paths],
-            "units": {"energy": "eV/atom", "forces": "eV/?"},
+            "units": {"energy": "eV/atom", "forces": "eV/\u00c5"},
             "figures": _figure_manifest(selected_paths),
             "shared_axes": {
                 level: {"minimum": bounds[0], "maximum": bounds[1]}
                 for level, bounds in shared_limits.items()
             },
+            "standardized_residual_counts": _standardized_residual_counts(data),
         }
         _strict_json_dump(staging / "plotting_manifest.json", manifest)
         _validate_staging(staging)
+        if _input_hashes(root) != input_hashes:
+            raise ValueError("publication input changed during plotting")
         _promote_directory(staging, destination)
     finally:
-        if staging.exists():
-            shutil.rmtree(staging)
+        _best_effort_remove(staging)
     return destination
+
+
+def run_plot(
+    publication_root: Path,
+    *,
+    output_dir: Path,
+    selected: Sequence[tuple[str, str]] = DEFAULT_SELECTED,
+    dpi: int = _DEFAULT_DPI,
+) -> Path:
+    """Render deterministic publication artifacts from validated formal CSVs."""
+    root, destination = _safe_paths(publication_root, output_dir)
+    selected_paths = _validate_selection(selected)
+    if isinstance(dpi, bool) or not isinstance(dpi, int) or dpi <= 0:
+        raise ValueError("plot dpi must be a positive integer")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _reject_existing_symlink_components(destination)
+    with _output_lock(destination):
+        _cleanup_stale_directories(destination)
+        return _run_plot_locked(root, destination, selected_paths, dpi)

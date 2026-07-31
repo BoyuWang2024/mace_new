@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing as mp
+import time
 from pathlib import Path
 
 import matplotlib
@@ -30,7 +32,11 @@ EXPECTED_STATISTICS_FIELDS = (
     "zero_std_rows", "zero_absolute_residual_rows", "mae", "rmse",
     "mean_std", "median_std", "coverage_1sigma", "coverage_2sigma",
     "coverage_3sigma", "standardized_residual_rows",
-    "mean_absolute_standardized_residual", "uncertainty_residual_correlation",
+    "mean_absolute_standardized_residual",
+    "undefined_standardized_residual_rows",
+    "zero_zero_standardized_residual_rows",
+    "uncertainty_residual_correlation",
+    "correlation_valid_rows", "correlation_degenerate",
     "shared_axis_min", "shared_axis_max",
 )
 EXPECTED_FIGURE_STEMS = (
@@ -80,6 +86,15 @@ def _rewrite_energy_with_zero_pair(root: Path) -> None:
                 cholesky_diagnostics=previous["cholesky_diagnostics"],
             ),
         )
+
+
+def _lock_worker(output: str, events: object) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    with plotting._output_lock(Path(output)):
+        events.put(("enter", time.monotonic()))
+        time.sleep(0.25)
+        events.put(("exit", time.monotonic()))
 
 
 def test_default_selected_paths() -> None:
@@ -142,7 +157,7 @@ def test_run_plot_generates_real_nonempty_png_pdf_and_fixed_statistics(
         for variant in ("he", "hf", "hef")
     ]
     assert set(statistics.query("data_level == 'energy'")["unit"]) == {"eV/atom"}
-    assert set(statistics.query("data_level != 'energy'")["unit"]) == {"eV/?"}
+    assert set(statistics.query("data_level != 'energy'")["unit"]) == {"eV/\u00c5"}
     for _, group in statistics.groupby("data_level", sort=False):
         assert group["shared_axis_min"].nunique() == 1
         assert group["shared_axis_max"].nunique() == 1
@@ -197,6 +212,7 @@ def test_plotting_manifest_is_strict_deterministic_and_hashes_every_consumed_inp
     assert set(manifest) == {
         "schema_version", "formula_version", "status", "inputs", "outputs",
         "config", "selected", "units", "figures", "shared_axes",
+        "standardized_residual_counts",
     }
     expected_inputs = {"manifest.json", "validation.json"} | {
         f"{variant}/{filename}"
@@ -212,7 +228,7 @@ def test_plotting_manifest_is_strict_deterministic_and_hashes_every_consumed_inp
     assert set(manifest["outputs"]) == expected_outputs
     assert all(manifest["outputs"][name] == _sha256(second / name) for name in expected_outputs)
     assert manifest["selected"] == [list(item) for item in DEFAULT_SELECTED]
-    assert manifest["units"] == {"energy": "eV/atom", "forces": "eV/?"}
+    assert manifest["units"] == {"energy": "eV/atom", "forces": "eV/\u00c5"}
     assert not any(
         forbidden in first_manifest.lower()
         for forbidden in (b"timestamp", b"created_at", b"updated_at", b"nan", b"infinity")
@@ -237,6 +253,58 @@ def test_manifest_figure_paths_follow_configured_selection(
     assert manifest["figures"]["selected_uncertainty_residual"]["paths"] == [
         list(item) for item in selected
     ]
+
+
+def test_constant_and_zero_statistics_are_finite_and_ecdf_counts_zero_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _publication_root(tmp_path, monkeypatch)
+    for variant in ("he", "hf", "hef"):
+        path = root / variant / "energy.csv"
+        frame = pd.read_csv(path)
+        frame.loc[0, "prediction"] = frame.loc[0, "reference"]
+        frame.loc[0, "residual"] = 0.0
+        frame.loc[1, "residual"] = 1.0
+        frame.loc[1, "prediction"] = frame.loc[1, "reference"] - 1.0
+        frame.loc[:, ["q", "variance", "std"]] = 0.0
+        frame.to_csv(path, index=False)
+        summary_path = root / variant / "summary.json"
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        atomic_json_dump(
+            summary_path,
+            summarize_variant(
+                root / variant,
+                variant=variant,
+                ridge_mode=previous["ridge"]["mode"],
+                ridge=previous["ridge"]["value"],
+                energy_alpha=previous["alpha"]["energy"],
+                force_alpha=previous["alpha"]["forces"],
+                cholesky_diagnostics=previous["cholesky_diagnostics"],
+            ),
+        )
+
+    result = run_plot(root, output_dir=tmp_path / "plots")
+
+    statistics = pd.read_csv(result / "plotting_statistics.csv")
+    numeric = statistics.drop(columns=["variant", "target", "data_level", "unit"])
+    assert not numeric.isna().any(axis=None)
+    assert np.isfinite(numeric.to_numpy(dtype=np.float64)).all()
+    row = statistics.query("variant == 'he' and data_level == 'energy'").iloc[0]
+    assert row["standardized_residual_rows"] == 1
+    assert row["zero_zero_standardized_residual_rows"] == 1
+    assert row["undefined_standardized_residual_rows"] == 1
+    assert row["mean_absolute_standardized_residual"] == 0.0
+    assert row["uncertainty_residual_correlation"] == 0.0
+    assert row["correlation_valid_rows"] == 2
+    assert row["correlation_degenerate"] == 1
+
+    manifest = _strict_json(result / "plotting_manifest.json")
+    counts = manifest["standardized_residual_counts"]["he/energy"]
+    assert counts == {
+        "ecdf_rows": 1,
+        "undefined_rows": 1,
+        "zero_zero_rows": 1,
+    }
 
 def test_invalid_publication_input_fails_before_replacing_existing_plots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -275,12 +343,19 @@ def test_render_failure_preserves_existing_plots_and_cleans_staging(
     assert not list(output.parent.glob(f".{output.name}.tmp-*"))
 
 
-@pytest.mark.parametrize("unsafe", ["root", "ancestor", "canonical_child"])
+@pytest.mark.parametrize(
+    "unsafe", ["root", "ancestor", "canonical_child", "plots_child"]
+)
 def test_output_directory_cannot_replace_publication_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str
 ) -> None:
     root = _publication_root(tmp_path / "case", monkeypatch)
-    output = {"root": root, "ancestor": root.parent, "canonical_child": root / "he"}[unsafe]
+    output = {
+        "root": root,
+        "ancestor": root.parent,
+        "canonical_child": root / "he",
+        "plots_child": root / "plots",
+    }[unsafe]
     before = {
         path.relative_to(root): path.read_bytes()
         for path in root.rglob("*") if path.is_file()
@@ -292,3 +367,147 @@ def test_output_directory_cannot_replace_publication_data(
         for path in root.rglob("*") if path.is_file()
     }
     assert after == before
+
+@pytest.mark.parametrize("case", ["canonical_child", "parent_component"])
+def test_output_symlink_escape_is_rejected_before_validation_or_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    external = tmp_path / "external"
+    external.mkdir()
+    if case == "canonical_child":
+        external_data = external / "he"
+        (root / "he").rename(external_data)
+        sentinel = external_data / "sentinel.txt"
+        sentinel.write_text("outside must survive", encoding="utf-8")
+        (root / "he").symlink_to(external_data, target_is_directory=True)
+        output = root / "he"
+    else:
+        sentinel = external / "sentinel.txt"
+        sentinel.write_text("outside must survive", encoding="utf-8")
+        link = tmp_path / "linked-parent"
+        link.symlink_to(external, target_is_directory=True)
+        output = link / "plots"
+    formal_before = {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+    with pytest.raises(ValueError, match="output_dir|symlink"):
+        run_plot(root, output_dir=output)
+
+    assert sentinel.read_text(encoding="utf-8") == "outside must survive"
+    formal_after = {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    assert formal_after == formal_before
+    assert not (root / "manifest.json").exists()
+    assert not (root / "validation.json").exists()
+
+
+def test_output_lock_serializes_independent_processes(tmp_path: Path) -> None:
+    context = mp.get_context("fork")
+    events = context.Queue()
+    output = tmp_path / "plots"
+    workers = [
+        context.Process(target=_lock_worker, args=(str(output), events))
+        for _ in range(2)
+    ]
+
+    for worker in workers:
+        worker.start()
+    observed = [events.get(timeout=5.0) for _ in range(4)]
+    for worker in workers:
+        worker.join(timeout=5.0)
+
+    assert [worker.exitcode for worker in workers] == [0, 0]
+    assert [name for name, _ in sorted(observed, key=lambda item: item[1])] == [
+        "enter", "exit", "enter", "exit"
+    ]
+
+
+def test_pre_exchange_failure_preserves_complete_old_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    output = run_plot(root, output_dir=tmp_path / "plots")
+    marker = output / "old-only.txt"
+    marker.write_text("old", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in output.iterdir()}
+
+    def fail_exchange(first: Path, second: Path) -> None:
+        del first, second
+        raise RuntimeError("simulated exchange failure")
+
+    monkeypatch.setattr(plotting, "_rename_exchange", fail_exchange, raising=False)
+    with pytest.raises(RuntimeError, match="simulated exchange failure"):
+        run_plot(root, output_dir=output)
+
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == before
+    assert not list(output.parent.glob(f".{output.name}.stale-*"))
+
+
+def test_post_exchange_cleanup_failure_keeps_complete_new_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    output = run_plot(root, output_dir=tmp_path / "plots")
+    (output / "old-only.txt").write_text("old", encoding="utf-8")
+    real_rmtree = plotting.shutil.rmtree
+
+    def fail_stale_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+        if f".{output.name}.stale-" in Path(path).name or ".backup-" in Path(path).name:
+            raise OSError("simulated stale cleanup failure")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(plotting.shutil, "rmtree", fail_stale_cleanup)
+    result = run_plot(root, output_dir=output)
+
+    assert result == output
+    assert not (output / "old-only.txt").exists()
+    assert (output / "plotting_manifest.json").is_file()
+    stale = list(output.parent.glob(f".{output.name}.stale-*"))
+    assert len(stale) == 1
+    assert (stale[0] / "old-only.txt").read_text(encoding="utf-8") == "old"
+
+
+def test_input_change_during_render_aborts_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    output = run_plot(root, output_dir=tmp_path / "plots")
+    marker = output / "old-only.txt"
+    marker.write_text("old", encoding="utf-8")
+    before = {
+        path.relative_to(output): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    real_render = plotting._render_all_figures
+
+    def mutate_input_after_render(*args: object, **kwargs: object) -> None:
+        real_render(*args, **kwargs)
+        energy_path = root / "he" / "energy.csv"
+        energy_path.write_bytes(energy_path.read_bytes() + b"\n")
+
+    monkeypatch.setattr(plotting, "_render_all_figures", mutate_input_after_render)
+    with pytest.raises(ValueError, match="input.*changed"):
+        run_plot(root, output_dir=output)
+
+    after = {
+        path.relative_to(output): path.read_bytes()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert marker.read_text(encoding="utf-8") == "old"
+    assert not list(output.parent.glob(f".{output.name}.stale-*"))
