@@ -10,7 +10,10 @@ import pytest
 import yaml
 
 from Uncertainty_Quantification.LLPR.llpr import cli
+from Uncertainty_Quantification.LLPR.llpr import calibration, curvature, inference
+from Uncertainty_Quantification.LLPR.llpr.artifacts import sha256_file
 from Uncertainty_Quantification.LLPR.llpr.config import load_config
+from Uncertainty_Quantification.LLPR.llpr.curvature import run_root
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -32,6 +35,8 @@ def _write_workflow_config(path: Path) -> None:
 checkpoint:
   path: inputs/model.pt
   expected_sha256: {'1' * 64}
+  selected_head: default
+  expected_readout_size: 2192
 data:
   build:
     path: inputs/build.extxyz
@@ -61,6 +66,47 @@ output:
 """.lstrip(),
         encoding="utf-8",
     )
+
+
+def _replace_checkpoint_section(path: Path, section: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    start = text.index("checkpoint:\n")
+    end = text.index("data:\n")
+    path.write_text(
+        text[:start] + "checkpoint:\n" + section + text[end:],
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        f"  expected_sha256: {'1' * 64}\n  selected_head: default\n  expected_readout_size: 2192\n",
+        "  path: inputs/model.pt\n  selected_head: default\n  expected_readout_size: 2192\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  expected_readout_size: 2192\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head: default\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head: default\n  expected_readout_size: 2192\n  unknown: value\n",
+        f"  path:\n  expected_sha256: {'1' * 64}\n  selected_head: default\n  expected_readout_size: 2192\n",
+        "  path: inputs/model.pt\n  expected_sha256:\n  selected_head: default\n  expected_readout_size: 2192\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head:\n  expected_readout_size: 2192\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head: \"\"\n  expected_readout_size: 2192\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head: default\n  expected_readout_size:\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head: default\n  expected_readout_size: true\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head: default\n  expected_readout_size: 1.5\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head: default\n  expected_readout_size: \"2192\"\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head: default\n  expected_readout_size: 0\n",
+        f"  path: inputs/model.pt\n  expected_sha256: {'1' * 64}\n  selected_head: default\n  expected_readout_size: -1\n",
+    ],
+)
+def test_checkpoint_config_rejects_incomplete_or_invalid_schema(
+    tmp_path: Path, section: str
+) -> None:
+    config_path = tmp_path / "workflow.yaml"
+    _write_workflow_config(config_path)
+    _replace_checkpoint_section(config_path, section)
+
+    with pytest.raises(ValueError, match="checkpoint"):
+        load_config(config_path)
 
 
 def _write_plot_config(path: Path) -> None:
@@ -122,6 +168,40 @@ def test_cli_run_orders_computing_stages_and_does_not_plot(
     assert cli.main(["run", "--config", str(config_path)]) == 0
 
     assert called == ["build", "calibrate", "evaluate", "validate"]
+
+
+class _StopAfterCheckpoint(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("module", "runner"),
+    [
+        (curvature, curvature.run_build),
+        (calibration, calibration.run_calibrate),
+        (inference, inference.run_evaluate),
+    ],
+)
+def test_computing_stages_pass_configured_checkpoint_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    module: object,
+    runner: object,
+) -> None:
+    config_path = tmp_path / "workflow.yaml"
+    _write_workflow_config(config_path)
+    config = load_config(config_path)
+
+    def stop_after_checkpoint(source, device, *, selected_head, expected_readout_size):
+        assert source == config.checkpoint
+        assert str(device) == "cpu"
+        assert selected_head == "default"
+        assert expected_readout_size == 2192
+        raise _StopAfterCheckpoint
+
+    monkeypatch.setattr(module, "load_checkpoint", stop_after_checkpoint)
+    with pytest.raises(_StopAfterCheckpoint):
+        runner(config)
 
 
 def test_cli_does_not_swallow_stage_failures(
@@ -343,15 +423,25 @@ def test_formal_configs_use_real_relative_inputs_and_required_numerics() -> None
     for document, source in ((cpu_document, cpu_path), (gpu_document, gpu_path)):
         loaded = load_config(source)
         assert _sha256(loaded.checkpoint.path) == loaded.checkpoint.expected_sha256
+        assert loaded.selected_head == "default"
+        assert loaded.expected_readout_size == 2192
         for identity in (loaded.build, loaded.calibration, loaded.test):
             assert _sha256(identity.path) == identity.expected_sha256
 
 
-def test_plot_config_has_fixed_schema_and_publication_selection() -> None:
+def test_plot_config_matches_cpu_n20_run_root_from_clean_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = CONFIG_ROOT / "plot_publication.yaml"
+    monkeypatch.chdir(tmp_path)
     document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    workflow = load_config(CONFIG_ROOT / "cpu_n20_full.yaml")
+    plotting = cli._load_plot_config(path)
+    workflow_root = run_root(workflow, sha256_file(workflow.checkpoint.path))
 
     assert set(document) == {"publication_root", "output_dir", "selected"}
+    assert plotting.publication_root == workflow_root / "evaluation" / "deterministic"
+    assert plotting.output_dir == workflow_root / "plots"
     assert document["selected"] == [
         ["he", "energy"],
         ["hf", "forces"],

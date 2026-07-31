@@ -67,6 +67,8 @@ class LLPRConfig:
     output_root: Path
     experiment: str
     curvature: CurvatureConfig
+    selected_head: str = "default"
+    expected_readout_size: int = 2192
 
     @property
     def data(self) -> DataConfig:
@@ -113,6 +115,37 @@ def _path_identity(source_dir: Path, value: Any, field: str) -> PathIdentity:
     )
 
 
+def _checkpoint_config(
+    source_dir: Path, value: Any
+) -> tuple[PathIdentity, str, int]:
+    mapping = _mapping(value, "checkpoint")
+    fields = {
+        "path",
+        "expected_sha256",
+        "selected_head",
+        "expected_readout_size",
+    }
+    if set(mapping) != fields:
+        raise ValueError(
+            "checkpoint must contain exactly path, expected_sha256, "
+            "selected_head, expected_readout_size"
+        )
+    identity = _path_identity(source_dir, mapping, "checkpoint")
+    if identity.expected_sha256 is None:
+        raise ValueError("checkpoint.expected_sha256 must not be null")
+    selected_head = mapping["selected_head"]
+    if not isinstance(selected_head, str) or not selected_head.strip():
+        raise ValueError("checkpoint.selected_head must be a non-empty string")
+    expected_readout_size = mapping["expected_readout_size"]
+    if (
+        isinstance(expected_readout_size, bool)
+        or not isinstance(expected_readout_size, int)
+        or expected_readout_size <= 0
+    ):
+        raise ValueError("checkpoint.expected_readout_size must be a positive integer")
+    return identity, selected_head, expected_readout_size
+
+
 def _optional_positive_int(value: Any, field: str) -> int | None:
     if value is None:
         return None
@@ -128,7 +161,9 @@ def load_config(path: Path) -> LLPRConfig:
         document = _mapping(yaml.safe_load(handle), "config")
     source_dir = source_path.parent
 
-    checkpoint = _path_identity(source_dir, _required(document, "checkpoint", "config"), "checkpoint")
+    checkpoint, selected_head, expected_readout_size = _checkpoint_config(
+        source_dir, _required(document, "checkpoint", "config")
+    )
     data = _mapping(_required(document, "data", "config"), "data")
     build = _path_identity(source_dir, _required(data, "build", "data"), "data.build")
     calibration = _path_identity(
@@ -206,4 +241,6 @@ def load_config(path: Path) -> LLPRConfig:
         output_root=output_root,
         experiment=experiment,
         curvature=curvature,
+        selected_head=selected_head,
+        expected_readout_size=expected_readout_size,
     )

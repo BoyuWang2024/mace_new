@@ -865,7 +865,12 @@ def _validate_complete_outputs(
 
 def run_evaluate(config: LLPRConfig) -> Path:
     """Evaluate all three curvature variants in one structure traversal."""
-    loaded = load_checkpoint(config.checkpoint, torch.device("cpu"))
+    loaded = load_checkpoint(
+        config.checkpoint,
+        torch.device("cpu"),
+        selected_head=config.selected_head,
+        expected_readout_size=config.expected_readout_size,
+    )
     layout = discover_readout_layout(loaded.model)
     dataset = build_dataset(
         config.test.path,

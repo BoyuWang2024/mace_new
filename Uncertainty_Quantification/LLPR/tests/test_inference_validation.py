@@ -337,8 +337,16 @@ def _install_fake_pipeline(
         head="default",
     )
 
-    def fake_load_checkpoint(source: PathIdentity, device: torch.device) -> LoadedCheckpoint:
+    def fake_load_checkpoint(
+        source: PathIdentity,
+        device: torch.device,
+        *,
+        selected_head: str,
+        expected_readout_size: int,
+    ) -> LoadedCheckpoint:
         assert source == config.checkpoint
+        assert selected_head == config.selected_head
+        assert expected_readout_size == config.expected_readout_size
         if load_devices is not None:
             load_devices.append(device)
         return checkpoint

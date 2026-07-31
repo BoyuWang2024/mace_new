@@ -379,7 +379,12 @@ def _records_from_progress(
 
 def run_calibrate(config: LLPRConfig) -> Path:
     """Calibrate energy and force scales for all three curvature variants."""
-    loaded = load_checkpoint(config.checkpoint, torch.device("cpu"))
+    loaded = load_checkpoint(
+        config.checkpoint,
+        torch.device("cpu"),
+        selected_head=config.selected_head,
+        expected_readout_size=config.expected_readout_size,
+    )
     layout = discover_readout_layout(loaded.model)
     dataset = build_dataset(
         config.calibration.path,

@@ -107,6 +107,23 @@ def test_load_checkpoint_builds_validated_identity(tmp_path: Path) -> None:
     assert loaded.identity.dtype == torch.float32
 
 
+def test_load_checkpoint_uses_configured_expected_readout_size(tmp_path: Path) -> None:
+    path = tmp_path / "model.pt"
+    torch.save(_real_checkpoint_model(readout_size=7), path)
+
+    loaded = load_checkpoint(
+        PathIdentity(path=path, expected_sha256=sha256_file(path)),
+        torch.device("cpu"),
+        selected_head="default",
+        expected_readout_size=7,
+    )
+
+    assert loaded.identity.selected_head == "default"
+    assert sum(
+        parameter.numel() for parameter in loaded.model.readouts.parameters()
+    ) == 7
+
+
 def test_load_checkpoint_rejects_wrong_readout_size(tmp_path: Path) -> None:
     path = tmp_path / "model.pt"
     torch.save(_real_checkpoint_model(readout_size=7), path)

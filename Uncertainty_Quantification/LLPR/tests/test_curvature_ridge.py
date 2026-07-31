@@ -166,7 +166,20 @@ def _install_fake_pipeline(
             raise RuntimeError("simulated interruption")
         return jacobians[batch]
 
-    monkeypatch.setattr(curvature, "load_checkpoint", lambda source, device: checkpoint)
+    def fake_load_checkpoint(
+        source: PathIdentity,
+        device: torch.device,
+        *,
+        selected_head: str,
+        expected_readout_size: int,
+    ) -> LoadedCheckpoint:
+        assert source == config.checkpoint
+        assert device == torch.device("cpu")
+        assert selected_head == config.selected_head
+        assert expected_readout_size == config.expected_readout_size
+        return checkpoint
+
+    monkeypatch.setattr(curvature, "load_checkpoint", fake_load_checkpoint)
     monkeypatch.setattr(
         curvature, "discover_readout_layout", lambda model, expected_size=None: layout
     )
@@ -369,8 +382,13 @@ def test_run_build_validates_complete_cache_on_cpu_before_requested_device(
     def load_for_identity(
         source: PathIdentity,
         device: torch.device,
+        *,
+        selected_head: str,
+        expected_readout_size: int,
     ) -> LoadedCheckpoint:
         assert source == config.checkpoint
+        assert selected_head == config.selected_head
+        assert expected_readout_size == config.expected_readout_size
         load_devices.append(device)
         return checkpoint
 

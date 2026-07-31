@@ -57,7 +57,7 @@ std = sqrt(variance)
 
 计算配置字段：
 
-- `checkpoint.path`：模型文件；`expected_sha256`：预期 SHA256；`selected_head` 固定为 `default`；`expected_readout_size` 固定为 `2192`。
+- `checkpoint.path`：模型文件；`expected_sha256`：预期 SHA256；`selected_head` 固定为 `default`；`expected_readout_size` 固定为 `2192`。加载配置时严格检查这四个字段，build、calibrate、evaluate 会把 head 与预期 readout 尺寸显式传给 checkpoint 校验，字段不会被忽略。
 - `data.build`、`data.calibration`、`data.test`：分别提供曲率、校准和测试数据的路径与 SHA256。
 - `curvature.variants`：固定为 `[he, hf, hef]`；`curvature.min_q` 固定为 `1e-30`。
 - `ridge.mode`：正式配置使用 `fixed`；`ridge.value` 固定为 `1e-12`。`max_condition_number` 仅供可选的 `condition_number` 模式使用。

@@ -36,6 +36,7 @@ def load_checkpoint(
     source: PathIdentity,
     device: torch.device,
     selected_head: str = "default",
+    expected_readout_size: int = EXPECTED_READOUT_SIZE,
 ) -> LoadedCheckpoint:
     """Load and validate the formal ScaleShiftMACE checkpoint."""
     if selected_head != "default":
@@ -64,7 +65,7 @@ def load_checkpoint(
     r_max = float(model.r_max)
     if r_max != 6.0:
         raise ValueError(f"checkpoint r_max must be 6.0, got {r_max}")
-    discover_readout_layout(model, expected_size=EXPECTED_READOUT_SIZE)
+    discover_readout_layout(model, expected_size=expected_readout_size)
     atomic_numbers = tuple(int(number) for number in model.atomic_numbers.tolist())
     dtype = next(model.parameters()).dtype
 
