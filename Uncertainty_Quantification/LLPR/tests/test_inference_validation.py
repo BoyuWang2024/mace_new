@@ -16,6 +16,7 @@ from Uncertainty_Quantification.LLPR.llpr.artifacts import (
     atomic_torch_save,
     load_torch_artifact,
     sha256_file,
+    stable_id,
 )
 from Uncertainty_Quantification.LLPR.llpr.checkpoint import (
     CheckpointIdentity,
@@ -139,10 +140,16 @@ def _checkpoint_identity_metadata() -> dict[str, object]:
     }
 
 
-def _dataset_identity_metadata(sha256: str, identity: str) -> dict[str, object]:
+def _dataset_identity_metadata(sha256: str) -> dict[str, object]:
+    semantic_identity = {
+        "sha256": sha256,
+        "atomic_numbers": (1,),
+        "r_max": 6.0,
+        "head": "default",
+    }
     return {
         "sha256": sha256,
-        "identity": identity,
+        "identity": stable_id(semantic_identity),
         "size": 2,
         "atomic_numbers": [1],
         "r_max": 6.0,
@@ -155,7 +162,7 @@ def _curvature_identity(layout: ReadoutLayout) -> dict[str, object]:
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
         "checkpoint": _checkpoint_identity_metadata(),
-        "build": _dataset_identity_metadata("b" * 64, "build-identity"),
+        "build": _dataset_identity_metadata("b" * 64),
         "readout": layout.metadata(),
         "curvature": {
             "energy": "outer(d(E/N)/dtheta, d(E/N)/dtheta)",
@@ -199,9 +206,7 @@ def _write_upstream_artifacts(config: LLPRConfig, layout: ReadoutLayout) -> None
         "formula_version": FORMULA_VERSION,
         "checkpoint": _checkpoint_identity_metadata(),
         "curvature": curvature_identity,
-        "calibration": _dataset_identity_metadata(
-            "c" * 64, "calibration-identity"
-        ),
+        "calibration": _dataset_identity_metadata("c" * 64),
         "ridge": {
             "mode": "fixed",
             "value": 1.0,
@@ -314,10 +319,18 @@ def _install_fake_pipeline(
     checkpoint = _checkpoint()
     layout = _layout()
     samples, jacobians = _samples()
+    test_sha256 = sha256_file(config.test.path)
     dataset = DatasetHandle(
         path=config.test.path,
-        sha256="d" * 64,
-        identity=f"test-{config.test.path.name}",
+        sha256=test_sha256,
+        identity=stable_id(
+            {
+                "sha256": test_sha256,
+                "atomic_numbers": (1,),
+                "r_max": 6.0,
+                "head": "default",
+            }
+        ),
         size=len(samples),
         atomic_numbers=(1,),
         r_max=6.0,
@@ -834,7 +847,9 @@ def test_evaluation_progress_identity_covers_all_semantic_inputs_and_is_weights_
         / "deterministic"
         / "ridge_diagnostics.json"
     )
-    assert identity["test"]["identity"] == "test-test.extxyz"
+    assert identity["test"]["identity"] == _dataset_identity_metadata(
+        sha256_file(config.test.path)
+    )["identity"]
     assert identity["limits"] == {
         "max_structures": None,
         "max_force_components_per_structure": None,
@@ -1272,8 +1287,38 @@ def test_validation_rejects_nonfinite_alpha_squared_q_result(
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary["alpha"]["energy"] = 1.0e308
     atomic_json_dump(summary_path, summary)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    progress["identity"]["calibration"]["records"]["he"]["energy"][
+        "alpha"
+    ] = 1.0e308
+    atomic_torch_save(progress_path, progress)
 
     with pytest.raises(ValueError, match="variance.*alpha.*q.*finite"):
+        validate_publication_root(root)
+
+
+def test_validation_rejects_underflowed_alpha_squared_q_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    path = root / "he" / "energy.csv"
+    energy = pd.read_csv(path)
+    energy.loc[0, "q"] = 1.0e-200
+    energy.to_csv(path, index=False)
+    _rewrite_variant_summary(root, "he")
+    summary_path = root / "he" / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["alpha"]["energy"] = 1.0e-200
+    atomic_json_dump(summary_path, summary)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    progress["identity"]["calibration"]["records"]["he"]["energy"][
+        "alpha"
+    ] = 1.0e-200
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match="representable"):
         validate_publication_root(root)
 
 
@@ -1431,6 +1476,108 @@ def test_validation_rejects_malformed_deep_progress_identity(
     atomic_torch_save(progress_path, progress)
 
     with pytest.raises(ValueError, match="progress identity"):
+        validate_publication_root(root)
+
+
+def _refresh_dataset_identity(metadata: dict[str, object]) -> None:
+    metadata["identity"] = stable_id(
+        {
+            "sha256": metadata["sha256"],
+            "atomic_numbers": tuple(metadata["atomic_numbers"]),
+            "r_max": metadata["r_max"],
+            "head": metadata["head"],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "build_identity",
+        "build_head",
+        "build_elements",
+        "build_cutoff",
+        "calibration_identity",
+        "calibration_head",
+        "calibration_elements",
+        "calibration_cutoff",
+    ],
+)
+def test_validation_rejects_cross_layer_dataset_identity_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    identity = progress["identity"]
+    build_copies = [
+        identity["curvature"]["identity"]["build"],
+        identity["calibration"]["identity"]["curvature"]["build"],
+    ]
+    calibration = identity["calibration"]["identity"]["calibration"]
+    if case == "build_identity":
+        for build in build_copies:
+            build["identity"] = "0" * 16
+    elif case == "build_head":
+        for build in build_copies:
+            build["head"] = "other"
+            _refresh_dataset_identity(build)
+    elif case == "build_elements":
+        for build in build_copies:
+            build["atomic_numbers"] = [8]
+            _refresh_dataset_identity(build)
+    elif case == "build_cutoff":
+        for build in build_copies:
+            build["r_max"] = 7.0
+            _refresh_dataset_identity(build)
+    elif case == "calibration_identity":
+        calibration["identity"] = "0" * 16
+    elif case == "calibration_head":
+        calibration["head"] = "other"
+        _refresh_dataset_identity(calibration)
+    elif case == "calibration_elements":
+        calibration["atomic_numbers"] = [8]
+        _refresh_dataset_identity(calibration)
+    else:
+        calibration["r_max"] = 7.0
+        _refresh_dataset_identity(calibration)
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match="progress identity"):
+        validate_publication_root(root)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["record_ridge", "record_zero_alpha", "summary_ridge", "summary_alpha"],
+)
+def test_validation_rejects_calibration_record_or_summary_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    if case.startswith("record"):
+        progress_path = root / "progress.pt"
+        progress = load_torch_artifact(progress_path)
+        record = progress["identity"]["calibration"]["records"]["he"]["energy"]
+        if case == "record_ridge":
+            record["ridge"] = 2.0
+        else:
+            record["alpha"] = 0.0
+        atomic_torch_save(progress_path, progress)
+    elif case == "summary_ridge":
+        summary_path = root / "he" / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary["ridge"]["value"] = 2.0
+        atomic_json_dump(summary_path, summary)
+    else:
+        energy_path = root / "he" / "energy.csv"
+        energy = pd.read_csv(energy_path)
+        energy["variance"] = 9.0 * energy["q"]
+        energy["std"] = energy["variance"] ** 0.5
+        energy.to_csv(energy_path, index=False)
+        _rewrite_variant_summary(root, "he", energy_alpha=3.0)
+
+    with pytest.raises(ValueError, match="calibration|summary"):
         validate_publication_root(root)
 
 

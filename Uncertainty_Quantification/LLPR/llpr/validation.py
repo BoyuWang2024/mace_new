@@ -15,6 +15,7 @@ from .artifacts import (
     SCHEMA_VERSION,
     load_torch_artifact,
     sha256_file,
+    stable_id,
 )
 
 
@@ -105,6 +106,11 @@ def _same(left: float, right: float) -> bool:
         rel_tol=RELATIVE_TOLERANCE,
         abs_tol=ABSOLUTE_TOLERANCE,
     )
+
+
+def _scale_aware_same(left: float, right: float) -> bool:
+    scale = max(abs(left), abs(right), 1.0e-30)
+    return abs(left - right) <= RELATIVE_TOLERANCE * scale
 
 
 def _strict_json_load(path: Path) -> Any:
@@ -440,7 +446,7 @@ def _validate_summary(
     energy_rows: Sequence[Mapping[str, str]],
     force_rows: Sequence[Mapping[str, str]],
     force_structure_summary: Mapping[str, Any],
-) -> dict[str, float]:
+) -> dict[str, Any]:
     source = f"{variant}/summary.json"
     document = _require_keys(_strict_json_load(root / source), _SUMMARY_FIELDS, source)
     if document["schema_version"] != SCHEMA_VERSION:
@@ -496,7 +502,12 @@ def _validate_summary(
                 raise ValueError(f"{source} summary cholesky diagnostics mismatch")
         elif isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             raise ValueError(f"{source} summary cholesky diagnostics mismatch")
-    return {target: float(value) for target, value in alpha.items()}
+    return {
+        "alpha": {target: float(value) for target, value in alpha.items()},
+        "ridge": {"mode": ridge["mode"], "value": float(ridge["value"])},
+    }
+
+
 
 
 def _validate_variance_formula(
@@ -754,7 +765,28 @@ def _validate_dataset_identity(value: Any, source: str) -> Mapping[str, Any]:
     _identity_atomic_numbers(dataset["atomic_numbers"], f"{source}.atomic_numbers")
     _identity_number(dataset["r_max"], f"{source}.r_max", minimum=0.0, strict=True)
     _identity_string(dataset["head"], f"{source}.head")
+    expected_identity = stable_id(
+        {
+            "sha256": dataset["sha256"],
+            "atomic_numbers": tuple(dataset["atomic_numbers"]),
+            "r_max": dataset["r_max"],
+            "head": dataset["head"],
+        }
+    )
+    if dataset["identity"] != expected_identity:
+        raise ValueError(f"trusted evaluation progress identity {source}.identity is invalid")
     return dataset
+
+
+def _validate_dataset_checkpoint_compatibility(
+    dataset: Mapping[str, Any], checkpoint: Mapping[str, Any], source: str
+) -> None:
+    if dataset["head"] != checkpoint["selected_head"]:
+        raise ValueError(f"trusted evaluation progress identity {source} head mismatch")
+    if dataset["atomic_numbers"] != checkpoint["atomic_numbers"]:
+        raise ValueError(f"trusted evaluation progress identity {source} elements mismatch")
+    if float(dataset["r_max"]) != float(checkpoint["r_max"]):
+        raise ValueError(f"trusted evaluation progress identity {source} cutoff mismatch")
 
 
 def _validate_limits_identity(value: Any, source: str) -> Mapping[str, Any]:
@@ -878,7 +910,9 @@ def _validate_calibration_source_identity(
     return identity
 
 
-def _validate_calibration_records(value: Any, source: str) -> None:
+def _validate_calibration_records(
+    value: Any, ridge_identity: Mapping[str, Any], source: str
+) -> Mapping[str, Any]:
     variants = _identity_mapping(value, set(_VARIANTS), source)
     for variant in _VARIANTS:
         targets = _identity_mapping(
@@ -893,13 +927,27 @@ def _validate_calibration_records(value: Any, source: str) -> None:
                 raise ValueError(
                     f"trusted evaluation progress identity {record_source}.ridge_mode is invalid"
                 )
-            _identity_number(record["ridge"], f"{record_source}.ridge", minimum=0.0)
-            _identity_number(record["alpha"], f"{record_source}.alpha", minimum=0.0)
+            record_ridge = _identity_number(
+                record["ridge"], f"{record_source}.ridge", minimum=0.0
+            )
+            _identity_number(
+                record["alpha"],
+                f"{record_source}.alpha",
+                minimum=0.0,
+                strict=True,
+            )
+            if record["ridge_mode"] != ridge_identity["mode"] or not _scale_aware_same(
+                record_ridge, float(ridge_identity["selected"][variant])
+            ):
+                raise ValueError(
+                    f"trusted evaluation progress identity {record_source} ridge mismatch"
+                )
             rows = record["rows"]
             if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
                 raise ValueError(
                     f"trusted evaluation progress identity {record_source}.rows is invalid"
                 )
+    return variants
 
 
 def _trusted_progress_identity(
@@ -960,7 +1008,9 @@ def _trusted_progress_identity(
     calibration_identity = _validate_calibration_source_identity(
         calibration["identity"], "calibration.identity"
     )
-    _validate_calibration_records(calibration["records"], "calibration.records")
+    _validate_calibration_records(
+        calibration["records"], calibration_identity["ridge"], "calibration.records"
+    )
     test = _validate_dataset_identity(identity["test"], "test")
     ridge = _validate_ridge_identity(identity["ridge"], "ridge", selected=False)
     min_q = _identity_number(
@@ -995,12 +1045,13 @@ def _trusted_progress_identity(
             raise ValueError(
                 f"trusted evaluation progress identity {source} mismatch"
             )
-    if test["head"] != checkpoint["selected_head"]:
-        raise ValueError("trusted evaluation progress identity test head mismatch")
-    if test["atomic_numbers"] != checkpoint["atomic_numbers"]:
-        raise ValueError("trusted evaluation progress identity test elements mismatch")
-    if float(test["r_max"]) != float(checkpoint["r_max"]):
-        raise ValueError("trusted evaluation progress identity test cutoff mismatch")
+    _validate_dataset_checkpoint_compatibility(
+        curvature_identity["build"], checkpoint, "build dataset"
+    )
+    _validate_dataset_checkpoint_compatibility(
+        calibration_identity["calibration"], checkpoint, "calibration dataset"
+    )
+    _validate_dataset_checkpoint_compatibility(test, checkpoint, "test dataset")
     calibration_ridge = calibration_identity["ridge"]
     active_field = "value" if ridge["mode"] == "fixed" else "max_condition_number"
     if (
@@ -1011,9 +1062,35 @@ def _trusted_progress_identity(
     if float(calibration_identity["min_q"]) != min_q:
         raise ValueError("trusted evaluation progress identity min_q mismatch")
     return identity
+
+
+def _validate_summary_calibration_contract(
+    variant: str,
+    summary: Mapping[str, Any],
+    records: Mapping[str, Any],
+) -> None:
+    for target in ("energy", "forces"):
+        record = records[variant][target]
+        if (
+            summary["ridge"]["mode"] != record["ridge_mode"]
+            or not _scale_aware_same(
+                float(summary["ridge"]["value"]), float(record["ridge"])
+            )
+        ):
+            raise ValueError(
+                f"{variant}/summary.json ridge mismatch with calibration record"
+            )
+        if not _scale_aware_same(
+            float(summary["alpha"][target]), float(record["alpha"])
+        ):
+            raise ValueError(
+                f"{variant}/summary.json {target} alpha mismatch with calibration record"
+            )
+
+
 def _publication_identities(
     root: Path, explicit_identity: Mapping[str, Any] | None
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
     source = _trusted_progress_identity(root, explicit_identity)
 
     existing_path = root / "manifest.json"
@@ -1046,7 +1123,7 @@ def _publication_identities(
         normalized
     ):
         raise ValueError("manifest identity mismatch")
-    return normalized
+    return normalized, source
 
 
 def _observations_aligned(
@@ -1133,7 +1210,8 @@ def validate_publication_root(
     root = Path(publication_root)
     if not root.is_dir():
         raise ValueError(f"publication root is not a directory: {root}")
-    identities = _publication_identities(root, identity)
+    identities, trusted_identity = _publication_identities(root, identity)
+    calibration_records = trusted_identity["calibration"]["records"]
     manifest_path = root / "manifest.json"
     manifest_exists = manifest_path.is_file()
     if manifest_exists:
@@ -1151,14 +1229,17 @@ def validate_publication_root(
         force_structure = _validate_force_structures(
             root, variant, energy, force_rows
         )
-        alphas = _validate_summary(
+        summary = _validate_summary(
             root, variant, energy_rows, force_rows, force_structure
         )
-        _validate_variance_formula(
-            energy_rows, alphas["energy"], f"{variant}/energy.csv"
+        _validate_summary_calibration_contract(
+            variant, summary, calibration_records
         )
         _validate_variance_formula(
-            force_rows, alphas["forces"], f"{variant}/force_components.csv"
+            energy_rows, summary["alpha"]["energy"], f"{variant}/energy.csv"
+        )
+        _validate_variance_formula(
+            force_rows, summary["alpha"]["forces"], f"{variant}/force_components.csv"
         )
         if energy_baseline is None:
             energy_baseline = energy
