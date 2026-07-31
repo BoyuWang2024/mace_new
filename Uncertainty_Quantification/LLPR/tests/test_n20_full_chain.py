@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 import yaml
 
@@ -19,6 +22,21 @@ from Uncertainty_Quantification.LLPR.llpr.curvature import run_root
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 LLPR_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_ROOT = LLPR_ROOT / "configs"
+VARIANTS = ("he", "hf", "hef")
+CANONICAL_FILES = (
+    "energy.csv",
+    "force_components.csv",
+    "force_structure.csv",
+    "summary.json",
+)
+FIGURE_STEMS = (
+    "selected_uncertainty_residual",
+    "energy_comparison",
+    "force_component_comparison",
+    "force_structure_comparison",
+    "reliability",
+    "standardized_residual_cdf",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -493,3 +511,141 @@ def test_shipped_configs_contain_no_machine_specific_absolute_paths() -> None:
         text = path.read_text(encoding="utf-8")
         assert "/home/" not in text
         assert "C:\\Users" not in text
+
+
+def _assert_finite(frame: pd.DataFrame, columns: tuple[str, ...]) -> None:
+    for column in columns:
+        assert all(math.isfinite(float(value)) for value in frame[column])
+
+
+@pytest.mark.full_chain
+def test_real_n20_artifacts_satisfy_the_complete_publication_contract() -> None:
+    workflow = load_config(CONFIG_ROOT / "cpu_n20_full.yaml")
+    root = (
+        run_root(workflow, sha256_file(workflow.checkpoint.path))
+        / "evaluation"
+        / "deterministic"
+    )
+    plotting = cli._load_plot_config(CONFIG_ROOT / "plot_publication.yaml")
+
+    validation = json.loads((root / "validation.json").read_text(encoding="utf-8"))
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert validation["status"] == "valid"
+    assert validation["manifest_sha256"] == _sha256(root / "manifest.json")
+    assert manifest["units"] == {"energy": "eV/atom", "forces": "eV/\u00c5"}
+    assert set(manifest["files"]) == {
+        f"{variant}/{filename}"
+        for variant in VARIANTS
+        for filename in CANONICAL_FILES
+    }
+    assert all(
+        digest == _sha256(root / relative_path)
+        for relative_path, digest in manifest["files"].items()
+    )
+
+    energy_keys: list[tuple[str, int]] | None = None
+    force_keys: list[tuple[str, int, int, int]] | None = None
+    for variant in VARIANTS:
+        variant_root = root / variant
+        energy = pd.read_csv(variant_root / "energy.csv")
+        forces = pd.read_csv(variant_root / "force_components.csv")
+        force_structures = pd.read_csv(variant_root / "force_structure.csv")
+        assert len(energy) == 20
+        assert len(forces) == 429
+        assert len(force_structures) == 20
+        assert energy["structure_id"].is_unique
+        assert force_structures["structure_id"].is_unique
+        assert energy["variant"].tolist() == [variant] * 20
+        assert forces["variant"].tolist() == [variant] * 429
+        assert force_structures["variant"].tolist() == [variant] * 20
+        assert set(energy["target"]) == {"energy"}
+        assert set(forces["target"]) == {"forces"}
+        assert set(force_structures["target"]) == {"forces"}
+        _assert_finite(
+            energy,
+            ("num_atoms", "reference", "prediction", "residual", "q", "variance", "std"),
+        )
+        _assert_finite(
+            forces,
+            (
+                "num_atoms",
+                "atom_index",
+                "direction",
+                "reference",
+                "prediction",
+                "residual",
+                "q",
+                "variance",
+                "std",
+            ),
+        )
+        _assert_finite(
+            force_structures,
+            ("num_atoms", "components", "mae", "rmse", "mean_q", "mean_variance"),
+        )
+
+        current_energy_keys = list(
+            energy[["structure_id", "num_atoms"]].itertuples(index=False, name=None)
+        )
+        current_structure_keys = list(
+            force_structures[["structure_id", "num_atoms"]].itertuples(
+                index=False, name=None
+            )
+        )
+        current_force_keys = list(
+            forces[
+                ["structure_id", "num_atoms", "atom_index", "direction"]
+            ].itertuples(index=False, name=None)
+        )
+        assert current_structure_keys == current_energy_keys
+        assert int(force_structures["components"].sum()) == 429
+        for structure_id, num_atoms in current_energy_keys:
+            component_rows = forces[forces["structure_id"] == structure_id]
+            assert len(component_rows) == 3 * num_atoms
+            assert list(
+                component_rows[["atom_index", "direction"]].itertuples(
+                    index=False, name=None
+                )
+            ) == [(index // 3, index % 3) for index in range(3 * num_atoms)]
+            structure_row = force_structures[
+                force_structures["structure_id"] == structure_id
+            ].iloc[0]
+            assert int(structure_row["components"]) == 3 * num_atoms
+        if energy_keys is None:
+            energy_keys = current_energy_keys
+            force_keys = current_force_keys
+        else:
+            assert current_energy_keys == energy_keys
+            assert current_force_keys == force_keys
+
+    plots = plotting.output_dir
+    expected_figures = {
+        f"{stem}.{suffix}"
+        for stem in FIGURE_STEMS
+        for suffix in ("png", "pdf")
+    }
+    assert len(expected_figures) == 12
+    expected_plot_files = expected_figures | {
+        "plotting_statistics.csv",
+        "plotting_manifest.json",
+    }
+    assert {path.name for path in plots.iterdir()} == expected_plot_files
+    assert all((plots / name).stat().st_size > 0 for name in expected_figures)
+    assert not (root / "plots").exists()
+
+    plot_manifest = json.loads(
+        (plots / "plotting_manifest.json").read_text(encoding="utf-8")
+    )
+    assert plot_manifest["status"] == "complete"
+    assert plot_manifest["units"] == {"energy": "eV/atom", "forces": "eV/\u00c5"}
+    assert set(plot_manifest["outputs"]) == expected_figures | {
+        "plotting_statistics.csv"
+    }
+    assert all(
+        digest == _sha256(plots / filename)
+        for filename, digest in plot_manifest["outputs"].items()
+    )
+    assert all(
+        digest == _sha256(root / relative_path)
+        for relative_path, digest in plot_manifest["inputs"].items()
+    )

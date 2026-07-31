@@ -14,6 +14,9 @@ profile = "black"
 # Dump tracebacks of all threads after 300s of inactivity per test.
 # This helps diagnose hangs in CI without requiring extra dependencies.
 faulthandler_timeout = 300
+markers = [
+    "full_chain: run the real CPU n20 LLPR workflow and inspect its artifacts",
+]
 
 [tool.pylint.'MESSAGES CONTROL']
 disable = [
