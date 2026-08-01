@@ -12,8 +12,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from confidence_head.cache import CacheIncompleteError
+from confidence_head.cache import (
+    CacheCorruptionError,
+    CacheIncompleteError,
+)
 from confidence_head.config import load_config
+from confidence_head.errors import DataContractError
 from confidence_head.identity import CodeIdentity
 from confidence_head.workflows import build_cache as workflow
 from conftest import write_valid_config
@@ -62,7 +66,9 @@ class FakeWriter:
         self.splits.setdefault(name, {})["complete"] = True
 
     def finalize(self):
-        return None
+        return SimpleNamespace(
+            splits={name: () for name in workflow.SPLIT_ORDER}
+        )
 
 
 def install_identity_stubs(monkeypatch, identity: str = "cache-id") -> None:
@@ -79,6 +85,47 @@ def mark_cache_incomplete(monkeypatch) -> None:
         raise CacheIncompleteError("cache manifest is missing")
 
     monkeypatch.setattr(workflow, "load_complete_cache", missing)
+
+
+@pytest.mark.parametrize(
+    "changed_input",
+    ("checkpoint", "train", "validation", "test"),
+)
+def test_cache_identity_includes_every_resolved_input_path(
+    monkeypatch, valid_config, tmp_path, changed_input
+):
+    monkeypatch.setattr(
+        workflow,
+        "code_identity",
+        lambda _root: CodeIdentity("1" * 40, False, None),
+    )
+    baseline = workflow._cache_identity(valid_config)
+    relocated = tmp_path / "relocated" / f"{changed_input}.artifact"
+    if changed_input == "checkpoint":
+        changed = replace(
+            valid_config,
+            checkpoint=replace(valid_config.checkpoint, path=relocated),
+        )
+    else:
+        changed_split = replace(
+            getattr(valid_config.data, changed_input), path=relocated
+        )
+        changed = replace(
+            valid_config,
+            data=replace(
+                valid_config.data, **{changed_input: changed_split}
+            ),
+        )
+
+    assert workflow._cache_identity(changed) != baseline
+
+
+def exact_manifest(root):
+    return SimpleNamespace(
+        root=root,
+        complete=True,
+        splits={name: () for name in workflow.SPLIT_ORDER},
+    )
 
 
 def test_build_cache_calls_backbone_once_and_processes_all_splits(
@@ -130,7 +177,7 @@ def test_existing_valid_cache_returns_without_loading_mace(monkeypatch, valid_co
     monkeypatch.setattr(
         workflow,
         "load_complete_cache",
-        lambda root, **_kwargs: SimpleNamespace(root=root, complete=True),
+        lambda root, **_kwargs: exact_manifest(root),
     )
     monkeypatch.setattr(
         workflow,
@@ -139,6 +186,52 @@ def test_existing_valid_cache_returns_without_loading_mace(monkeypatch, valid_co
     )
 
     assert workflow.run_build_cache(valid_config) == expected
+
+
+def assert_invalid_complete_manifest_fails_closed(
+    monkeypatch, valid_config, splits
+):
+    install_identity_stubs(monkeypatch, "invalid-manifest")
+    monkeypatch.setattr(
+        workflow,
+        "load_complete_cache",
+        lambda root, **_kwargs: SimpleNamespace(
+            root=root, complete=True, splits=splits
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "load_frozen_backbone",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid complete manifest loaded MACE"
+        ),
+    )
+
+    with pytest.raises(CacheCorruptionError, match="split set"):
+        workflow.run_build_cache(valid_config)
+
+
+def test_complete_cache_rejects_manifest_with_only_train_split(
+    monkeypatch, valid_config
+):
+    assert_invalid_complete_manifest_fails_closed(
+        monkeypatch, valid_config, {"train": ()}
+    )
+
+
+def test_complete_cache_rejects_manifest_with_unexpected_split(
+    monkeypatch, valid_config
+):
+    assert_invalid_complete_manifest_fails_closed(
+        monkeypatch,
+        valid_config,
+        {
+            "train": (),
+            "validation": (),
+            "test": (),
+            "unexpected": (),
+        },
+    )
 
 
 def test_partial_cache_resumes_at_next_index(monkeypatch, valid_config):
@@ -190,6 +283,42 @@ def test_partial_cache_resumes_at_next_index(monkeypatch, valid_config):
     assert workflow.run_build_cache(valid_config) == cache_root
     assert resumed == [cache_root]
     assert processed == [("validation", 2), ("test", 0)]
+
+
+def test_build_rejects_wrong_split_set_returned_by_finalize(
+    monkeypatch, valid_config
+):
+    class IncompleteFinalWriter(FakeWriter):
+        def finalize(self):
+            return SimpleNamespace(splits={"train": ()})
+
+    install_identity_stubs(monkeypatch, "bad-final")
+    mark_cache_incomplete(monkeypatch)
+    monkeypatch.setattr(
+        workflow,
+        "load_frozen_backbone",
+        lambda *_args, **_kwargs: fake_loaded(),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "build_dataset_handles",
+        lambda *_args, **_kwargs: {
+            name: SimpleNamespace(size=1) for name in workflow.SPLIT_ORDER
+        },
+    )
+    monkeypatch.setattr(
+        workflow, "validate_split_isolation", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(workflow, "FeatureCapture", FakeCapture)
+    monkeypatch.setattr(
+        workflow, "CacheWriter", lambda *_a, **_k: IncompleteFinalWriter()
+    )
+    monkeypatch.setattr(
+        workflow, "cache_one_split", lambda _name, **_kwargs: None
+    )
+
+    with pytest.raises(CacheCorruptionError, match="split set"):
+        workflow.run_build_cache(valid_config)
 
 
 def test_cache_one_split_uses_ordered_indices_force_and_one_forward_per_batch(
@@ -259,6 +388,82 @@ def test_cache_one_split_uses_ordered_indices_force_and_one_forward_per_batch(
     ]
     assert [name for _, name in appended] == ["validation", "validation"]
     assert all(not features.requires_grad for _, features in continuous)
+
+
+def run_nonfinite_prediction_case(monkeypatch, valid_config, predictions):
+    structure = object()
+    handle = SimpleNamespace(
+        path=Path("split.extxyz"),
+        size=1,
+        structure_ids=("structure-0",),
+    )
+    monkeypatch.setattr(
+        workflow, "read_structures", lambda _path: (structure,)
+    )
+    batch = SimpleNamespace(
+        atom_offsets=torch.tensor([0, 1]),
+        structure_ids=("structure-0",),
+        mace_batch=SimpleNamespace(to_dict=lambda: {"batch": 1}),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "build_structure_batch",
+        lambda *_args, **_kwargs: batch,
+    )
+    monkeypatch.setattr(
+        workflow, "to_continuous_batch", lambda *_args: object()
+    )
+    loaded = SimpleNamespace(
+        model=lambda *_args, **_kwargs: predictions,
+        identity=object(),
+    )
+
+    class FiniteCapture:
+        def take(self, *, expected_atoms):
+            return torch.ones(expected_atoms, 640)
+
+    appended = []
+    writer = SimpleNamespace(
+        append=lambda batch, *, split: appended.append((batch, split))
+    )
+
+    with pytest.raises(DataContractError, match="predictions must be finite"):
+        workflow.cache_one_split(
+            "train",
+            handle=handle,
+            loaded=loaded,
+            capture=FiniteCapture(),
+            writer=writer,
+            config=valid_config,
+            next_index=0,
+        )
+    assert appended == []
+
+
+def test_cache_one_split_rejects_nonfinite_energy_prediction(
+    monkeypatch, valid_config
+):
+    run_nonfinite_prediction_case(
+        monkeypatch,
+        valid_config,
+        {
+            "energy": torch.tensor([float("nan")]),
+            "forces": torch.zeros(1, 3),
+        },
+    )
+
+
+def test_cache_one_split_rejects_nonfinite_force_prediction(
+    monkeypatch, valid_config
+):
+    run_nonfinite_prediction_case(
+        monkeypatch,
+        valid_config,
+        {
+            "energy": torch.zeros(1),
+            "forces": [torch.tensor([[0.0, float("inf"), 0.0]])],
+        },
+    )
 
 
 def test_script_only_accepts_config(monkeypatch, tmp_path):

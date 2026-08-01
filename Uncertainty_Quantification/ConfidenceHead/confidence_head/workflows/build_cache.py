@@ -35,14 +35,19 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _cache_identity(config: ConfidenceHeadConfig) -> str:
+    checkpoint_path = config.checkpoint.path.resolve()
     feature_modules = [
         {"name": module.name, "expected_dim": module.expected_dim}
         for module in config.checkpoint.feature_modules
     ]
     return cache_id(
-        checkpoint={"sha256": config.checkpoint.expected_sha256.lower()},
+        checkpoint={
+            "path": str(checkpoint_path),
+            "sha256": config.checkpoint.expected_sha256.lower(),
+        },
         splits={
             name: {
+                "path": str(getattr(config.data, name).path.resolve()),
                 "sha256": getattr(config.data, name).expected_sha256.lower()
             }
             for name in SPLIT_ORDER
@@ -92,6 +97,8 @@ def read_structures(path: Path) -> Sequence[Any]:
 
 def _detach_prediction_tensors(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
+        if not bool(torch.isfinite(value).all().item()):
+            raise DataContractError("MACE predictions must be finite")
         return value.detach()
     if isinstance(value, Mapping):
         return {key: _detach_prediction_tensors(item) for key, item in value.items()}
@@ -100,6 +107,16 @@ def _detach_prediction_tensors(value: Any) -> Any:
     if isinstance(value, list):
         return [_detach_prediction_tensors(item) for item in value]
     return value
+
+
+def _validate_manifest_splits(manifest: object) -> None:
+    splits = getattr(manifest, "splits", None)
+    expected = frozenset(SPLIT_ORDER)
+    if not isinstance(splits, Mapping) or frozenset(splits) != expected:
+        raise CacheCorruptionError(
+            "cache manifest split set must be exactly "
+            "{train, validation, test}"
+        )
 
 
 def cache_one_split(
@@ -186,10 +203,11 @@ def run_build_cache(config: ConfidenceHeadConfig) -> Path:
     identity = _cache_identity(config)
     root = _cache_root(config, identity)
     try:
-        load_complete_cache(root, expected_cache_id=identity)
+        manifest = load_complete_cache(root, expected_cache_id=identity)
     except CacheIncompleteError:
         pass
     else:
+        _validate_manifest_splits(manifest)
         return root
 
     loaded = load_frozen_backbone(
@@ -223,5 +241,6 @@ def run_build_cache(config: ConfidenceHeadConfig) -> Path:
             )
             writer.finalize_split(name)
 
-    writer.finalize()
+    manifest = writer.finalize()
+    _validate_manifest_splits(manifest)
     return root
