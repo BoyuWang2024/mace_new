@@ -321,6 +321,70 @@ def test_build_rejects_wrong_split_set_returned_by_finalize(
         workflow.run_build_cache(valid_config)
 
 
+def test_resumed_unexpected_split_fails_before_manifest_persistence(
+    monkeypatch, valid_config
+):
+    identity = "unexpected-progress"
+    install_identity_stubs(monkeypatch, identity)
+    cache_root = (
+        valid_config.run.output_root
+        / valid_config.run.name_prefix
+        / "cache"
+        / identity
+    )
+    writer = workflow.CacheWriter(
+        cache_root,
+        cache_id=identity,
+        shard_max_atoms=valid_config.cache.shard_max_atoms,
+    )
+    writer.append(
+        SimpleNamespace(
+            indices=torch.tensor([0], dtype=torch.long),
+            structure_ids=("unexpected-0",),
+            num_atoms=torch.tensor([1], dtype=torch.long),
+            atom_offsets=torch.tensor([0, 1], dtype=torch.long),
+            features=torch.zeros(1, 640, dtype=torch.float64),
+            reference_energy=torch.zeros(1, dtype=torch.float64),
+            reference_forces=torch.zeros(1, 3, dtype=torch.float64),
+        ),
+        split="unexpected",
+    )
+    writer.finalize_split("unexpected")
+    manifest_path = cache_root / "cache_manifest.json"
+    manifest_before = (
+        manifest_path.read_bytes() if manifest_path.exists() else None
+    )
+
+    monkeypatch.setattr(
+        workflow,
+        "load_frozen_backbone",
+        lambda *_args, **_kwargs: fake_loaded(),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "build_dataset_handles",
+        lambda *_args, **_kwargs: {
+            name: SimpleNamespace(size=0) for name in workflow.SPLIT_ORDER
+        },
+    )
+    monkeypatch.setattr(
+        workflow, "validate_split_isolation", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(workflow, "FeatureCapture", FakeCapture)
+    monkeypatch.setattr(
+        workflow, "cache_one_split", lambda _name, **_kwargs: None
+    )
+
+    with pytest.raises(CacheCorruptionError, match="split set"):
+        workflow.run_build_cache(valid_config)
+
+    manifest_after = (
+        manifest_path.read_bytes() if manifest_path.exists() else None
+    )
+    assert manifest_before is None
+    assert manifest_after == manifest_before
+
+
 def test_cache_one_split_uses_ordered_indices_force_and_one_forward_per_batch(
     monkeypatch, valid_config
 ):

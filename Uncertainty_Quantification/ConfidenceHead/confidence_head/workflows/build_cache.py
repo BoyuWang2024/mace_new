@@ -109,14 +109,30 @@ def _detach_prediction_tensors(value: Any) -> Any:
     return value
 
 
-def _validate_manifest_splits(manifest: object) -> None:
-    splits = getattr(manifest, "splits", None)
+def _validate_exact_splits(value: object, *, where: str) -> Mapping[str, Any]:
+    splits = getattr(value, "splits", None)
     expected = frozenset(SPLIT_ORDER)
     if not isinstance(splits, Mapping) or frozenset(splits) != expected:
         raise CacheCorruptionError(
-            "cache manifest split set must be exactly "
-            "{train, validation, test}"
+            f"{where} split set must be exactly {{train, validation, test}}"
         )
+    return splits
+
+
+def _validate_writer_ready(writer: CacheWriter) -> None:
+    splits = _validate_exact_splits(writer, where="cache progress")
+    if any(
+        not isinstance(splits[name], Mapping)
+        or splits[name].get("complete") is not True
+        for name in SPLIT_ORDER
+    ):
+        raise CacheCorruptionError(
+            "cache progress required splits must be complete"
+        )
+
+
+def _validate_manifest_splits(manifest: object) -> None:
+    _validate_exact_splits(manifest, where="cache manifest")
 
 
 def cache_one_split(
@@ -241,6 +257,7 @@ def run_build_cache(config: ConfidenceHeadConfig) -> Path:
             )
             writer.finalize_split(name)
 
+    _validate_writer_ready(writer)
     manifest = writer.finalize()
     _validate_manifest_splits(manifest)
     return root
