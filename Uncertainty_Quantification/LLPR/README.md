@@ -110,6 +110,8 @@ outputs/<experiment>/<checkpoint_sha256前12位>/
 
 ## 结果可发表验证
 
-`validate` 会重新读取并哈希全部正式 CSV 与摘要，检查固定 schema、有限数值、正 `q`、非负 variance/std、残差与方差公式、三种曲率之间的结构和观测对齐，以及 manifest 身份和文件 SHA256。覆盖率、相关性和标准化残差是完整报告指标，不作为隐藏的质量门槛。
+`validate` 会重新读取并哈希全部正式 CSV 与摘要，检查固定 schema、有限数值、正 `q`、非负 variance/std、残差与方差公式、三种曲率之间共享的结构键、原子数、分量索引和 reference 对齐，以及 manifest 身份和文件 SHA256。每个 variant 的 prediction 与 residual 可以独立产生，但必须在该 variant 内严格满足 `residual = reference - prediction`，其逐结构力误差和摘要也必须由本路径 CSV 自洽重建。
+
+当前评估流程对同一结构只执行一次模型预测，因此新计算的三个 variant 会自然共享 prediction；验证器允许科学上合法的 variant-specific prediction，不改变新计算的这一确定性行为。覆盖率、相关性和标准化残差是完整报告指标，不作为隐藏的质量门槛。
 
 只有 `validate` 成功并生成确定性的 `manifest.json`、`validation.json` 后，结果才满足可发表结果包的结构与数值完整性要求。绘图再次验证输入快照，只从正式 CSV、摘要和清单生成图形及统计，不做后验尺度修正，也不重新计算任何不确定度。

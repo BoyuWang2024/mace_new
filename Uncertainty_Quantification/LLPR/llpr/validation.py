@@ -1128,20 +1128,18 @@ def _publication_identities(
     return normalized, source
 
 
-def _observations_aligned(
+def _references_aligned(
     actual: Sequence[tuple[Any, ...]],
     expected: Sequence[tuple[Any, ...]],
     *,
     key_fields: int,
 ) -> bool:
+    """Require shared keys and reference observations, not shared predictions."""
     if len(actual) != len(expected):
         return False
     return all(
         left[:key_fields] == right[:key_fields]
-        and all(
-            _same(float(a), float(b))
-            for a, b in zip(left[key_fields:], right[key_fields:])
-        )
+        and _scale_aware_same(float(left[key_fields]), float(right[key_fields]))
         for left, right in zip(actual, expected)
     )
 
@@ -1246,9 +1244,9 @@ def validate_publication_root(
         if energy_baseline is None:
             energy_baseline = energy
             force_baseline = forces
-        elif not _observations_aligned(
+        elif not _references_aligned(
             energy, energy_baseline, key_fields=2
-        ) or not _observations_aligned(
+        ) or not _references_aligned(
             forces,
             force_baseline if force_baseline is not None else (),
             key_fields=4,

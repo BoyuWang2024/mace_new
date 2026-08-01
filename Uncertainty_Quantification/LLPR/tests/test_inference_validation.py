@@ -880,6 +880,69 @@ def _evaluated_publication_root(
     return run_evaluate(config)
 
 
+def _make_variant_predictions_distinct(root: Path) -> None:
+    """Keep shared observations while making every variant's predictions valid."""
+    for variant_index, variant in enumerate(_VARIANTS, start=1):
+        delta = variant_index * 0.125
+        energy_path = root / variant / "energy.csv"
+        energy = pd.read_csv(energy_path)
+        energy["prediction"] += delta
+        energy["residual"] = energy["reference"] - energy["prediction"]
+        energy.to_csv(energy_path, index=False)
+
+        force_path = root / variant / "force_components.csv"
+        forces = pd.read_csv(force_path)
+        forces["prediction"] -= delta
+        forces["residual"] = forces["reference"] - forces["prediction"]
+        forces.to_csv(force_path, index=False)
+
+        structure_path = root / variant / "force_structure.csv"
+        structures = pd.read_csv(structure_path)
+        for row_index, structure in structures.iterrows():
+            group = forces[forces["structure_id"] == structure["structure_id"]]
+            structures.loc[row_index, "mae"] = group["residual"].abs().mean()
+            structures.loc[row_index, "rmse"] = (
+                (group["residual"] ** 2).mean() ** 0.5
+            )
+        structures.to_csv(structure_path, index=False)
+
+        summary_path = root / variant / "summary.json"
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        atomic_json_dump(
+            summary_path,
+            summarize_variant(
+                root / variant,
+                variant=variant,
+                ridge_mode=previous["ridge"]["mode"],
+                ridge=previous["ridge"]["value"],
+                energy_alpha=previous["alpha"]["energy"],
+                force_alpha=previous["alpha"]["forces"],
+                cholesky_diagnostics=previous["cholesky_diagnostics"],
+            ),
+        )
+
+
+def test_publication_contract_allows_variant_specific_energy_and_force_predictions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    _make_variant_predictions_distinct(root)
+
+    report = validate_publication_root(root)
+
+    assert report["status"] == "valid"
+    predictions = {
+        variant: (
+            pd.read_csv(root / variant / "energy.csv").loc[0, "prediction"],
+            pd.read_csv(root / variant / "force_components.csv").loc[
+                0, "prediction"
+            ],
+        )
+        for variant in _VARIANTS
+    }
+    assert len(set(predictions.values())) == len(_VARIANTS)
+
+
 def test_validate_publication_root_writes_deterministic_strict_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1005,15 +1068,46 @@ def test_validation_rejects_variant_misalignment(
         validate_publication_root(root)
 
 
-def test_validation_rejects_cross_variant_force_observation_mismatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _refresh_variant_derived_files(root: Path, variant: str) -> None:
+    forces = pd.read_csv(root / variant / "force_components.csv")
+    structure_path = root / variant / "force_structure.csv"
+    structures = pd.read_csv(structure_path)
+    for row_index, structure in structures.iterrows():
+        group = forces[forces["structure_id"] == structure["structure_id"]]
+        structures.loc[row_index, "mae"] = group["residual"].abs().mean()
+        structures.loc[row_index, "rmse"] = (
+            (group["residual"] ** 2).mean() ** 0.5
+        )
+    structures.to_csv(structure_path, index=False)
+
+    summary_path = root / variant / "summary.json"
+    previous = json.loads(summary_path.read_text(encoding="utf-8"))
+    atomic_json_dump(
+        summary_path,
+        summarize_variant(
+            root / variant,
+            variant=variant,
+            ridge_mode=previous["ridge"]["mode"],
+            ridge=previous["ridge"]["value"],
+            energy_alpha=previous["alpha"]["energy"],
+            force_alpha=previous["alpha"]["forces"],
+            cholesky_diagnostics=previous["cholesky_diagnostics"],
+        ),
+    )
+
+
+@pytest.mark.parametrize("target", ("energy", "forces"))
+def test_validation_rejects_cross_variant_reference_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
 ) -> None:
     root = _evaluated_publication_root(tmp_path, monkeypatch)
-    path = root / "hf" / "force_components.csv"
+    filename = "energy.csv" if target == "energy" else "force_components.csv"
+    path = root / "hf" / filename
     frame = pd.read_csv(path)
-    frame.loc[0, "prediction"] += 1.0
-    frame.loc[0, "residual"] -= 1.0
+    frame.loc[0, "reference"] += 1.0
+    frame.loc[0, "residual"] += 1.0
     frame.to_csv(path, index=False)
+    _refresh_variant_derived_files(root, "hf")
 
     with pytest.raises(ValueError, match="variant alignment"):
         validate_publication_root(root)
@@ -1113,8 +1207,8 @@ def test_variant_alignment_accepts_values_within_documented_tolerance(
     root = _evaluated_publication_root(tmp_path, monkeypatch)
     path = root / "hf" / "energy.csv"
     energy = pd.read_csv(path)
-    energy.loc[0, "prediction"] += 5.0e-13
-    energy.loc[0, "residual"] -= 5.0e-13
+    energy.loc[0, "reference"] += 5.0e-13
+    energy.loc[0, "residual"] += 5.0e-13
     energy.to_csv(path, index=False)
     summary_path = root / "hf" / "summary.json"
     previous = json.loads(summary_path.read_text(encoding="utf-8"))
