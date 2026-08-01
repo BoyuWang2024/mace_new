@@ -62,7 +62,7 @@ class BinningConfig:
 
 @dataclass(frozen=True)
 class ForceModelConfig:
-    target_mode: Literal["atom_mean"]
+    target_mode: Literal["atom_mean", "component"]
     hidden_dims: tuple[int, ...]
     dropout: float
 
@@ -279,8 +279,9 @@ def _binning(value: Any) -> BinningConfig:
 def _model(value: Any) -> ModelConfig:
     mapping = _keys(value, {"force", "energy"}, "model")
     force = _keys(mapping["force"], {"target_mode", "hidden_dims", "dropout"}, "model.force")
-    if _string(force["target_mode"], "model.force.target_mode") != "atom_mean":
-        raise ConfigError("model.force.target_mode must be atom_mean")
+    target_mode = _string(force["target_mode"], "model.force.target_mode")
+    if target_mode not in {"atom_mean", "component"}:
+        raise ConfigError("model.force.target_mode must be atom_mean or component")
     energy = _keys(mapping["energy"], {"cumulant_order", "projection_dim", "adapter_dropout", "hidden_dims", "dropout", "signed_root"}, "model.energy")
     order = _int(energy["cumulant_order"], "model.energy.cumulant_order")
     if not 1 <= order <= 5:
@@ -288,7 +289,7 @@ def _model(value: Any) -> ModelConfig:
     projection_dim = _int(energy["projection_dim"], "model.energy.projection_dim")
     if projection_dim != 512:
         raise ConfigError("model.energy.projection_dim must be 512")
-    return ModelConfig(ForceModelConfig("atom_mean", _dims(force["hidden_dims"], "model.force.hidden_dims"), _dropout(force["dropout"], "model.force.dropout")), EnergyModelConfig(order, 512, _dropout(energy["adapter_dropout"], "model.energy.adapter_dropout"), _dims(energy["hidden_dims"], "model.energy.hidden_dims"), _dropout(energy["dropout"], "model.energy.dropout"), _bool(energy["signed_root"], "model.energy.signed_root")))
+    return ModelConfig(ForceModelConfig(target_mode, _dims(force["hidden_dims"], "model.force.hidden_dims"), _dropout(force["dropout"], "model.force.dropout")), EnergyModelConfig(order, 512, _dropout(energy["adapter_dropout"], "model.energy.adapter_dropout"), _dims(energy["hidden_dims"], "model.energy.hidden_dims"), _dropout(energy["dropout"], "model.energy.dropout"), _bool(energy["signed_root"], "model.energy.signed_root")))
 
 
 def _loss(value: Any) -> LossConfig:

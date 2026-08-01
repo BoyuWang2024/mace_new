@@ -93,6 +93,11 @@ def test_feature_module_order_and_dimensions_are_fixed(
         load_config(path)
 
 
+def test_force_component_target_mode_is_accepted(tmp_path: Path) -> None:
+    path = write_valid_config(tmp_path)
+    update_yaml(path, {"model.force.target_mode": "component"})
+    config = load_config(path)
+    assert config.model.force.target_mode == "component"
 @pytest.mark.parametrize("num_bins", [2, 0, -1])
 def test_binning_requires_at_least_three_bins(tmp_path: Path, num_bins: int) -> None:
     path = write_valid_config(tmp_path)
