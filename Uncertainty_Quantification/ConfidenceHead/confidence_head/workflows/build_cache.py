@@ -14,6 +14,7 @@ from ..cache import (
     CACHE_SCHEMA_VERSION,
     FEATURE_WIDTH,
     CacheCorruptionError,
+    ContinuousBatch,
     CacheIncompleteError,
     CacheWriter,
     load_complete_cache,
@@ -26,7 +27,7 @@ from ..data import (
     validate_split_isolation,
 )
 from ..errors import DataContractError
-from ..features import FeatureCapture, to_continuous_batch
+from ..features import FeatureCapture
 from ..identity import cache_id, code_identity
 
 
@@ -95,18 +96,85 @@ def read_structures(path: Path) -> Sequence[Any]:
     return structures
 
 
-def _detach_prediction_tensors(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        if not bool(torch.isfinite(value).all().item()):
-            raise DataContractError("MACE predictions must be finite")
-        return value.detach()
-    if isinstance(value, Mapping):
-        return {key: _detach_prediction_tensors(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_detach_prediction_tensors(item) for item in value)
-    if isinstance(value, list):
-        return [_detach_prediction_tensors(item) for item in value]
-    return value
+def _prediction_tensor(
+    value: object,
+    *,
+    name: str,
+    expected_shape: tuple[int, ...],
+) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor):
+        raise DataContractError(f"MACE {name} prediction must be a tensor")
+    if tuple(value.shape) != expected_shape:
+        raise DataContractError(
+            f"MACE {name} prediction must have shape {expected_shape}"
+        )
+    if not value.is_floating_point():
+        raise DataContractError(
+            f"MACE {name} prediction must be floating point"
+        )
+    if value.device.type == "meta":
+        raise DataContractError(
+            f"MACE {name} prediction must use a materialized device"
+        )
+    detached = value.detach()
+    if not bool(torch.isfinite(detached).all().item()):
+        raise DataContractError("MACE predictions must be finite")
+    return detached
+
+
+def _extract_predictions(
+    output: object, *, expected_structures: int, expected_atoms: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not isinstance(output, Mapping):
+        raise DataContractError("MACE forward output must be a mapping")
+    try:
+        energy = output["energy"]
+        forces = output["forces"]
+    except KeyError as error:
+        raise DataContractError(
+            "MACE forward output must contain energy and forces predictions"
+        ) from error
+    return (
+        _prediction_tensor(
+            energy,
+            name="energy",
+            expected_shape=(expected_structures,),
+        ),
+        _prediction_tensor(
+            forces,
+            name="forces",
+            expected_shape=(expected_atoms, 3),
+        ),
+    )
+
+
+def _atomic_numbers(
+    model_input: Mapping[str, Any], *, expected_atoms: int
+) -> torch.Tensor:
+    value = model_input.get("atomic_numbers")
+    if not isinstance(value, torch.Tensor):
+        raise DataContractError(
+            "MACE structure batch atomic_numbers must be a tensor"
+        )
+    if value.ndim != 1 or value.numel() != expected_atoms:
+        raise DataContractError(
+            "MACE structure batch atomic_numbers must cover every atom"
+        )
+    if value.dtype not in {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }:
+        raise DataContractError(
+            "MACE structure batch atomic_numbers must use an integral dtype"
+        )
+    if value.device.type == "meta":
+        raise DataContractError(
+            "MACE structure batch atomic_numbers must be materialized"
+        )
+    return value.detach()
 
 
 def _validate_exact_splits(value: object, *, where: str) -> Mapping[str, Any]:
@@ -166,17 +234,38 @@ def cache_one_split(
         if batch.structure_ids != expected_ids:
             raise DataContractError(f"{name} changed after identity validation")
 
-        predictions = _detach_prediction_tensors(
-            loaded.model(
-                batch.mace_batch.to_dict(),
-                training=False,
-                compute_force=True,
-            )
-        )
+        model_input = batch.mace_batch.to_dict()
         expected_atoms = int(batch.atom_offsets[-1].item())
-        features = capture.take(expected_atoms=expected_atoms).detach()
-        writer.append(to_continuous_batch(batch, features), split=name)
-        del predictions
+        atomic_numbers = _atomic_numbers(
+            model_input, expected_atoms=expected_atoms
+        )
+        output = loaded.model(
+            model_input,
+            training=False,
+            compute_force=True,
+        )
+        energy_prediction, force_prediction = _extract_predictions(
+            output,
+            expected_structures=stop - start,
+            expected_atoms=expected_atoms,
+        )
+        scalar_features = capture.take(
+            expected_atoms=expected_atoms
+        ).detach()
+        writer.append(
+            ContinuousBatch(
+                structure_index=batch.indices,
+                structure_id=batch.structure_ids,
+                atomic_numbers=atomic_numbers,
+                atom_offsets=batch.atom_offsets,
+                scalar_features=scalar_features,
+                force_prediction=force_prediction,
+                force_reference=batch.reference_forces,
+                energy_prediction=energy_prediction,
+                energy_reference=batch.reference_energy,
+            ),
+            split=name,
+        )
 
 
 def _open_writer(

@@ -14,7 +14,7 @@ from .artifacts import atomic_json_dump, atomic_torch_save, load_torch_artifact
 from .identity import sha256_file
 
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 FEATURE_WIDTH = 640
 FORCE_WIDTH = 3
 
@@ -26,12 +26,15 @@ _SHARD_PAYLOAD_KEYS = frozenset(
         "shard_index",
         "num_structures",
         "num_atoms",
-        "indices",
-        "structure_ids",
+        "structure_index",
+        "structure_id",
+        "atomic_numbers",
         "atom_offsets",
-        "features",
-        "reference_energy",
-        "reference_forces",
+        "scalar_features",
+        "force_prediction",
+        "force_reference",
+        "energy_prediction",
+        "energy_reference",
     }
 )
 _PROGRESS_KEYS = frozenset(
@@ -70,13 +73,21 @@ _ATOMIC_SHARD_TEMP_PATTERN = re.compile(
 class ContinuousBatch:
     """Cache-only representation that does not import MACE or ASE."""
 
-    indices: torch.Tensor
-    structure_ids: tuple[str, ...]
-    num_atoms: torch.Tensor
+    structure_index: torch.Tensor
+    structure_id: tuple[str, ...]
+    atomic_numbers: torch.Tensor
     atom_offsets: torch.Tensor
-    features: torch.Tensor
-    reference_energy: torch.Tensor
-    reference_forces: torch.Tensor
+    scalar_features: torch.Tensor
+    force_prediction: torch.Tensor
+    force_reference: torch.Tensor
+    energy_prediction: torch.Tensor
+    energy_reference: torch.Tensor
+
+
+    @property
+    def num_atoms(self) -> torch.Tensor:
+        """Return per-structure atom counts derived from committed offsets."""
+        return self.atom_offsets[1:] - self.atom_offsets[:-1]
 
 
 class CacheCorruptionError(ValueError):
@@ -115,7 +126,7 @@ class CacheManifest:
 @dataclass(frozen=True)
 class _ValidationResult:
     structure_ids: frozenset[str]
-    floating_dtype: torch.dtype | None
+    feature_dtype: torch.dtype | None
     splits: dict[str, tuple[CacheShard, ...]]
 
 
@@ -186,37 +197,36 @@ def _tensor(
     return value
 
 
+_CONTINUOUS_BATCH_FIELDS = (
+    "structure_index",
+    "structure_id",
+    "atomic_numbers",
+    "atom_offsets",
+    "scalar_features",
+    "force_prediction",
+    "force_reference",
+    "energy_prediction",
+    "energy_reference",
+)
+_INTEGRAL_DTYPES = frozenset(
+    {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
+)
+
+
 def _batch_attributes(batch: object, where: str) -> ContinuousBatch:
-    field_names = (
-        "indices",
-        "structure_ids",
-        "num_atoms",
-        "atom_offsets",
-        "features",
-        "reference_energy",
-        "reference_forces",
-    )
     if isinstance(batch, dict):
-        try:
-            values = {name: batch[name] for name in field_names}
-        except KeyError as error:
-            raise _bad(where, "missing continuous batch fields") from error
+        expected = frozenset(_CONTINUOUS_BATCH_FIELDS)
+        mapping = _exact_mapping(batch, expected, where)
+        values = {name: mapping[name] for name in _CONTINUOUS_BATCH_FIELDS}
     else:
         try:
             values = {
-                name: getattr(batch, name) for name in field_names
+                name: getattr(batch, name)
+                for name in _CONTINUOUS_BATCH_FIELDS
             }
         except AttributeError as error:
             raise _bad(where, "missing continuous batch fields") from error
-    return ContinuousBatch(
-        indices=values["indices"],
-        structure_ids=values["structure_ids"],
-        num_atoms=values["num_atoms"],
-        atom_offsets=values["atom_offsets"],
-        features=values["features"],
-        reference_energy=values["reference_energy"],
-        reference_forces=values["reference_forces"],
-    )
+    return ContinuousBatch(**values)
 
 
 def _validate_continuous_batch(
@@ -227,23 +237,26 @@ def _validate_continuous_batch(
     require_cpu: bool,
 ) -> ContinuousBatch:
     value = _batch_attributes(batch, where)
-    if not isinstance(value.structure_ids, tuple):
-        raise _bad(f"{where}.structure_ids", "must be a tuple")
-    if not value.structure_ids:
+    if not isinstance(value.structure_id, tuple):
+        raise _bad(f"{where}.structure_id", "must be a tuple")
+    if not value.structure_id:
         raise _bad(where, "batch must contain at least one structure")
     if not all(
         isinstance(structure_id, str) and structure_id
-        for structure_id in value.structure_ids
+        for structure_id in value.structure_id
     ):
-        raise _bad(f"{where}.structure_ids", "must contain non-empty strings")
-    if len(value.structure_ids) != len(set(value.structure_ids)):
+        raise _bad(f"{where}.structure_id", "must contain non-empty strings")
+    if len(value.structure_id) != len(set(value.structure_id)):
         raise _bad(where, "duplicate structure_ids")
 
-    indices = _tensor(
-        value.indices, f"{where}.indices", ndim=1, dtype=torch.long
+    structure_index = _tensor(
+        value.structure_index,
+        f"{where}.structure_index",
+        ndim=1,
+        dtype=torch.long,
     )
-    num_atoms = _tensor(
-        value.num_atoms, f"{where}.num_atoms", ndim=1, dtype=torch.long
+    atomic_numbers = _tensor(
+        value.atomic_numbers, f"{where}.atomic_numbers", ndim=1
     )
     atom_offsets = _tensor(
         value.atom_offsets,
@@ -251,59 +264,73 @@ def _validate_continuous_batch(
         ndim=1,
         dtype=torch.long,
     )
-    features = _tensor(value.features, f"{where}.features", ndim=2)
-    reference_energy = _tensor(
-        value.reference_energy, f"{where}.reference_energy", ndim=1
+    scalar_features = _tensor(
+        value.scalar_features, f"{where}.scalar_features", ndim=2
     )
-    reference_forces = _tensor(
-        value.reference_forces, f"{where}.reference_forces", ndim=2
+    force_prediction = _tensor(
+        value.force_prediction, f"{where}.force_prediction", ndim=2
+    )
+    force_reference = _tensor(
+        value.force_reference, f"{where}.force_reference", ndim=2
+    )
+    energy_prediction = _tensor(
+        value.energy_prediction, f"{where}.energy_prediction", ndim=1
+    )
+    energy_reference = _tensor(
+        value.energy_reference, f"{where}.energy_reference", ndim=1
     )
 
     tensors = (
-        indices,
-        num_atoms,
+        structure_index,
+        atomic_numbers,
         atom_offsets,
-        features,
-        reference_energy,
-        reference_forces,
+        scalar_features,
+        force_prediction,
+        force_reference,
+        energy_prediction,
+        energy_reference,
     )
-    device = indices.device
+    device = structure_index.device
     if any(tensor.device != device for tensor in tensors[1:]):
         raise _bad(where, "all tensors must use the same device")
     if require_cpu and device.type != "cpu":
         raise _bad(where, "persisted tensors must use the CPU")
+    if atomic_numbers.dtype not in _INTEGRAL_DTYPES:
+        raise _bad(f"{where}.atomic_numbers", "must use an integral dtype")
 
-    floating = (features, reference_energy, reference_forces)
+    floating = (
+        scalar_features,
+        force_prediction,
+        force_reference,
+        energy_prediction,
+        energy_reference,
+    )
     if any(not tensor.is_floating_point() for tensor in floating):
-        raise _bad(where, "feature and reference tensors must be floating point")
-    if any(tensor.dtype != features.dtype for tensor in floating[1:]):
-        raise _bad(where, "feature and reference tensor dtype mismatch")
+        raise _bad(where, "prediction, reference, and feature tensors must float")
 
-    structure_count = len(value.structure_ids)
+    structure_count = len(value.structure_id)
     if (
-        indices.numel() != structure_count
-        or num_atoms.numel() != structure_count
-        or reference_energy.numel() != structure_count
+        structure_index.numel() != structure_count
+        or energy_prediction.numel() != structure_count
+        or energy_reference.numel() != structure_count
         or atom_offsets.numel() != structure_count + 1
     ):
         raise _bad(where, "structure tensor lengths do not match")
-    if not bool(torch.all(num_atoms > 0).item()):
-        raise _bad(where, "num_atoms counts must be positive")
     if int(atom_offsets[0].item()) != 0:
         raise _bad(where, "atom_offsets must start at zero")
-
-    offset_counts = atom_offsets[1:] - atom_offsets[:-1]
-    if not bool(torch.all(offset_counts > 0).item()):
+    if not bool(torch.all(atom_offsets[1:] > atom_offsets[:-1]).item()):
         raise _bad(where, "atom_offsets must be strictly increasing")
-    if not torch.equal(offset_counts, num_atoms):
-        raise _bad(where, "atom_offsets must exactly match num_atoms")
 
     total_atoms = int(atom_offsets[-1].item())
-    if tuple(features.shape) != (total_atoms, FEATURE_WIDTH):
-        raise _bad(where, "feature rows or width do not match atom counts")
-    if tuple(reference_forces.shape) != (total_atoms, FORCE_WIDTH):
-        raise _bad(where, "reference force rows or width do not match atom counts")
-
+    if atomic_numbers.numel() != total_atoms:
+        raise _bad(where, "atomic-number rows do not match atom offsets")
+    if tuple(scalar_features.shape) != (total_atoms, FEATURE_WIDTH):
+        raise _bad(where, "feature rows or width do not match atom offsets")
+    expected_force_shape = (total_atoms, FORCE_WIDTH)
+    if tuple(force_prediction.shape) != expected_force_shape:
+        raise _bad(where, "prediction force shape does not match atom offsets")
+    if tuple(force_reference.shape) != expected_force_shape:
+        raise _bad(where, "reference force shape does not match atom offsets")
     if any(not bool(torch.isfinite(tensor).all().item()) for tensor in floating):
         raise _bad(where, "tensors must be finite")
 
@@ -313,8 +340,8 @@ def _validate_continuous_batch(
         dtype=torch.long,
         device=device,
     )
-    if not torch.equal(indices, expected_indices):
-        raise _bad(where, "indices must be continuous")
+    if not torch.equal(structure_index, expected_indices):
+        raise _bad(where, "structure_index must be continuous")
     return value
 
 
@@ -345,21 +372,31 @@ def _validate_shard_payload(
         f"{where}.num_structures",
         minimum=1,
     )
+    declared_atoms = _exact_int(
+        mapping["num_atoms"],
+        f"{where}.num_atoms",
+        minimum=1,
+    )
     batch = _validate_continuous_batch(
-        mapping,
+        {
+            field: mapping[field]
+            for field in _CONTINUOUS_BATCH_FIELDS
+        },
         expected_start=expected_start,
         where=where,
         require_cpu=True,
     )
-    structure_count = len(batch.structure_ids)
+    structure_count = len(batch.structure_id)
     if declared_structures != structure_count:
         raise _bad(where, "num_structures is false")
     total_atoms = int(batch.atom_offsets[-1].item())
+    if declared_atoms != total_atoms:
+        raise _bad(where, "num_atoms is false")
     return (
         structure_count,
         total_atoms,
-        batch.structure_ids,
-        batch.features.dtype,
+        batch.structure_id,
+        batch.scalar_features.dtype,
     )
 
 
@@ -478,7 +515,7 @@ def _validate_cache(
     root: Path, progress: CacheProgress
 ) -> _ValidationResult:
     structure_ids: set[str] = set()
-    floating_dtype: torch.dtype | None = None
+    feature_dtype: torch.dtype | None = None
     declared_paths: set[Path] = set()
     parsed_splits: dict[str, tuple[CacheShard, ...]] = {}
 
@@ -536,12 +573,12 @@ def _validate_cache(
                 )
             structure_ids.update(shard_ids)
 
-            if floating_dtype is None:
-                floating_dtype = shard_dtype
-            elif shard_dtype != floating_dtype:
+            if feature_dtype is None:
+                feature_dtype = shard_dtype
+            elif shard_dtype != feature_dtype:
                 raise _bad(
                     shard_where,
-                    "floating dtype differs from earlier cache shards",
+                    "feature dtype differs from earlier cache shards",
                 )
 
             expected_structure_index += shard_structures
@@ -567,7 +604,7 @@ def _validate_cache(
     _reject_undeclared_shards(root, declared_paths)
     return _ValidationResult(
         structure_ids=frozenset(structure_ids),
-        floating_dtype=floating_dtype,
+        feature_dtype=feature_dtype,
         splits=parsed_splits,
     )
 
@@ -585,13 +622,15 @@ def _new_split_state() -> dict[str, Any]:
 
 def _cpu_batch(batch: ContinuousBatch) -> ContinuousBatch:
     return ContinuousBatch(
-        indices=batch.indices.detach().cpu(),
-        structure_ids=batch.structure_ids,
-        num_atoms=batch.num_atoms.detach().cpu(),
+        structure_index=batch.structure_index.detach().cpu(),
+        structure_id=batch.structure_id,
+        atomic_numbers=batch.atomic_numbers.detach().cpu(),
         atom_offsets=batch.atom_offsets.detach().cpu(),
-        features=batch.features.detach().cpu(),
-        reference_energy=batch.reference_energy.detach().cpu(),
-        reference_forces=batch.reference_forces.detach().cpu(),
+        scalar_features=batch.scalar_features.detach().cpu(),
+        force_prediction=batch.force_prediction.detach().cpu(),
+        force_reference=batch.force_reference.detach().cpu(),
+        energy_prediction=batch.energy_prediction.detach().cpu(),
+        energy_reference=batch.energy_reference.detach().cpu(),
     )
 
 
@@ -602,15 +641,21 @@ def _one_structure(
     atom_end = int(batch.atom_offsets[structure_index + 1].item())
     atom_count = atom_end - atom_start
     return ContinuousBatch(
-        indices=batch.indices[structure_index : structure_index + 1],
-        structure_ids=(batch.structure_ids[structure_index],),
-        num_atoms=batch.num_atoms[structure_index : structure_index + 1],
-        atom_offsets=torch.tensor([0, atom_count], dtype=torch.long),
-        features=batch.features[atom_start:atom_end],
-        reference_energy=batch.reference_energy[
+        structure_index=batch.structure_index[
             structure_index : structure_index + 1
         ],
-        reference_forces=batch.reference_forces[atom_start:atom_end],
+        structure_id=(batch.structure_id[structure_index],),
+        atomic_numbers=batch.atomic_numbers[atom_start:atom_end],
+        atom_offsets=torch.tensor([0, atom_count], dtype=torch.long),
+        scalar_features=batch.scalar_features[atom_start:atom_end],
+        force_prediction=batch.force_prediction[atom_start:atom_end],
+        force_reference=batch.force_reference[atom_start:atom_end],
+        energy_prediction=batch.energy_prediction[
+            structure_index : structure_index + 1
+        ],
+        energy_reference=batch.energy_reference[
+            structure_index : structure_index + 1
+        ],
     )
 
 
@@ -636,7 +681,7 @@ class CacheWriter:
         self._buffer: list[ContinuousBatch] = []
         self._active_split: str | None = None
         self._seen_structure_ids: set[str] = set()
-        self._floating_dtype: torch.dtype | None = None
+        self._feature_dtype: torch.dtype | None = None
 
         self.root.mkdir(parents=True, exist_ok=True)
         if (self.root / "cache_manifest.json").exists():
@@ -650,7 +695,7 @@ class CacheWriter:
                 raise _bad("progress.pt", "shard_max_atoms mismatch")
             self.splits = progress.splits
             self._seen_structure_ids.update(validation.structure_ids)
-            self._floating_dtype = validation.floating_dtype
+            self._feature_dtype = validation.feature_dtype
         else:
             self._save_progress()
 
@@ -709,9 +754,9 @@ class CacheWriter:
             require_cpu=False,
         )
         buffered_ids = {
-            structure.structure_ids[0] for structure in self._buffer
+            structure.structure_id[0] for structure in self._buffer
         }
-        duplicates = set(validated.structure_ids).intersection(
+        duplicates = set(validated.structure_id).intersection(
             self._seen_structure_ids | buffered_ids
         )
         if duplicates:
@@ -720,22 +765,23 @@ class CacheWriter:
                 "duplicate structure_ids across cache splits or shards",
             )
         if (
-            self._floating_dtype is not None
-            and validated.features.dtype != self._floating_dtype
+            self._feature_dtype is not None
+            and validated.scalar_features.dtype != self._feature_dtype
         ):
-            raise _bad(split, "floating dtype differs from cache dtype")
+            raise _bad(split, "feature dtype differs from cache dtype")
 
         normalized = _cpu_batch(validated)
-        if self._floating_dtype is None:
-            self._floating_dtype = normalized.features.dtype
+        if self._feature_dtype is None:
+            self._feature_dtype = normalized.scalar_features.dtype
 
         self._state(split)
         self._active_split = split
-        for structure_index in range(len(normalized.structure_ids)):
+        for structure_index in range(len(normalized.structure_id)):
             structure = _one_structure(normalized, structure_index)
-            atom_count = int(structure.num_atoms[0].item())
+            atom_count = int(structure.atom_offsets[-1].item())
             buffered_atoms = sum(
-                int(item.num_atoms[0].item()) for item in self._buffer
+                int(item.atom_offsets[-1].item())
+                for item in self._buffer
             )
             if (
                 self._buffer
@@ -748,42 +794,50 @@ class CacheWriter:
         if not self._buffer:
             return
         state = self._state(split)
-        num_atoms = torch.cat(
-            [structure.num_atoms for structure in self._buffer]
+        atom_counts = torch.tensor(
+            [
+                int(structure.atom_offsets[-1].item())
+                for structure in self._buffer
+            ],
+            dtype=torch.long,
         )
+        total_atoms = int(atom_counts.sum().item())
         payload = {
             "schema_version": CACHE_SCHEMA_VERSION,
             "cache_id": self.cache_id,
             "split": split,
             "shard_index": state["next_shard_index"],
             "num_structures": len(self._buffer),
-            "num_atoms": num_atoms,
-            "indices": torch.cat(
-                [structure.indices for structure in self._buffer]
+            "num_atoms": total_atoms,
+            "structure_index": torch.cat(
+                [structure.structure_index for structure in self._buffer]
             ),
-            "structure_ids": tuple(
-                structure.structure_ids[0] for structure in self._buffer
+            "structure_id": tuple(
+                structure.structure_id[0] for structure in self._buffer
+            ),
+            "atomic_numbers": torch.cat(
+                [structure.atomic_numbers for structure in self._buffer]
             ),
             "atom_offsets": torch.cat(
                 (
                     torch.zeros(1, dtype=torch.long),
-                    num_atoms.cumsum(0),
+                    atom_counts.cumsum(0),
                 )
             ),
-            "features": torch.cat(
-                [structure.features for structure in self._buffer]
+            "scalar_features": torch.cat(
+                [structure.scalar_features for structure in self._buffer]
             ),
-            "reference_energy": torch.cat(
-                [
-                    structure.reference_energy
-                    for structure in self._buffer
-                ]
+            "force_prediction": torch.cat(
+                [structure.force_prediction for structure in self._buffer]
             ),
-            "reference_forces": torch.cat(
-                [
-                    structure.reference_forces
-                    for structure in self._buffer
-                ]
+            "force_reference": torch.cat(
+                [structure.force_reference for structure in self._buffer]
+            ),
+            "energy_prediction": torch.cat(
+                [structure.energy_prediction for structure in self._buffer]
+            ),
+            "energy_reference": torch.cat(
+                [structure.energy_reference for structure in self._buffer]
             ),
         }
         (
@@ -1028,7 +1082,13 @@ def iter_cache_batches(
             raise _bad(shard_where, "committed counts are false")
         expected_structure_index += structure_count
 
-        shard_batch = _batch_attributes(payload, shard_where)
+        shard_batch = _batch_attributes(
+            {
+                field: payload[field]
+                for field in _CONTINUOUS_BATCH_FIELDS
+            },
+            shard_where,
+        )
         for structure_index in range(structure_count):
             pending.append(
                 _one_structure(shard_batch, structure_index)
@@ -1042,36 +1102,42 @@ def iter_cache_batches(
 
 
 def _repack(structures: list[ContinuousBatch]) -> ContinuousBatch:
-    num_atoms = torch.cat(
-        [structure.num_atoms for structure in structures]
+    atom_counts = torch.tensor(
+        [
+            int(structure.atom_offsets[-1].item())
+            for structure in structures
+        ],
+        dtype=torch.long,
     )
     return ContinuousBatch(
-        indices=torch.cat(
-            [structure.indices for structure in structures]
+        structure_index=torch.cat(
+            [structure.structure_index for structure in structures]
         ),
-        structure_ids=tuple(
-            structure.structure_ids[0] for structure in structures
+        structure_id=tuple(
+            structure.structure_id[0] for structure in structures
         ),
-        num_atoms=num_atoms,
+        atomic_numbers=torch.cat(
+            [structure.atomic_numbers for structure in structures]
+        ),
         atom_offsets=torch.cat(
             (
                 torch.zeros(1, dtype=torch.long),
-                num_atoms.cumsum(0),
+                atom_counts.cumsum(0),
             )
         ),
-        features=torch.cat(
-            [structure.features for structure in structures]
+        scalar_features=torch.cat(
+            [structure.scalar_features for structure in structures]
         ),
-        reference_energy=torch.cat(
-            [
-                structure.reference_energy
-                for structure in structures
-            ]
+        force_prediction=torch.cat(
+            [structure.force_prediction for structure in structures]
         ),
-        reference_forces=torch.cat(
-            [
-                structure.reference_forces
-                for structure in structures
-            ]
+        force_reference=torch.cat(
+            [structure.force_reference for structure in structures]
+        ),
+        energy_prediction=torch.cat(
+            [structure.energy_prediction for structure in structures]
+        ),
+        energy_reference=torch.cat(
+            [structure.energy_reference for structure in structures]
         ),
     )

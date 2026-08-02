@@ -338,14 +338,16 @@ def test_resumed_unexpected_split_fails_before_manifest_persistence(
         shard_max_atoms=valid_config.cache.shard_max_atoms,
     )
     writer.append(
-        SimpleNamespace(
-            indices=torch.tensor([0], dtype=torch.long),
-            structure_ids=("unexpected-0",),
-            num_atoms=torch.tensor([1], dtype=torch.long),
+        workflow.ContinuousBatch(
+            structure_index=torch.tensor([0], dtype=torch.long),
+            structure_id=("unexpected-0",),
+            atomic_numbers=torch.tensor([1], dtype=torch.long),
             atom_offsets=torch.tensor([0, 1], dtype=torch.long),
-            features=torch.zeros(1, 640, dtype=torch.float64),
-            reference_energy=torch.zeros(1, dtype=torch.float64),
-            reference_forces=torch.zeros(1, 3, dtype=torch.float64),
+            scalar_features=torch.zeros(1, 640, dtype=torch.float64),
+            force_prediction=torch.zeros(1, 3, dtype=torch.float64),
+            force_reference=torch.zeros(1, 3, dtype=torch.float64),
+            energy_prediction=torch.zeros(1, dtype=torch.float64),
+            energy_reference=torch.zeros(1, dtype=torch.float64),
         ),
         split="unexpected",
     )
@@ -404,25 +406,29 @@ def test_cache_one_split_uses_ordered_indices_force_and_one_forward_per_batch(
         del backbone, device
         built_indices.append(tuple(indices))
         atom_count = len(items)
+        model_input = {
+            "batch": len(items),
+            "atomic_numbers": torch.ones(atom_count, dtype=torch.long),
+        }
         return SimpleNamespace(
+            indices=torch.tensor(tuple(indices), dtype=torch.long),
             atom_offsets=torch.tensor([0, atom_count]),
             structure_ids=structure_ids[indices[0] : indices[-1] + 1],
-            mace_batch=SimpleNamespace(to_dict=lambda: {"batch": len(items)}),
+            reference_energy=torch.zeros(len(items)),
+            reference_forces=torch.zeros(atom_count, 3),
+            mace_batch=SimpleNamespace(to_dict=lambda: model_input),
         )
 
     monkeypatch.setattr(workflow, "build_structure_batch", fake_build)
-    continuous = []
-    monkeypatch.setattr(
-        workflow,
-        "to_continuous_batch",
-        lambda batch, features: continuous.append((batch, features)) or object(),
-    )
-
     forwards = []
 
     def model(batch, **kwargs):
         forwards.append((batch, kwargs))
-        return {"energy": torch.ones(1, requires_grad=True)}
+        atom_count = len(batch["atomic_numbers"])
+        return {
+            "energy": torch.ones(batch["batch"], requires_grad=True),
+            "forces": torch.ones(atom_count, 3, requires_grad=True),
+        }
 
     loaded = SimpleNamespace(model=model, identity=object())
 
@@ -446,12 +452,153 @@ def test_cache_one_split_uses_ordered_indices_force_and_one_forward_per_batch(
     )
 
     assert built_indices == [(1, 2), (3, 4)]
-    assert forwards == [
-        ({"batch": 2}, {"training": False, "compute_force": True}),
-        ({"batch": 2}, {"training": False, "compute_force": True}),
+    assert len(forwards) == 2
+    assert [item[0]["batch"] for item in forwards] == [2, 2]
+    assert [item[1] for item in forwards] == [
+        {"training": False, "compute_force": True},
+        {"training": False, "compute_force": True},
     ]
     assert [name for _, name in appended] == ["validation", "validation"]
-    assert all(not features.requires_grad for _, features in continuous)
+    assert all(not batch.scalar_features.requires_grad for batch, _ in appended)
+    assert all(not batch.force_prediction.requires_grad for batch, _ in appended)
+
+
+def test_cache_one_split_writes_actual_predictions_and_batch_atomic_numbers(
+    monkeypatch, valid_config
+):
+    structures = (object(), object())
+    handle = SimpleNamespace(
+        path=Path("split.extxyz"),
+        size=2,
+        structure_ids=("structure-0", "structure-1"),
+    )
+    monkeypatch.setattr(workflow, "read_structures", lambda _path: structures)
+    model_input = {
+        "batch": torch.tensor([0, 0, 1], dtype=torch.long),
+        "atomic_numbers": torch.tensor([1, 8, 6], dtype=torch.int32),
+    }
+    structure_batch = SimpleNamespace(
+        indices=torch.tensor([0, 1], dtype=torch.long),
+        structure_ids=handle.structure_ids,
+        atom_offsets=torch.tensor([0, 2, 3], dtype=torch.long),
+        reference_energy=torch.tensor([1.25, -0.5], dtype=torch.float32),
+        reference_forces=torch.full((3, 3), 0.25, dtype=torch.float16),
+        mace_batch=SimpleNamespace(to_dict=lambda: model_input),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "build_structure_batch",
+        lambda *_args, **_kwargs: structure_batch,
+    )
+    energy_prediction = torch.tensor([1.0, -0.75], dtype=torch.float64)
+    force_prediction = torch.arange(9, dtype=torch.float64).reshape(3, 3)
+    forwards = []
+
+    def model(inputs, **kwargs):
+        forwards.append((inputs, kwargs))
+        return {
+            "energy": energy_prediction.requires_grad_(),
+            "forces": force_prediction.requires_grad_(),
+            "node_energy": torch.zeros(3),
+        }
+
+    class Capture:
+        def take(self, *, expected_atoms):
+            assert expected_atoms == 3
+            return torch.ones(
+                3, 640, dtype=torch.float32, requires_grad=True
+            )
+
+    appended = []
+    workflow.cache_one_split(
+        "train",
+        handle=handle,
+        loaded=SimpleNamespace(model=model, identity=object()),
+        capture=Capture(),
+        writer=SimpleNamespace(
+            append=lambda batch, *, split: appended.append((batch, split))
+        ),
+        config=valid_config,
+        next_index=0,
+    )
+
+    assert len(forwards) == 1
+    assert forwards[0] == (
+        model_input,
+        {"training": False, "compute_force": True},
+    )
+    cached, split = appended[0]
+    assert split == "train"
+    assert torch.equal(cached.atomic_numbers, model_input["atomic_numbers"])
+    assert torch.equal(cached.force_prediction, force_prediction)
+    assert torch.equal(cached.energy_prediction, energy_prediction)
+    assert cached.scalar_features.dtype is torch.float32
+    assert cached.force_reference.dtype is torch.float16
+    assert cached.energy_reference.dtype is torch.float32
+    assert not cached.force_prediction.requires_grad
+    assert not cached.energy_prediction.requires_grad
+
+
+@pytest.mark.parametrize(
+    "predictions",
+    [
+        {
+            "energy": torch.zeros(2, 1),
+            "forces": torch.zeros(3, 3),
+        },
+        {
+            "energy": torch.zeros(2),
+            "forces": torch.zeros(2, 3),
+        },
+    ],
+)
+def test_cache_one_split_rejects_malformed_prediction_shapes(
+    monkeypatch, valid_config, predictions
+):
+    structures = (object(), object())
+    handle = SimpleNamespace(
+        path=Path("split.extxyz"),
+        size=2,
+        structure_ids=("structure-0", "structure-1"),
+    )
+    monkeypatch.setattr(workflow, "read_structures", lambda _path: structures)
+    monkeypatch.setattr(
+        workflow,
+        "build_structure_batch",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            indices=torch.tensor([0, 1], dtype=torch.long),
+            structure_ids=handle.structure_ids,
+            atom_offsets=torch.tensor([0, 2, 3], dtype=torch.long),
+            reference_energy=torch.zeros(2),
+            reference_forces=torch.zeros(3, 3),
+            mace_batch=SimpleNamespace(
+                to_dict=lambda: {
+                    "batch": torch.tensor([0, 0, 1]),
+                    "atomic_numbers": torch.tensor([1, 8, 6]),
+                }
+            ),
+        ),
+    )
+
+    with pytest.raises(DataContractError, match="prediction"):
+        workflow.cache_one_split(
+            "train",
+            handle=handle,
+            loaded=SimpleNamespace(
+                model=lambda *_args, **_kwargs: predictions,
+                identity=object(),
+            ),
+            capture=SimpleNamespace(
+                take=lambda **_kwargs: torch.ones(3, 640)
+            ),
+            writer=SimpleNamespace(
+                append=lambda *_args, **_kwargs: pytest.fail(
+                    "malformed predictions were appended"
+                )
+            ),
+            config=valid_config,
+            next_index=0,
+        )
 
 
 def run_nonfinite_prediction_case(monkeypatch, valid_config, predictions):
@@ -465,17 +612,22 @@ def run_nonfinite_prediction_case(monkeypatch, valid_config, predictions):
         workflow, "read_structures", lambda _path: (structure,)
     )
     batch = SimpleNamespace(
+        indices=torch.tensor([0], dtype=torch.long),
         atom_offsets=torch.tensor([0, 1]),
         structure_ids=("structure-0",),
-        mace_batch=SimpleNamespace(to_dict=lambda: {"batch": 1}),
+        reference_energy=torch.zeros(1),
+        reference_forces=torch.zeros(1, 3),
+        mace_batch=SimpleNamespace(
+            to_dict=lambda: {
+                "batch": 1,
+                "atomic_numbers": torch.tensor([1], dtype=torch.long),
+            }
+        ),
     )
     monkeypatch.setattr(
         workflow,
         "build_structure_batch",
         lambda *_args, **_kwargs: batch,
-    )
-    monkeypatch.setattr(
-        workflow, "to_continuous_batch", lambda *_args: object()
     )
     loaded = SimpleNamespace(
         model=lambda *_args, **_kwargs: predictions,
@@ -525,7 +677,7 @@ def test_cache_one_split_rejects_nonfinite_force_prediction(
         valid_config,
         {
             "energy": torch.zeros(1),
-            "forces": [torch.tensor([[0.0, float("inf"), 0.0]])],
+            "forces": torch.tensor([[0.0, float("inf"), 0.0]]),
         },
     )
 

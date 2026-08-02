@@ -15,7 +15,7 @@ from confidence_head.artifacts import (
     atomic_torch_save,
     load_torch_artifact,
 )
-from confidence_head.features import ContinuousBatch
+from confidence_head.cache import ContinuousBatch
 from confidence_head.identity import sha256_file
 
 
@@ -27,34 +27,42 @@ def batch_with_atom_counts(
     index_start: int = 0,
     structure_prefix: str = "structure",
 ) -> ContinuousBatch:
-    num_atoms = torch.tensor(counts, dtype=torch.long, device=device)
+    atom_counts = torch.tensor(counts, dtype=torch.long, device=device)
     atom_offsets = torch.cat(
         (
             torch.zeros(1, dtype=torch.long, device=device),
-            num_atoms.cumsum(0),
+            atom_counts.cumsum(0),
         )
     )
     total_atoms = int(atom_offsets[-1])
     return ContinuousBatch(
-        indices=torch.arange(
+        structure_index=torch.arange(
             index_start,
             index_start + len(counts),
             dtype=torch.long,
             device=device,
         ),
-        structure_ids=tuple(
+        structure_id=tuple(
             f"{structure_prefix}-{index}" for index in range(len(counts))
         ),
-        num_atoms=num_atoms,
+        atomic_numbers=torch.ones(
+            total_atoms, dtype=torch.long, device=device
+        ),
         atom_offsets=atom_offsets,
-        features=torch.arange(
+        scalar_features=torch.arange(
             total_atoms * 640, dtype=dtype, device=device
         ).reshape(total_atoms, 640),
-        reference_energy=torch.arange(
-            len(counts), dtype=dtype, device=device
+        force_prediction=torch.full(
+            (total_atoms, 3), 0.25, dtype=dtype, device=device
         ),
-        reference_forces=torch.full(
+        force_reference=torch.full(
             (total_atoms, 3), 0.125, dtype=dtype, device=device
+        ),
+        energy_prediction=torch.arange(
+            len(counts), dtype=dtype, device=device
+        ) + 0.5,
+        energy_reference=torch.arange(
+            len(counts), dtype=dtype, device=device
         ),
     )
 
@@ -87,7 +95,7 @@ def write_two_split_cache(root: Path, *, complete: bool) -> Path:
 def duplicate_validation_id_and_recommit(root: Path) -> None:
     shard_path = root / "validation" / "shard-000000.pt"
     shard = load_torch_artifact(shard_path)
-    shard["structure_ids"] = ("structure-0",)
+    shard["structure_id"] = ("structure-0",)
     atomic_torch_save(shard_path, shard)
     replacement_hash = sha256_file(shard_path)
 
@@ -109,13 +117,153 @@ class UnsafePickle:
         return (eval, ("40 + 2",))
 
 
+def approved_payload_batch(
+    counts: list[int],
+    *,
+    index_start: int = 0,
+    structure_prefix: str = "approved",
+) -> ContinuousBatch:
+    """Build independent, hand-derived source tensors for schema-v2 tests."""
+    atom_counts = torch.tensor(counts, dtype=torch.long)
+    atom_offsets = torch.cat(
+        (torch.zeros(1, dtype=torch.long), atom_counts.cumsum(0))
+    )
+    total_atoms = int(atom_offsets[-1].item())
+    return ContinuousBatch(
+        structure_index=torch.arange(
+            index_start, index_start + len(counts), dtype=torch.long
+        ),
+        structure_id=tuple(
+            f"{structure_prefix}-{index}" for index in range(len(counts))
+        ),
+        atomic_numbers=torch.tensor(
+            [1 + atom_index for atom_index in range(total_atoms)],
+            dtype=torch.int32,
+        ),
+        atom_offsets=atom_offsets,
+        scalar_features=torch.arange(
+            total_atoms * 640, dtype=torch.float32
+        ).reshape(total_atoms, 640),
+        force_prediction=torch.arange(
+            total_atoms * 3, dtype=torch.float64
+        ).reshape(total_atoms, 3),
+        force_reference=torch.full(
+            (total_atoms, 3), 0.125, dtype=torch.float16
+        ),
+        energy_prediction=(
+            torch.arange(len(counts), dtype=torch.float64) + 0.5
+        ),
+        energy_reference=(
+            torch.arange(len(counts), dtype=torch.float32) - 0.25
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("atomic_numbers", "force_prediction", "energy_prediction"),
+)
+def test_shard_preserves_each_approved_payload_field(
+    tmp_path: Path, field: str
+) -> None:
+    from confidence_head.cache import CacheWriter
+
+    batch = approved_payload_batch([2, 1])
+    writer = CacheWriter(tmp_path, cache_id="cache", shard_max_atoms=10)
+    writer.append(batch)
+    writer.finalize_split("train")
+
+    payload = load_torch_artifact(
+        tmp_path / "train" / "shard-000000.pt"
+    )
+    expected = getattr(batch, field)
+    actual = payload[field]
+    assert actual.dtype == expected.dtype
+    assert torch.equal(actual, expected)
+
+
+def test_approved_payload_round_trip_and_repacking_preserve_independent_dtypes(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import CacheWriter, iter_cache_batches
+
+    batch = approved_payload_batch([2, 1, 3])
+    writer = CacheWriter(tmp_path, cache_id="cache", shard_max_atoms=3)
+    writer.append(batch)
+    writer.finalize_split("train")
+    manifest = writer.finalize()
+
+    repacked = list(iter_cache_batches(manifest, "train", batch_size=2))
+    assert [item.atom_offsets.tolist() for item in repacked] == [
+        [0, 2, 3],
+        [0, 3],
+    ]
+    assert torch.equal(
+        repacked[0].atomic_numbers,
+        torch.tensor([1, 2, 3], dtype=torch.int32),
+    )
+    assert repacked[0].scalar_features.dtype is torch.float32
+    assert repacked[0].force_prediction.dtype is torch.float64
+    assert repacked[0].force_reference.dtype is torch.float16
+    assert repacked[0].energy_prediction.dtype is torch.float64
+    assert repacked[0].energy_reference.dtype is torch.float32
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        (
+            "force_prediction",
+            torch.tensor([[float("nan"), 0.0, 0.0]], dtype=torch.float64),
+        ),
+        (
+            "energy_prediction",
+            torch.tensor([float("inf")], dtype=torch.float64),
+        ),
+        (
+            "force_prediction",
+            torch.zeros(1, 2, dtype=torch.float64),
+        ),
+        (
+            "energy_prediction",
+            torch.zeros(1, 1, dtype=torch.float64),
+        ),
+        (
+            "atomic_numbers",
+            torch.tensor([1.0], dtype=torch.float32),
+        ),
+        (
+            "atomic_numbers",
+            torch.tensor([1, 8], dtype=torch.int64),
+        ),
+    ],
+)
+def test_writer_rejects_malformed_approved_payload_fields(
+    tmp_path: Path,
+    field: str,
+    replacement: torch.Tensor,
+) -> None:
+    from confidence_head.cache import CacheCorruptionError, CacheWriter
+
+    batch = approved_payload_batch([1])
+    setattr(batch, field, replacement)
+    with pytest.raises(CacheCorruptionError):
+        CacheWriter(
+            tmp_path, cache_id="cache", shard_max_atoms=10
+        ).append(batch)
+
+
 def test_cache_writer_never_splits_one_structure(tmp_path: Path) -> None:
     from confidence_head.cache import CacheWriter
 
     writer = CacheWriter(tmp_path, cache_id="cache", shard_max_atoms=5)
     writer.append(batch_with_atom_counts([3, 4]))
     writer.finalize_split("train")
-    assert [load_torch_artifact(path)["num_atoms"].tolist() for path in sorted((tmp_path / "train").glob("shard-*.pt"))] == [[3], [4]]
+    payloads = [
+        load_torch_artifact(path)
+        for path in sorted((tmp_path / "train").glob("shard-*.pt"))
+    ]
+    assert [payload["num_atoms"] for payload in payloads] == [3, 4]
 
 
 def test_resume_rejects_modified_committed_shard(tmp_path: Path) -> None:
@@ -137,10 +285,15 @@ def test_incomplete_cache_cannot_be_opened_for_training(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda batch: replace(batch, indices=torch.tensor([0, 2])), "continuous"),
-        (lambda batch: replace(batch, structure_ids=("structure-0", "structure-0")), "duplicate"),
-        (lambda batch: replace(batch, reference_energy=batch.reference_energy.float()), "dtype"),
-        (lambda batch: replace(batch, features=torch.full_like(batch.features, float("nan"))), "finite"),
+        (lambda batch: replace(batch, structure_index=torch.tensor([0, 2])), "continuous"),
+        (lambda batch: replace(batch, structure_id=("structure-0", "structure-0")), "duplicate"),
+        (
+            lambda batch: replace(
+                batch, atomic_numbers=batch.atomic_numbers.float()
+            ),
+            "integral",
+        ),
+        (lambda batch: replace(batch, scalar_features=torch.full_like(batch.scalar_features, float("nan"))), "finite"),
     ],
 )
 def test_writer_rejects_invalid_batch_contract(tmp_path: Path, mutation, message: str) -> None:
@@ -174,9 +327,9 @@ def test_iter_cache_batches_repacks_full_structures_and_preserves_dtype(tmp_path
     batches = list(iter_cache_batches(load_complete_cache(tmp_path, expected_cache_id="cache"), "train", batch_size=2))
     assert [batch.num_atoms.tolist() for batch in batches] == [[2, 1], [3]]
     assert [batch.atom_offsets.tolist() for batch in batches] == [[0, 2, 3], [0, 3]]
-    assert batches[0].features.dtype is torch.float32
-    assert batches[0].reference_energy.dtype is torch.float32
-    assert batches[0].reference_forces.dtype is torch.float32
+    assert batches[0].scalar_features.dtype is torch.float32
+    assert batches[0].energy_reference.dtype is torch.float32
+    assert batches[0].force_reference.dtype is torch.float32
 
 
 def test_complete_cache_rejects_manifest_schema_or_identity_mismatch(tmp_path: Path) -> None:
@@ -210,7 +363,7 @@ def test_append_validates_whole_batch_before_slicing(tmp_path: Path) -> None:
     from confidence_head.cache import CacheCorruptionError, CacheWriter
 
     batch = batch_with_atom_counts([2, 2])
-    broken = replace(batch, features=torch.cat((batch.features, batch.features[:1])))
+    broken = replace(batch, scalar_features=torch.cat((batch.scalar_features, batch.scalar_features[:1])))
     with pytest.raises(CacheCorruptionError):
         CacheWriter(tmp_path, cache_id="cache", shard_max_atoms=10).append(broken)
 
@@ -219,7 +372,6 @@ def test_append_validates_whole_batch_before_slicing(tmp_path: Path) -> None:
     "case",
     [
         "structure_ids_length",
-        "num_atoms_length",
         "indices_length",
         "offsets_length",
         "energy_length",
@@ -228,15 +380,12 @@ def test_append_validates_whole_batch_before_slicing(tmp_path: Path) -> None:
         "offsets_start",
         "offsets_monotonic",
         "offsets_terminal",
-        "positive_counts",
         "feature_width",
         "force_width",
         "finite_energy",
         "finite_forces",
         "indices_dtype",
-        "num_atoms_dtype",
         "offsets_dtype",
-        "floating_dtype",
         "floating_device",
     ],
 )
@@ -247,16 +396,11 @@ def test_append_rejects_every_malformed_batch_boundary(
 
     batch = batch_with_atom_counts([2, 2])
     if case == "structure_ids_length":
-        broken = replace(batch, structure_ids=batch.structure_ids + ("extra",))
-    elif case == "num_atoms_length":
-        broken = replace(
-            batch,
-            num_atoms=torch.cat((batch.num_atoms, torch.tensor([1]))),
-        )
+        broken = replace(batch, structure_id=batch.structure_id + ("extra",))
     elif case == "indices_length":
         broken = replace(
             batch,
-            indices=torch.cat((batch.indices, torch.tensor([2]))),
+            structure_index=torch.cat((batch.structure_index, torch.tensor([2]))),
         )
     elif case == "offsets_length":
         broken = replace(
@@ -268,20 +412,20 @@ def test_append_rejects_every_malformed_batch_boundary(
     elif case == "energy_length":
         broken = replace(
             batch,
-            reference_energy=torch.cat(
-                (batch.reference_energy, batch.reference_energy[:1])
+            energy_reference=torch.cat(
+                (batch.energy_reference, batch.energy_reference[:1])
             ),
         )
     elif case == "feature_rows":
         broken = replace(
             batch,
-            features=torch.cat((batch.features, batch.features[:1])),
+            scalar_features=torch.cat((batch.scalar_features, batch.scalar_features[:1])),
         )
     elif case == "force_rows":
         broken = replace(
             batch,
-            reference_forces=torch.cat(
-                (batch.reference_forces, batch.reference_forces[:1])
+            force_reference=torch.cat(
+                (batch.force_reference, batch.force_reference[:1])
             ),
         )
     elif case == "offsets_start":
@@ -290,44 +434,32 @@ def test_append_rejects_every_malformed_batch_boundary(
         broken = replace(batch, atom_offsets=torch.tensor([0, 3, 2]))
     elif case == "offsets_terminal":
         broken = replace(batch, atom_offsets=torch.tensor([0, 2, 3]))
-    elif case == "positive_counts":
-        broken = replace(
-            batch,
-            num_atoms=torch.tensor([2, 0]),
-            atom_offsets=torch.tensor([0, 2, 2]),
-        )
     elif case == "feature_width":
-        broken = replace(batch, features=batch.features[:, :-1])
+        broken = replace(batch, scalar_features=batch.scalar_features[:, :-1])
     elif case == "force_width":
         broken = replace(
-            batch, reference_forces=batch.reference_forces[:, :-1]
+            batch, force_reference=batch.force_reference[:, :-1]
         )
     elif case == "finite_energy":
-        values = batch.reference_energy.clone()
+        values = batch.energy_reference.clone()
         values[-1] = float("nan")
-        broken = replace(batch, reference_energy=values)
+        broken = replace(batch, energy_reference=values)
     elif case == "finite_forces":
-        values = batch.reference_forces.clone()
+        values = batch.force_reference.clone()
         values[-1, -1] = float("inf")
-        broken = replace(batch, reference_forces=values)
+        broken = replace(batch, force_reference=values)
     elif case == "indices_dtype":
-        broken = replace(batch, indices=batch.indices.to(torch.int32))
-    elif case == "num_atoms_dtype":
-        broken = replace(batch, num_atoms=batch.num_atoms.to(torch.int32))
+        broken = replace(batch, structure_index=batch.structure_index.to(torch.int32))
     elif case == "offsets_dtype":
         broken = replace(
             batch, atom_offsets=batch.atom_offsets.to(torch.int32)
         )
-    elif case == "floating_dtype":
-        broken = replace(
-            batch, reference_forces=batch.reference_forces.float()
-        )
     elif case == "floating_device":
         broken = replace(
             batch,
-            reference_energy=torch.empty(
-                batch.reference_energy.shape,
-                dtype=batch.reference_energy.dtype,
+            energy_reference=torch.empty(
+                batch.energy_reference.shape,
+                dtype=batch.energy_reference.dtype,
                 device="meta",
             ),
         )
@@ -344,17 +476,17 @@ def test_invalid_batch_does_not_partially_mutate_writer(tmp_path: Path) -> None:
 
     writer = CacheWriter(tmp_path, cache_id="cache", shard_max_atoms=10)
     batch = batch_with_atom_counts([2, 2])
-    energies = batch.reference_energy.clone()
+    energies = batch.energy_reference.clone()
     energies[-1] = float("nan")
 
     with pytest.raises(CacheCorruptionError):
-        writer.append(replace(batch, reference_energy=energies))
+        writer.append(replace(batch, energy_reference=energies))
 
     writer.append(batch)
     writer.finalize_split("train")
     assert load_torch_artifact(
         tmp_path / "train" / "shard-000000.pt"
-    )["structure_ids"] == batch.structure_ids
+    )["structure_id"] == batch.structure_id
 
 
 def test_writer_rejects_dtype_changes_between_batches(tmp_path: Path) -> None:
