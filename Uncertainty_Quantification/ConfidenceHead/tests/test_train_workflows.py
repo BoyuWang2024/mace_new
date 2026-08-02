@@ -753,3 +753,82 @@ def test_wandb_summary_failure_keeps_local_run_publishable(
 
     assert attempted is True
     assert summary["wandb_failed"] is True
+    assert best.is_file()
+    assert (best.parent / "last.pt").is_file()
+    assert json.loads(validation.read_text(encoding="utf-8"))["valid"] is True
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "epoch_bool",
+        "epoch_float",
+        "best_epoch_bool",
+        "best_epoch_float",
+        "bad_epochs_bool",
+        "bad_epochs_float",
+        "overflow_bool",
+        "overflow_float",
+        "overflow_missing_key",
+        "overflow_extra_key",
+        "overflow_non_string_key",
+        "improved_integer",
+        "completed_integer",
+        "metric_count_bool",
+        "metric_count_float",
+    ],
+)
+def test_completed_check_rejects_non_exact_event_json_types(
+    tmp_path: Path, damage: str
+) -> None:
+    config, bins = _ready_force_run(tmp_path)
+    run_train(config)
+    run_dir = bins.parent / "run"
+    events_path = run_dir / "events.jsonl"
+    events = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    event = events[0]
+    if damage == "epoch_bool":
+        event["epoch"] = False
+    elif damage == "epoch_float":
+        event["epoch"] = 0.0
+    elif damage == "best_epoch_bool":
+        event["best_epoch"] = False
+    elif damage == "best_epoch_float":
+        event["best_epoch"] = 0.0
+    elif damage == "bad_epochs_bool":
+        event["bad_epochs"] = False
+    elif damage == "bad_epochs_float":
+        event["bad_epochs"] = 0.0
+    elif damage == "overflow_bool":
+        event["overflow"]["force"] = False
+    elif damage == "overflow_float":
+        event["overflow"]["force"] = 0.0
+    elif damage == "overflow_missing_key":
+        event["overflow"].pop("force")
+    elif damage == "overflow_extra_key":
+        event["overflow"]["energy"] = 0
+    elif damage == "overflow_non_string_key":
+        event["overflow"] = {0: 0}
+    elif damage == "improved_integer":
+        event["improved"] = 1
+    elif damage == "completed_integer":
+        event["completed"] = int(event["completed"])
+    elif damage == "metric_count_bool":
+        event["train"]["force_samples"] = True
+    else:
+        event["train"]["force_samples"] = float(event["train"]["force_samples"])
+    events_path.write_text(
+        "".join(
+            json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n"
+            for item in events
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RunConflictError, match="event|overflow|sample"):
+        run_check_training(config)
+    assert not (run_dir / "training_validation.json").exists()
+    assert not (run_dir / "training_manifest.json").exists()

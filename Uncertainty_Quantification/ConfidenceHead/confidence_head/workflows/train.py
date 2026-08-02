@@ -98,6 +98,30 @@ def _finite_event_value(value: object, where: str) -> float:
     return float(value)
 
 
+def _nonnegative_event_int(value: object, where: str) -> int:
+    if type(value) is not int or value < 0:
+        raise RunConflictError(f"{where} must be a non-negative integer")
+    return value
+
+
+def _validate_event_overflow(
+    value: object,
+    *,
+    where: str,
+    inputs: RunInputs,
+) -> dict[str, int]:
+    expected_keys = set(inputs.binning.branches)
+    if type(value) is not dict or set(value) != expected_keys:
+        raise RunConflictError(f"{where} schema differs from enabled branches")
+    result = {
+        branch: _nonnegative_event_int(value[branch], f"{where}.{branch}")
+        for branch in expected_keys
+    }
+    if result != inputs.overflow:
+        raise RunConflictError(f"{where} diagnostics differ")
+    return result
+
+
 def _expected_event_samples(inputs: RunInputs, split: str, branch: str) -> int:
     shards = inputs.cache.splits.get(split, ())
     if branch == "energy":
@@ -161,7 +185,8 @@ def _validate_event_history(
     for epoch, event in enumerate(events):
         if type(event) is not dict or set(event) != _ALLOWED_EVENT_KEYS:
             raise RunConflictError(f"event {epoch} schema differs")
-        if event["epoch"] != epoch:
+        event_epoch = _nonnegative_event_int(event["epoch"], f"event {epoch}.epoch")
+        if event_epoch != epoch:
             raise RunConflictError("event epochs must be contiguous from zero")
         if terminal:
             raise RunConflictError("events continue after a completed epoch")
@@ -189,16 +214,27 @@ def _validate_event_history(
             bad_epochs >= inputs.config.trainer.early_stopping_patience
             or epoch + 1 >= inputs.config.trainer.max_epochs
         )
+        event_best_epoch = _nonnegative_event_int(
+            event["best_epoch"], f"event {epoch}.best_epoch"
+        )
+        event_best_loss = _finite_event_value(
+            event["best_validation_loss"],
+            f"event {epoch}.best_validation_loss",
+        )
+        event_bad_epochs = _nonnegative_event_int(
+            event["bad_epochs"], f"event {epoch}.bad_epochs"
+        )
         if (
             event["improved"] is not improved
-            or event["best_epoch"] != best_epoch
-            or float(event["best_validation_loss"]) != best_loss
-            or event["bad_epochs"] != bad_epochs
+            or event_best_epoch != best_epoch
+            or event_best_loss != best_loss
+            or event_bad_epochs != bad_epochs
             or event["completed"] is not completed
         ):
             raise RunConflictError(f"event {epoch} best/early-stop semantics differ")
-        if event["overflow"] != inputs.overflow:
-            raise RunConflictError(f"event {epoch} overflow diagnostics differ")
+        _validate_event_overflow(
+            event["overflow"], where=f"event {epoch}.overflow", inputs=inputs
+        )
         terminal = completed
 
     if not events or best_epoch is None:
