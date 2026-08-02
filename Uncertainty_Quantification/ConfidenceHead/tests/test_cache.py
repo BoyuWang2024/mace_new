@@ -190,12 +190,12 @@ def test_smoke_writer_allows_only_cross_split_duplicates_and_resumes(
     writer.finalize_split("validation")
     manifest = writer.finalize()
     assert manifest.allow_cross_split_duplicates is True
-    with pytest.raises(CacheCorruptionError, match="duplicate structure_ids"):
+    with pytest.raises(CacheCorruptionError, match="persisted cache policy mismatch"):
         load_complete_cache(root, expected_cache_id="cache")
     assert load_complete_cache(
         root,
         expected_cache_id="cache",
-        allow_cross_split_duplicates=True,
+        expected_allow_cross_split_duplicates=True,
     ) == manifest
 
     same_split = CacheWriter(

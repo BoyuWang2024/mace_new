@@ -38,7 +38,7 @@ _SHARD_PAYLOAD_KEYS = frozenset(
     }
 )
 _PROGRESS_KEYS = frozenset(
-    {"schema_version", "cache_id", "shard_max_atoms", "splits"}
+    {"schema_version", "cache_id", "shard_max_atoms", "allow_cross_split_duplicates", "splits"}
 )
 _SPLIT_STATE_KEYS = frozenset(
     {
@@ -61,7 +61,7 @@ _SHARD_RECORD_KEYS = frozenset(
     }
 )
 _MANIFEST_KEYS = frozenset(
-    {"schema_version", "cache_id", "complete", "splits"}
+    {"schema_version", "cache_id", "complete", "allow_cross_split_duplicates", "splits"}
 )
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _ATOMIC_SHARD_TEMP_PATTERN = re.compile(
@@ -112,6 +112,7 @@ class CacheShard:
 class CacheProgress:
     cache_id: str
     shard_max_atoms: int
+    allow_cross_split_duplicates: bool
     splits: dict[str, dict[str, Any]]
 
 
@@ -440,12 +441,17 @@ def _load_progress(root: Path, expected_cache_id: str) -> CacheProgress:
         minimum=1,
     )
     splits = mapping["splits"]
+    allow_cross_split_duplicates = mapping["allow_cross_split_duplicates"]
+    if type(allow_cross_split_duplicates) is not bool:
+        raise _bad(
+            "progress.pt.allow_cross_split_duplicates", "must be a boolean")
     if not isinstance(splits, dict):
         raise _bad("progress.pt.splits", "must be a mapping")
     return CacheProgress(
         cache_id=cache_id,
         shard_max_atoms=shard_max_atoms,
         splits=splits,
+        allow_cross_split_duplicates=allow_cross_split_duplicates,
     )
 
 
@@ -726,10 +732,16 @@ class CacheWriter:
         progress_path = self.root / "progress.pt"
         if progress_path.exists():
             progress = _load_progress(self.root, cache_id)
+            if (
+                progress.allow_cross_split_duplicates
+                and not allow_cross_split_duplicates
+            ):
+                raise _bad("progress.pt", "cache policy mismatch")
+            self.allow_cross_split_duplicates = progress.allow_cross_split_duplicates
             validation = _validate_cache(
                 self.root,
                 progress,
-                allow_cross_split_duplicates=allow_cross_split_duplicates,
+                allow_cross_split_duplicates=progress.allow_cross_split_duplicates,
             )
             if progress.shard_max_atoms != shard_max_atoms:
                 raise _bad("progress.pt", "shard_max_atoms mismatch")
@@ -752,16 +764,21 @@ class CacheWriter:
     ) -> "CacheWriter":
         cache_root = Path(root)
         progress = _load_progress(cache_root, expected_cache_id)
+        if (
+            progress.allow_cross_split_duplicates
+            and not allow_cross_split_duplicates
+        ):
+            raise _bad("progress.pt", "cache policy mismatch")
         _validate_cache(
             cache_root,
             progress,
-            allow_cross_split_duplicates=allow_cross_split_duplicates,
+            allow_cross_split_duplicates=progress.allow_cross_split_duplicates,
         )
         return cls(
             cache_root,
             cache_id=expected_cache_id,
             shard_max_atoms=progress.shard_max_atoms,
-            allow_cross_split_duplicates=allow_cross_split_duplicates,
+            allow_cross_split_duplicates=progress.allow_cross_split_duplicates,
         )
 
     def _save_progress(self) -> None:
@@ -772,6 +789,7 @@ class CacheWriter:
                 "cache_id": self.cache_id,
                 "shard_max_atoms": self.shard_max_atoms,
                 "splits": self.splits,
+                "allow_cross_split_duplicates": self.allow_cross_split_duplicates,
             },
         )
 
@@ -965,10 +983,16 @@ class CacheWriter:
             raise CacheIncompleteError("cache has incomplete splits")
 
         progress = _load_progress(self.root, self.cache_id)
+        if (
+            progress.allow_cross_split_duplicates
+            != self.allow_cross_split_duplicates
+        ):
+            raise _bad("progress.pt", "cache policy mismatch")
+
         _validate_cache(
             self.root,
             progress,
-            allow_cross_split_duplicates=self.allow_cross_split_duplicates,
+            allow_cross_split_duplicates=progress.allow_cross_split_duplicates,
         )
         atomic_json_dump(
             self.root / "cache_manifest.json",
@@ -976,6 +1000,9 @@ class CacheWriter:
                 "schema_version": CACHE_SCHEMA_VERSION,
                 "cache_id": self.cache_id,
                 "complete": True,
+                "allow_cross_split_duplicates": (
+                    progress.allow_cross_split_duplicates
+                ),
                 "splits": {
                     split: state["shards"]
                     for split, state in progress.splits.items()
@@ -985,7 +1012,7 @@ class CacheWriter:
         return load_complete_cache(
             self.root,
             expected_cache_id=self.cache_id,
-            allow_cross_split_duplicates=self.allow_cross_split_duplicates,
+            expected_allow_cross_split_duplicates=self.allow_cross_split_duplicates,
         )
 
 
@@ -1020,6 +1047,10 @@ def _load_manifest_payload(
         )
     if not complete:
         raise CacheIncompleteError("cache manifest is incomplete")
+    manifest_policy = mapping["allow_cross_split_duplicates"]
+    if type(manifest_policy) is not bool:
+        raise _bad(
+            "cache_manifest.json.allow_cross_split_duplicates", "must be a boolean")
 
     raw_splits = mapping["splits"]
     if not isinstance(raw_splits, dict):
@@ -1054,10 +1085,10 @@ def load_complete_cache(
     root: Path,
     *,
     expected_cache_id: str,
-    allow_cross_split_duplicates: bool = False,
+    expected_allow_cross_split_duplicates: bool = False,
 ) -> CacheManifest:
-    if type(allow_cross_split_duplicates) is not bool:
-        raise ValueError("allow_cross_split_duplicates must be a boolean")
+    if type(expected_allow_cross_split_duplicates) is not bool:
+        raise ValueError("expected_allow_cross_split_duplicates must be a boolean")
     cache_root = Path(root)
     manifest_path = cache_root / "cache_manifest.json"
     if not manifest_path.is_file():
@@ -1067,10 +1098,15 @@ def load_complete_cache(
         manifest_path, expected_cache_id=expected_cache_id
     )
     progress = _load_progress(cache_root, expected_cache_id)
+    manifest_policy = manifest_payload["allow_cross_split_duplicates"]
+    if progress.allow_cross_split_duplicates != manifest_policy or (
+        manifest_policy and not expected_allow_cross_split_duplicates
+    ):
+        raise _bad("cache policy", "persisted cache policy mismatch")
     validation = _validate_cache(
         cache_root,
         progress,
-        allow_cross_split_duplicates=allow_cross_split_duplicates,
+        allow_cross_split_duplicates=progress.allow_cross_split_duplicates,
     )
     if not progress.splits or not all(
         state["complete"] is True for state in progress.splits.values()
@@ -1096,7 +1132,7 @@ def load_complete_cache(
         root=cache_root,
         cache_id=expected_cache_id,
         complete=True,
-        allow_cross_split_duplicates=allow_cross_split_duplicates,
+        allow_cross_split_duplicates=progress.allow_cross_split_duplicates,
         splits=manifest_splits,
     )
 
@@ -1119,7 +1155,7 @@ def _bind_manifest(manifest: object) -> CacheManifest:
     committed = load_complete_cache(
         manifest.root,
         expected_cache_id=manifest.cache_id,
-        allow_cross_split_duplicates=manifest.allow_cross_split_duplicates,
+        expected_allow_cross_split_duplicates=manifest.allow_cross_split_duplicates,
     )
     if manifest != committed:
         raise _bad("manifest", "object is not bound to the committed manifest")

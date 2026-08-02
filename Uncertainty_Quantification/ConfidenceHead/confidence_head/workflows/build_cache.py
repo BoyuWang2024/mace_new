@@ -315,7 +315,7 @@ def run_build_cache(config: ConfidenceHeadConfig) -> Path:
         manifest = load_complete_cache(
             root,
             expected_cache_id=identity,
-            allow_cross_split_duplicates=config.profile == "smoke_test",
+            expected_allow_cross_split_duplicates=config.profile == "smoke_test",
         )
     except CacheIncompleteError:
         pass

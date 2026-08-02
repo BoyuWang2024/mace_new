@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import shutil
+import warnings
 
 import ase.io
 import pytest
@@ -20,32 +22,55 @@ from confidence_head.workflows.fit_bins import run_fit_bins
 from confidence_head.workflows.train import ControlledEpochStop, run_train
 
 
-pytestmark = [
-    pytest.mark.filterwarnings(
-        "ignore:Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, "
+_COPY_TENSOR_WARNING = (
+    "To copy construct from a tensor, it is recommended to use "
+    "sourceTensor.detach().clone() or sourceTensor.detach().clone()"
+    ".requires_grad_(True), rather than torch.tensor(sourceTensor)."
+)
+_MACE_WARNING_FILTERS = (
+    (
+        "Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, "
         "since the`weights_only` argument was not explicitly passed to "
-        "`torch\\.load`, forcing weights_only=False\\.:UserWarning"
+        "`torch\\.load`, forcing weights_only=False\\.",
+        UserWarning,
+        r"torch\\.serialization",
     ),
-    pytest.mark.filterwarnings(
-        "ignore:`torch\\.jit\\.script` is deprecated\\. Please switch to "
-        "`torch\\.compile` or `torch\\.export`\\.:DeprecationWarning"
+    (
+        r"`torch\.jit\.script` is deprecated\. Please switch to "
+        r"`torch\.compile` or `torch\.export`\.",
+        DeprecationWarning,
+        r"torch\\.jit\\._script",
     ),
-    pytest.mark.filterwarnings(
-        "ignore:`torch\\.jit\\.load` is deprecated\\. Please switch to "
-        "`torch\\.export`\\.:DeprecationWarning"
+    (
+        r"`torch\.jit\.load` is deprecated\. Please switch to `torch\.export`\.",
+        DeprecationWarning,
+        r"torch\\.jit\\._serialization",
     ),
-    pytest.mark.filterwarnings(
-        "ignore:To copy construct from a tensor, it is recommended to use "
+    (
+        "To copy construct from a tensor, it is recommended to use "
         "sourceTensor\\.detach\\(\\)\\.clone\\(\\) or sourceTensor\\.detach\\(\\)\\.clone\\(\\)"
-        "\\.requires_grad_\\(True\\), rather than torch\\.tensor\\(sourceTensor\\)\\.:UserWarning"
+        "\\.requires_grad_\\(True\\), rather than torch\\.tensor\\(sourceTensor\\)\\.",
+        UserWarning,
+        r"mace\\.modules\\.models",
     ),
-    pytest.mark.filterwarnings(
-        "ignore:The TorchScript type system doesn't support instance-level "
+    (
+        "The TorchScript type system doesn't support instance-level "
         "annotations on empty non-base types in `__init__`\\. Instead, either "
         "1\\) use a type annotation in the class body, or 2\\) wrap the type "
-        "in `torch\\.jit\\.Attribute`\\.:UserWarning"
+        "in `torch\\.jit\\.Attribute`\\.",
+        UserWarning,
+        r"torch\\.jit\\._check",
     ),
-]
+)
+
+
+@contextmanager
+def _mace_checkpoint_warning_scope():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for message, category, _module in _MACE_WARNING_FILTERS:
+            warnings.filterwarnings("ignore", message=message, category=category)
+        yield
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -93,7 +118,7 @@ def _assert_complete_n20_cache(config, cache_root: Path) -> None:
     manifest = load_complete_cache(
         cache_root,
         expected_cache_id=cache_identity,
-        allow_cross_split_duplicates=config.profile == "smoke_test",
+        expected_allow_cross_split_duplicates=config.profile == "smoke_test",
     )
     for split in ("train", "validation", "test"):
         assert sum(shard.num_structures for shard in manifest.splits[split]) == 20
@@ -119,8 +144,12 @@ def test_real_n20_training_chain(monkeypatch, tmp_path: Path) -> None:
     config_path = _write_n20_config_with_temporary_output(tmp_path)
     config = load_config(config_path)
 
-    cache_root = run_build_cache(config)
+    with _mace_checkpoint_warning_scope():
+        cache_root = run_build_cache(config)
     assert cache_root.is_relative_to(tmp_path)
+    with pytest.raises(UserWarning, match="To copy construct from a tensor"):
+        warnings.warn(_COPY_TENSOR_WARNING, UserWarning, stacklevel=1)
+
     assert (cache_root / "cache_manifest.json").is_file()
     _assert_complete_n20_cache(config, cache_root)
 
