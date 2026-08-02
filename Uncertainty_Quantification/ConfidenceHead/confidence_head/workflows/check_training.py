@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -35,6 +34,7 @@ from .train import (
     _load_run_inputs,
     _new_model_optimizer,
     _summary,
+    _validate_event_history,
 )
 
 
@@ -46,142 +46,6 @@ _REQUIRED_RUN_FILES = {
     "last.pt",
     "training_summary.json",
 }
-_ALLOWED_EVENT_KEYS = {
-    "epoch",
-    "train",
-    "validation",
-    "improved",
-    "best_epoch",
-    "best_validation_loss",
-    "bad_epochs",
-    "completed",
-    "overflow",
-}
-_METRIC_KEYS = {
-    "force_loss",
-    "energy_loss",
-    "total_loss",
-    "force_samples",
-    "energy_samples",
-}
-
-
-def _finite(value: object, where: str) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-    ):
-        raise RunConflictError(f"{where} must be finite")
-    return float(value)
-
-
-def _expected_samples(inputs: RunInputs, split: str, branch: str) -> int:
-    shards = inputs.cache.splits.get(split, ())
-    if branch == "energy":
-        return sum(shard.num_structures for shard in shards)
-    atoms = sum(shard.num_atoms for shard in shards)
-    multiplier = 3 if inputs.config.model.force.target_mode == "component" else 1
-    return atoms * multiplier
-
-
-def _metrics(
-    value: object,
-    *,
-    where: str,
-    split: str,
-    inputs: RunInputs,
-) -> dict[str, Any]:
-    if type(value) is not dict or set(value) != _METRIC_KEYS:
-        raise RunConflictError(f"{where} metric schema differs")
-    result = dict(value)
-    for name in ("force_loss", "energy_loss", "total_loss"):
-        _finite(result[name], f"{where}.{name}")
-    for branch in ("force", "energy"):
-        count = result[f"{branch}_samples"]
-        if type(count) is not int or count < 0:
-            raise RunConflictError(f"{where}.{branch}_samples differs")
-        enabled = branch in inputs.binning.branches
-        if enabled and count < 1:
-            raise RunConflictError(f"{where}.{branch}_samples must be positive")
-        if enabled and count != _expected_samples(inputs, split, branch):
-            raise RunConflictError(
-                f"{where}.{branch}_samples sample count differs from complete cache"
-            )
-        if not enabled and (count != 0 or float(result[f"{branch}_loss"]) != 0.0):
-            raise RunConflictError(f"{where} contains disabled {branch} metrics")
-    expected_total = inputs.config.loss.force_coefficient * float(
-        result["force_loss"]
-    ) + inputs.config.loss.energy_coefficient * float(result["energy_loss"])
-    if not math.isclose(
-        float(result["total_loss"]), expected_total, rel_tol=1e-12, abs_tol=1e-12
-    ):
-        raise RunConflictError(f"{where}.total_loss formula differs")
-    return result
-
-
-def _events(inputs: RunInputs) -> tuple[list[dict[str, Any]], TrainingState]:
-    path = inputs.run_dir / "events.jsonl"
-    raw = path.read_bytes()
-    if not raw or not raw.endswith(b"\n"):
-        raise RunConflictError("events.jsonl is empty or has an incomplete tail")
-    try:
-        lines = raw.decode("utf-8").splitlines()
-        events = [json.loads(line) for line in lines]
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RunConflictError(f"events.jsonl is corrupt: {error}") from error
-    best_epoch: int | None = None
-    best_loss = math.inf
-    bad_epochs = 0
-    terminal = False
-    for epoch, event in enumerate(events):
-        if type(event) is not dict or set(event) != _ALLOWED_EVENT_KEYS:
-            raise RunConflictError(f"event {epoch} schema differs")
-        if event["epoch"] != epoch:
-            raise RunConflictError("event epochs must be contiguous from zero")
-        if terminal:
-            raise RunConflictError("events continue after a completed epoch")
-        _metrics(
-            event["train"],
-            where=f"event {epoch}.train",
-            split="train",
-            inputs=inputs,
-        )
-        validation = _metrics(
-            event["validation"],
-            where=f"event {epoch}.validation",
-            split="validation",
-            inputs=inputs,
-        )
-        total = float(validation["total_loss"])
-        improved = total < best_loss
-        if improved:
-            best_epoch = epoch
-            best_loss = total
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
-        completed = (
-            bad_epochs >= inputs.config.trainer.early_stopping_patience
-            or epoch + 1 >= inputs.config.trainer.max_epochs
-        )
-        if (
-            event["improved"] is not improved
-            or event["best_epoch"] != best_epoch
-            or float(event["best_validation_loss"]) != best_loss
-            or event["bad_epochs"] != bad_epochs
-            or event["completed"] is not completed
-        ):
-            raise RunConflictError(f"event {epoch} best/early-stop semantics differ")
-        if event["overflow"] != inputs.overflow:
-            raise RunConflictError(f"event {epoch} overflow diagnostics differ")
-        terminal = completed
-    if not events or not terminal or best_epoch is None:
-        raise RunConflictError("event history is not a completed training run")
-    state = TrainingState(
-        len(events), best_epoch, best_loss, len(events) - best_epoch - 1, True
-    )
-    return events, state
 
 
 def _validate_tensor_state(
@@ -301,7 +165,10 @@ def _validate_summary(inputs: RunInputs, state: TrainingState) -> dict[str, Any]
     )
     if mode not in allowed:
         raise RunConflictError("training summary W&B mode differs")
-    expected = _summary(inputs, state, wandb_mode=mode)
+    failed = summary.get("wandb_failed")
+    if type(failed) is not bool:
+        raise RunConflictError("training summary W&B failure state differs")
+    expected = _summary(inputs, state, wandb_mode=mode, wandb_failed=failed)
     if summary != expected:
         raise RunConflictError("training summary differs from events/checkpoints")
     return summary
@@ -418,7 +285,7 @@ def run_check_training(config: ConfidenceHeadConfig) -> Path:
         if validation_path.exists() != manifest_path.exists():
             raise RunConflictError("training finalization is a partial artifact pair")
 
-        events, state = _events(inputs)
+        events, state = _validate_event_history(inputs, require_completed=True)
         dtype = _feature_dtype(inputs.cache, config.trainer.batch_size)
         model, optimizer = _new_model_optimizer(
             inputs, device=torch.device("cpu"), dtype=dtype

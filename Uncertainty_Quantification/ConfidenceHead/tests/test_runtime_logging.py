@@ -37,6 +37,7 @@ class FakeRun:
     def __init__(self) -> None:
         self.logs: list[tuple[dict[str, Any], int]] = []
         self.finish_count = 0
+        self.summary: dict[str, Any] = {}
 
     def log(self, event: dict[str, Any], *, step: int) -> None:
         self.logs.append((event, step))
@@ -553,3 +554,89 @@ def test_training_logger_start_establishes_local_file_before_wandb(
             events, logging_config(), {"run_id": "r"}, wandb_module=fake
         )
     assert events.is_file()
+
+
+@pytest.mark.parametrize("failure_phase", ["log", "summary", "finish"])
+def test_wandb_runtime_failures_disable_non_authoritative_mirror(
+    tmp_path: Path, failure_phase: str
+) -> None:
+    fake = FakeWandb()
+
+    class FailingSummary(dict[str, Any]):
+        def update(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("summary failed")
+
+    if failure_phase == "log":
+        fake.run.log = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("log failed")
+        )
+    elif failure_phase == "summary":
+        fake.run.summary = FailingSummary()
+    else:
+        fake.run.finish = lambda: (_ for _ in ()).throw(RuntimeError("finish failed"))
+    mirror = WandbMirror.start(
+        logging_config(mode="offline"),
+        tmp_path,
+        {"run_id": "r"},
+        wandb_module=fake,
+    )
+
+    if failure_phase == "log":
+        mirror.log({"epoch": 0}, step=0)
+    elif failure_phase == "summary":
+        mirror.update_summary({"overflow": {"force": 0}})
+    else:
+        mirror.finish()
+
+    assert mirror.failed is True
+    assert mirror.failure is not None
+    mirror.finish()
+
+
+def test_training_logger_isolates_rng_from_all_wandb_callbacks(
+    tmp_path: Path,
+) -> None:
+    def consume_rng() -> None:
+        random.random()
+        np.random.rand()
+        torch.rand(1)
+
+    class ConsumingSummary(dict[str, Any]):
+        def update(self, *args: Any, **kwargs: Any) -> None:
+            consume_rng()
+            super().update(*args, **kwargs)
+
+    class ConsumingRun(FakeRun):
+        def __init__(self) -> None:
+            super().__init__()
+            self.summary = ConsumingSummary()
+
+        def log(self, event: dict[str, Any], *, step: int) -> None:
+            consume_rng()
+            super().log(event, step=step)
+
+        def finish(self) -> None:
+            consume_rng()
+            super().finish()
+
+    class ConsumingWandb(FakeWandb):
+        def __init__(self) -> None:
+            super().__init__()
+            self.run = ConsumingRun()
+
+        def init(self, **kwargs: Any) -> FakeRun:
+            consume_rng()
+            return super().init(**kwargs)
+
+    def assert_rng_preserved(callback) -> None:
+        before = capture_rng_state()
+        callback()
+        actual = (random.random(), np.random.rand(), torch.rand(2))
+        restore_rng_state(before)
+        expected = (random.random(), np.random.rand(), torch.rand(2))
+        assert actual[:2] == expected[:2]
+        assert torch.equal(actual[2], expected[2])
+
+    configure_runtime(seed=829, deterministic=True, device="cpu")
+    fake = ConsumingWandb()
+    holder: dict[str, TrainingLogger] = {}

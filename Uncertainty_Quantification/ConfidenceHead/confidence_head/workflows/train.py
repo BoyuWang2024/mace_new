@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass
@@ -65,6 +66,154 @@ class RunInputs:
     run_dir: Path
     identity: dict[str, str]
     overflow: dict[str, int]
+
+
+_ALLOWED_EVENT_KEYS = {
+    "epoch",
+    "train",
+    "validation",
+    "improved",
+    "best_epoch",
+    "best_validation_loss",
+    "bad_epochs",
+    "completed",
+    "overflow",
+}
+_METRIC_KEYS = {
+    "force_loss",
+    "energy_loss",
+    "total_loss",
+    "force_samples",
+    "energy_samples",
+}
+
+
+def _finite_event_value(value: object, where: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        raise RunConflictError(f"{where} must be finite")
+    return float(value)
+
+
+def _expected_event_samples(inputs: RunInputs, split: str, branch: str) -> int:
+    shards = inputs.cache.splits.get(split, ())
+    if branch == "energy":
+        return sum(shard.num_structures for shard in shards)
+    atoms = sum(shard.num_atoms for shard in shards)
+    multiplier = 3 if inputs.config.model.force.target_mode == "component" else 1
+    return atoms * multiplier
+
+
+def _validate_event_metrics(
+    value: object,
+    *,
+    where: str,
+    split: str,
+    inputs: RunInputs,
+) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != _METRIC_KEYS:
+        raise RunConflictError(f"{where} metric schema differs")
+    result = dict(value)
+    for name in ("force_loss", "energy_loss", "total_loss"):
+        _finite_event_value(result[name], f"{where}.{name}")
+    for branch in ("force", "energy"):
+        count = result[f"{branch}_samples"]
+        if type(count) is not int or count < 0:
+            raise RunConflictError(f"{where}.{branch}_samples differs")
+        enabled = branch in inputs.binning.branches
+        if enabled and count != _expected_event_samples(inputs, split, branch):
+            raise RunConflictError(
+                f"{where}.{branch}_samples sample count differs from complete cache"
+            )
+        if not enabled and (count != 0 or float(result[f"{branch}_loss"]) != 0.0):
+            raise RunConflictError(f"{where} contains disabled {branch} metrics")
+    expected_total = inputs.config.loss.force_coefficient * float(
+        result["force_loss"]
+    ) + inputs.config.loss.energy_coefficient * float(result["energy_loss"])
+    if not math.isclose(
+        float(result["total_loss"]), expected_total, rel_tol=1e-12, abs_tol=1e-12
+    ):
+        raise RunConflictError(f"{where}.total_loss formula differs")
+    return result
+
+
+def _validate_event_history(
+    inputs: RunInputs,
+    *,
+    require_completed: bool,
+) -> tuple[list[dict[str, Any]], TrainingState]:
+    path = inputs.run_dir / "events.jsonl"
+    raw = path.read_bytes()
+    if not raw or not raw.endswith(b"\n"):
+        raise RunConflictError("events.jsonl is empty or has an incomplete tail")
+    try:
+        events = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RunConflictError(f"events.jsonl is corrupt: {error}") from error
+
+    best_epoch: int | None = None
+    best_loss = math.inf
+    bad_epochs = 0
+    terminal = False
+    for epoch, event in enumerate(events):
+        if type(event) is not dict or set(event) != _ALLOWED_EVENT_KEYS:
+            raise RunConflictError(f"event {epoch} schema differs")
+        if event["epoch"] != epoch:
+            raise RunConflictError("event epochs must be contiguous from zero")
+        if terminal:
+            raise RunConflictError("events continue after a completed epoch")
+        _validate_event_metrics(
+            event["train"],
+            where=f"event {epoch}.train",
+            split="train",
+            inputs=inputs,
+        )
+        validation = _validate_event_metrics(
+            event["validation"],
+            where=f"event {epoch}.validation",
+            split="validation",
+            inputs=inputs,
+        )
+        total = float(validation["total_loss"])
+        improved = total < best_loss
+        if improved:
+            best_epoch = epoch
+            best_loss = total
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+        completed = (
+            bad_epochs >= inputs.config.trainer.early_stopping_patience
+            or epoch + 1 >= inputs.config.trainer.max_epochs
+        )
+        if (
+            event["improved"] is not improved
+            or event["best_epoch"] != best_epoch
+            or float(event["best_validation_loss"]) != best_loss
+            or event["bad_epochs"] != bad_epochs
+            or event["completed"] is not completed
+        ):
+            raise RunConflictError(f"event {epoch} best/early-stop semantics differ")
+        if event["overflow"] != inputs.overflow:
+            raise RunConflictError(f"event {epoch} overflow diagnostics differ")
+        terminal = completed
+
+    if not events or best_epoch is None:
+        raise RunConflictError("event history contains no committed epoch")
+    if terminal is not require_completed:
+        expected = "completed" if require_completed else "resumable"
+        raise RunConflictError(f"event history is not a {expected} training run")
+    state = TrainingState(
+        len(events),
+        best_epoch,
+        best_loss,
+        len(events) - best_epoch - 1,
+        terminal,
+    )
+    return events, state
 
 
 def _json_safe(value: Any) -> Any:
@@ -306,6 +455,7 @@ def _summary(
     state: TrainingState,
     *,
     wandb_mode: str,
+    wandb_failed: bool,
 ) -> dict[str, Any]:
     stop_reason = (
         "max_epochs"
@@ -325,6 +475,7 @@ def _summary(
         "best_validation_loss": state.best_validation_loss,
         "overflow": dict(inputs.overflow),
         "wandb_mode": wandb_mode,
+        "wandb_failed": wandb_failed,
     }
 
 
@@ -382,11 +533,27 @@ def run_train(
                     "partial run is missing events or best checkpoint"
                 )
             try:
+                committed_events, replayed_state = _validate_event_history(
+                    inputs, require_completed=False
+                )
+                last_payload = load_torch_artifact(last_path)
                 state = load_last(last_path, model, optimizer, inputs.identity)
             except Exception as error:
                 raise RunConflictError(
                     f"last checkpoint cannot resume: {error}"
                 ) from error
+            if len(committed_events) != state.next_epoch:
+                raise RunConflictError(
+                    "resume event count differs from last checkpoint"
+                )
+            if replayed_state != state:
+                raise RunConflictError(
+                    "resume event state differs from last checkpoint"
+                )
+            if committed_events[-1]["validation"] != last_payload["validation_metrics"]:
+                raise RunConflictError(
+                    "resume final event differs from last checkpoint"
+                )
             if state.completed:
                 raise RunConflictError(
                     "training is already complete; run check_training.py"
@@ -428,13 +595,20 @@ def run_train(
             _stop_after_completed_epochs=_stop_after_completed_epochs,
             _stop_exception=ControlledEpochStop,
         )
-        effective_wandb_mode = logger.mirror.mode
+        logger.update_summary({"overflow": dict(inputs.overflow)})
     finally:
         logger.close()
+    effective_wandb_mode = logger.mirror.mode
+    wandb_failed = logger.mirror.failed
     if not final_state.completed:
         raise RuntimeError("trainer returned an incomplete terminal state")
     atomic_json_dump(
         summary_path,
-        _summary(inputs, final_state, wandb_mode=effective_wandb_mode),
+        _summary(
+            inputs,
+            final_state,
+            wandb_mode=effective_wandb_mode,
+            wandb_failed=wandb_failed,
+        ),
     )
     return best_path

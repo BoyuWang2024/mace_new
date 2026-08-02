@@ -11,6 +11,7 @@ from typing import Any
 
 from .config import LoggingConfig
 from .identity import canonical_json
+from .runtime import capture_rng_state, restore_rng_state
 
 
 def _event_epoch(event: object) -> int:
@@ -125,6 +126,21 @@ class WandbMirror:
         self.mode = mode
         self._run = run
         self._finished = False
+        self._failed = False
+        self._failure: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self._failed
+
+    @property
+    def failure(self) -> str | None:
+        return self._failure
+
+    def _disable(self, error: Exception) -> None:
+        self._failed = True
+        self._failure = f"{type(error).__name__}: {error}"
+        self._run = None
 
     @classmethod
     def start(
@@ -193,12 +209,29 @@ class WandbMirror:
         if self._finished:
             raise RuntimeError("W&B mirror is finished")
         if self._run is not None:
-            self._run.log(dict(event), step=step)
+            try:
+                self._run.log(dict(event), step=step)
+            except Exception as error:
+                self._disable(error)
+
+    def update_summary(self, values: Mapping[str, Any]) -> None:
+        if self._finished:
+            raise RuntimeError("W&B mirror is finished")
+        if self._run is not None:
+            try:
+                self._run.summary.update(dict(values))
+            except Exception as error:
+                self._disable(error)
 
     def finish(self) -> None:
-        if not self._finished:
+        if self._finished:
+            return
+        try:
             if self._run is not None:
                 self._run.finish()
+        except Exception as error:
+            self._disable(error)
+        finally:
             self._finished = True
 
 
@@ -221,6 +254,7 @@ class TrainingLogger:
         init_timeout_seconds: float = 30.0,
     ) -> TrainingLogger:
         local = JsonlLogger.resume(events_path)
+        rng_state = capture_rng_state()
         try:
             mirror = WandbMirror.start(
                 logging_config,
@@ -232,18 +266,37 @@ class TrainingLogger:
         except BaseException:
             local.close()
             raise
+        finally:
+            restore_rng_state(rng_state)
         return cls(local, mirror)
 
     def append_epoch(self, event: Mapping[str, Any]) -> None:
         if self._closed:
             raise RuntimeError("training logger is closed")
         self.local.append(event)
-        self.mirror.log(event, step=_event_epoch(event))
+        rng_state = capture_rng_state()
+        try:
+            self.mirror.log(event, step=_event_epoch(event))
+        finally:
+            restore_rng_state(rng_state)
+
+    def update_summary(self, values: Mapping[str, Any]) -> None:
+        if self._closed:
+            raise RuntimeError("training logger is closed")
+        rng_state = capture_rng_state()
+        try:
+            self.mirror.update_summary(values)
+        finally:
+            restore_rng_state(rng_state)
 
     def close(self) -> None:
         if not self._closed:
             try:
-                self.mirror.finish()
+                rng_state = capture_rng_state()
+                try:
+                    self.mirror.finish()
+                finally:
+                    restore_rng_state(rng_state)
             finally:
                 self.local.close()
                 self._closed = True

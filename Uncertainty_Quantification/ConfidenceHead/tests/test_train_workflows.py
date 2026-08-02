@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
 import torch
 import pytest
 
@@ -337,12 +339,29 @@ class _FakeWandbRun:
     def __init__(self) -> None:
         self.logs: list[tuple[dict, int]] = []
         self.finished = False
+        self.summary: dict[str, object] = {}
+        self.log_error: Exception | None = None
+        self.finish_error: Exception | None = None
+        self.consume_rng = False
 
     def log(self, event, *, step):
         self.logs.append((dict(event), step))
+        if self.consume_rng:
+            random.random()
+            np.random.rand()
+            torch.rand(1)
+        if self.log_error is not None:
+            raise self.log_error
 
     def finish(self):
         self.finished = True
+
+        if self.consume_rng:
+            random.random()
+            np.random.rand()
+            torch.rand(1)
+        if self.finish_error is not None:
+            raise self.finish_error
 
 
 class _FakeWandb:
@@ -357,9 +376,14 @@ class _FakeWandb:
     def __init__(self) -> None:
         self.modes: list[str] = []
         self.run = _FakeWandbRun()
+        self.consume_rng = False
 
     def init(self, **kwargs):
         self.modes.append(kwargs["mode"])
+        if self.consume_rng:
+            random.random()
+            np.random.rand()
+            torch.rand(1)
         if kwargs["mode"] == "online":
             raise _FakeCommError("offline")
         (Path(kwargs["dir"]) / "wandb").mkdir(exist_ok=True)
@@ -561,3 +585,171 @@ def test_check_rejects_false_complete_epoch_sample_counts(tmp_path: Path) -> Non
 
     with pytest.raises(RunConflictError, match="sample count"):
         run_check_training(config)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "metrics",
+        "validation",
+        "best_state",
+        "overflow",
+        "extra_key",
+        "missing_key",
+    ],
+)
+def test_resume_rejects_same_epoch_event_tampering_before_batches(
+    tmp_path: Path, monkeypatch, damage: str
+) -> None:
+    config, bins = _ready_force_run(tmp_path)
+    with pytest.raises(ControlledEpochStop):
+        run_train(config, _stop_after_completed_epochs=1)
+    events_path = bins.parent / "run" / "events.jsonl"
+    event = json.loads(events_path.read_text(encoding="utf-8"))
+    if damage == "metrics":
+        event["train"]["force_samples"] = 1
+    elif damage == "validation":
+        event["validation"]["force_loss"] += 1.0
+        event["validation"]["total_loss"] += 1.0
+    elif damage == "best_state":
+        event["bad_epochs"] = 1
+    elif damage == "overflow":
+        event["overflow"]["force"] = 1
+    elif damage == "extra_key":
+        event["unexpected"] = True
+    else:
+        event.pop("improved")
+    events_path.write_text(
+        json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    from confidence_head.workflows import train as train_workflow
+
+    monkeypatch.setattr(
+        train_workflow,
+        "iter_shuffled_cache_batches",
+        lambda *args, **kwargs: pytest.fail(
+            "tampered resume must fail before requesting train batches"
+        ),
+    )
+    with pytest.raises(RunConflictError, match="event|resume"):
+        run_train(config)
+
+
+@pytest.mark.parametrize("failure_phase", ["log", "finish"])
+def test_runtime_wandb_failure_never_blocks_authoritative_artifacts(
+    tmp_path: Path, monkeypatch, failure_phase: str
+) -> None:
+    config, _ = _ready_force_run(
+        tmp_path,
+        {
+            "logging.wandb": True,
+            "logging.wandb_mode": "auto",
+            "trainer.max_epochs": 1,
+        },
+    )
+    fake = _FakeWandb()
+    if failure_phase == "log":
+        fake.run.log_error = RuntimeError("runtime log failure")
+    else:
+        fake.run.finish_error = RuntimeError("runtime finish failure")
+    monkeypatch.setattr("confidence_head.logging._import_wandb", lambda: fake)
+
+    best = run_train(config)
+    validation = run_check_training(config)
+
+    assert best.is_file()
+    assert (best.parent / "last.pt").is_file()
+    assert (best.parent / "training_summary.json").is_file()
+    assert json.loads(validation.read_text(encoding="utf-8"))["valid"] is True
+
+
+def test_wandb_callbacks_do_not_change_training_or_resume_rng(
+    tmp_path: Path, monkeypatch
+) -> None:
+    disabled_config, _ = _ready_force_run(tmp_path / "disabled")
+    disabled_last = load_torch_artifact(run_train(disabled_config).parent / "last.pt")
+
+    enabled_config, _ = _ready_force_run(
+        tmp_path / "enabled",
+        {
+            "logging.wandb": True,
+            "logging.wandb_mode": "auto",
+        },
+    )
+    enabled_fake = _FakeWandb()
+    enabled_fake.consume_rng = True
+    enabled_fake.run.consume_rng = True
+    monkeypatch.setattr("confidence_head.logging._import_wandb", lambda: enabled_fake)
+    enabled_last = load_torch_artifact(run_train(enabled_config).parent / "last.pt")
+    assert _state_equal(disabled_last["model_state"], enabled_last["model_state"])
+    assert _state_equal(
+        disabled_last["optimizer_state"], enabled_last["optimizer_state"]
+    )
+
+    resumed_config, _ = _ready_force_run(
+        tmp_path / "resumed",
+        {
+            "logging.wandb": True,
+            "logging.wandb_mode": "auto",
+        },
+    )
+    with pytest.raises(ControlledEpochStop):
+        run_train(resumed_config, _stop_after_completed_epochs=1)
+    resumed_last = load_torch_artifact(run_train(resumed_config).parent / "last.pt")
+    assert _state_equal(enabled_last["model_state"], resumed_last["model_state"])
+    assert _state_equal(
+        enabled_last["optimizer_state"], resumed_last["optimizer_state"]
+    )
+
+
+def test_completed_run_mirrors_overflow_into_wandb_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, _ = _ready_force_run(
+        tmp_path,
+        {
+            "logging.wandb": True,
+            "logging.wandb_mode": "auto",
+            "trainer.max_epochs": 1,
+        },
+    )
+    fake = _FakeWandb()
+    monkeypatch.setattr("confidence_head.logging._import_wandb", lambda: fake)
+
+    run_train(config)
+
+    assert fake.run.summary == {"overflow": {"force": 0}}
+
+
+def test_wandb_summary_failure_keeps_local_run_publishable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, _ = _ready_force_run(
+        tmp_path,
+        {
+            "logging.wandb": True,
+            "logging.wandb_mode": "auto",
+            "trainer.max_epochs": 1,
+        },
+    )
+    attempted = False
+
+    class FailingSummary(dict):
+        def update(self, *args, **kwargs):
+            nonlocal attempted
+            attempted = True
+            raise RuntimeError("summary unavailable")
+
+    fake = _FakeWandb()
+    fake.run.summary = FailingSummary()
+    monkeypatch.setattr("confidence_head.logging._import_wandb", lambda: fake)
+
+    best = run_train(config)
+    validation = run_check_training(config)
+    summary = json.loads(
+        (best.parent / "training_summary.json").read_text(encoding="utf-8")
+    )
+
+    assert attempted is True
+    assert summary["wandb_failed"] is True
