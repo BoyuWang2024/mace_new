@@ -353,10 +353,17 @@ def test_log_binning_rejects_fixed_or_extra_branch_fields(tmp_path: Path) -> Non
 @pytest.mark.parametrize(
     ("updates", "expected"),
     [
-        ({}, "unit_linear_atommean-f50_e50-order3"),
+        (
+            {},
+            "unit_linear_"
+            "f50-fmax0.3-fw1-fmlp256x256x256_"
+            "e50-emax0.5-ew0.3-emlp256x256-order3",
+        ),
         (
             {"loss.force_coefficient": 0.0},
-            "unit_linear_foff_e50-order3",
+            "unit_linear_"
+            "f50-fmax0.3-fw0-fmlp256x256x256_"
+            "e50-emax0.5-ew0.3-emlp256x256-order3",
         ),
         (
             {
@@ -364,7 +371,9 @@ def test_log_binning_rejects_fixed_or_extra_branch_fields(tmp_path: Path) -> Non
                 "model.force.target_mode": "component",
                 "loss.energy_coefficient": 0.0,
             },
-            "unit_log_component-f50_eoff",
+            "unit_log_"
+            "f50-fmaxauto-fw1-fmlp256x256x256_"
+            "e50-emaxauto-ew0-emlp256x256-order3",
         ),
     ],
 )
