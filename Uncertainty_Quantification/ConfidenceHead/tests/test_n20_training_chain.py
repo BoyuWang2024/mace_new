@@ -147,8 +147,10 @@ def test_real_n20_training_chain(monkeypatch, tmp_path: Path) -> None:
     with _mace_checkpoint_warning_scope():
         cache_root = run_build_cache(config)
     assert cache_root.is_relative_to(tmp_path)
-    with pytest.raises(UserWarning, match="To copy construct from a tensor"):
-        warnings.warn(_COPY_TENSOR_WARNING, UserWarning, stacklevel=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(UserWarning, match="To copy construct from a tensor"):
+            warnings.warn(_COPY_TENSOR_WARNING, UserWarning, stacklevel=1)
 
     assert (cache_root / "cache_manifest.json").is_file()
     _assert_complete_n20_cache(config, cache_root)
