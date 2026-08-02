@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import random
 import shutil
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -890,3 +892,268 @@ def test_resume_wraps_weights_only_rejection_as_cache_corruption(
 
     with pytest.raises(CacheCorruptionError, match="cannot load safely"):
         CacheWriter.resume(tmp_path, expected_cache_id="cache")
+
+
+def _write_shuffle_cache(root: Path):
+    from confidence_head.cache import CacheWriter
+
+    writer = CacheWriter(root, cache_id="cache", shard_max_atoms=4)
+    batch = batch_with_atom_counts([1, 2, 1, 3, 1])
+    writer.append(
+        replace(
+            batch, atomic_numbers=torch.arange(1, 9, dtype=torch.long)
+        )
+    )
+    writer.finalize_split("train")
+    return writer.finalize()
+
+
+def _flatten_structure_ids(
+    batches: list[ContinuousBatch],
+) -> list[str]:
+    return [
+        structure_id
+        for batch in batches
+        for structure_id in batch.structure_id
+    ]
+
+
+def test_shuffled_iterator_is_reproducible_and_epoch_changes_order(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import iter_shuffled_cache_batches
+
+    manifest = _write_shuffle_cache(tmp_path)
+    first = list(
+        iter_shuffled_cache_batches(manifest, "train", 2, seed=17)
+    )
+    repeated = list(
+        iter_shuffled_cache_batches(manifest, "train", 2, seed=17)
+    )
+    next_epoch = list(
+        iter_shuffled_cache_batches(manifest, "train", 2, seed=18)
+    )
+
+    assert [batch.structure_id for batch in first] == [
+        batch.structure_id for batch in repeated
+    ]
+    assert all(
+        torch.equal(getattr(left, field), getattr(right, field))
+        for left, right in zip(first, repeated, strict=True)
+        for field in (
+            "structure_index",
+            "atomic_numbers",
+            "atom_offsets",
+            "scalar_features",
+            "force_prediction",
+            "force_reference",
+            "energy_prediction",
+            "energy_reference",
+        )
+    )
+    assert _flatten_structure_ids(first) != _flatten_structure_ids(
+        next_epoch
+    )
+
+
+def test_shuffled_iterator_yields_each_complete_structure_once(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import (
+        iter_cache_batches,
+        iter_shuffled_cache_batches,
+    )
+
+    manifest = _write_shuffle_cache(tmp_path)
+    sequential = list(iter_cache_batches(manifest, "train", 10))
+    shuffled = list(
+        iter_shuffled_cache_batches(manifest, "train", 2, seed=29)
+    )
+
+    assert sorted(_flatten_structure_ids(shuffled)) == sorted(
+        _flatten_structure_ids(sequential)
+    )
+    assert len(_flatten_structure_ids(shuffled)) == 5
+    assert all(len(batch.structure_id) <= 2 for batch in shuffled)
+    atom_counts = {
+        "structure-0": 1,
+        "structure-1": 2,
+        "structure-2": 1,
+        "structure-3": 3,
+        "structure-4": 1,
+    }
+    expected_atomic_numbers = {
+        "structure-0": [1],
+        "structure-1": [2, 3],
+        "structure-2": [4],
+        "structure-3": [5, 6, 7],
+        "structure-4": [8],
+    }
+    for batch in shuffled:
+        expected_offsets = [0]
+        for structure_id in batch.structure_id:
+            expected_offsets.append(
+                expected_offsets[-1] + atom_counts[structure_id]
+            )
+        assert batch.atom_offsets.tolist() == expected_offsets
+        for index, structure_id in enumerate(batch.structure_id):
+            atom_start = batch.atom_offsets[index]
+            atom_end = batch.atom_offsets[index + 1]
+            assert batch.atomic_numbers[atom_start:atom_end].tolist() == (
+                expected_atomic_numbers[structure_id]
+            )
+            assert int(batch.structure_index[index]) == int(structure_id[-1])
+
+
+def test_shuffled_iterator_flushes_at_non_feature_dtype_boundary(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import (
+        CacheWriter,
+        iter_shuffled_cache_batches,
+    )
+
+    writer = CacheWriter(tmp_path, cache_id="cache", shard_max_atoms=1)
+    writer.append(approved_payload_batch([1], structure_prefix="first"))
+    writer.append(
+        batch_with_changed_field_dtype(
+            field="energy_reference",
+            index_start=1,
+            structure_prefix="second",
+        )
+    )
+    writer.finalize_split("train")
+    manifest = writer.finalize()
+
+    batches = list(
+        iter_shuffled_cache_batches(manifest, "train", 10, seed=3)
+    )
+
+    assert len(batches) == 2
+    assert {batch.energy_reference.dtype for batch in batches} == {
+        torch.float32,
+        torch.float64,
+    }
+
+
+def test_shuffled_iterator_does_not_mutate_global_rng_states(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import iter_shuffled_cache_batches
+
+    manifest = _write_shuffle_cache(tmp_path)
+    random.seed(101)
+    np.random.seed(102)
+    torch.manual_seed(103)
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state().clone()
+
+    list(iter_shuffled_cache_batches(manifest, "train", 2, seed=104))
+
+    assert random.getstate() == python_state
+    current_numpy_state = np.random.get_state()
+    assert current_numpy_state[0] == numpy_state[0]
+    assert np.array_equal(current_numpy_state[1], numpy_state[1])
+    assert current_numpy_state[2:] == numpy_state[2:]
+    assert torch.equal(torch.random.get_rng_state(), torch_state)
+
+
+def test_shuffled_iterator_consumes_each_shard_once_in_permuted_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import confidence_head.cache as cache_module
+    from confidence_head.cache import iter_shuffled_cache_batches
+
+    manifest = _write_shuffle_cache(tmp_path)
+    original = cache_module._load_iterator_shard
+    loaded: list[int] = []
+
+    def recording_loader(*args, **kwargs):
+        shard = kwargs["shard"]
+        loaded.append(shard.shard_index)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cache_module, "_load_iterator_shard", recording_loader
+    )
+
+    iterator = iter_shuffled_cache_batches(manifest, "train", 2, seed=7)
+    next(iterator)
+    assert len(loaded) == 1
+    list(iterator)
+
+    assert sorted(loaded) == [0, 1]
+    assert loaded != [0, 1]
+
+
+@pytest.mark.parametrize("seed", [True, -1, 2**63])
+def test_shuffled_iterator_rejects_invalid_seed(
+    tmp_path: Path, seed: object
+) -> None:
+    from confidence_head.cache import iter_shuffled_cache_batches
+
+    manifest = _write_shuffle_cache(tmp_path)
+    with pytest.raises(ValueError, match="seed"):
+        list(
+            iter_shuffled_cache_batches(
+                manifest, "train", batch_size=2, seed=seed
+            )
+        )
+
+
+def test_shuffled_iterator_rejects_unbound_manifest(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import (
+        CacheCorruptionError,
+        iter_shuffled_cache_batches,
+    )
+
+    manifest = _write_shuffle_cache(tmp_path)
+    forged = replace(manifest, splits={})
+    with pytest.raises(CacheCorruptionError, match="manifest"):
+        list(
+            iter_shuffled_cache_batches(
+                forged, "train", batch_size=2, seed=0
+            )
+        )
+
+
+def test_shuffled_iterator_empty_split_and_tampering_contracts(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import (
+        CacheCorruptionError,
+        iter_shuffled_cache_batches,
+    )
+
+    manifest = _write_shuffle_cache(tmp_path)
+    assert list(
+        iter_shuffled_cache_batches(
+            manifest, "validation", 2, seed=0
+        )
+    ) == []
+
+    (tmp_path / "train" / "shard-000000.pt").write_bytes(b"corrupt")
+    with pytest.raises(CacheCorruptionError):
+        list(
+            iter_shuffled_cache_batches(
+                manifest, "train", 2, seed=0
+            )
+        )
+
+
+@pytest.mark.parametrize("batch_size", [True, 0])
+def test_shuffled_iterator_rejects_invalid_batch_size(
+    tmp_path: Path, batch_size: object
+) -> None:
+    from confidence_head.cache import iter_shuffled_cache_batches
+
+    manifest = _write_shuffle_cache(tmp_path)
+    with pytest.raises(ValueError, match="batch_size"):
+        list(
+            iter_shuffled_cache_batches(
+                manifest, "train", batch_size=batch_size, seed=0
+            )
+        )

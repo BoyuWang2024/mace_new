@@ -1063,6 +1063,68 @@ def _bind_manifest(manifest: object) -> CacheManifest:
     return committed
 
 
+def _load_iterator_shard(
+    *,
+    committed: CacheManifest,
+    split: str,
+    shard: CacheShard,
+    expected_start: int,
+) -> ContinuousBatch:
+    """Load and validate one shard after the committed-manifest audit."""
+    shard_path = committed.root / split / shard.filename
+    shard_where = f"{split}/{shard.filename}"
+    if not shard_path.is_file():
+        raise _bad(shard_where, "is missing")
+    if sha256_file(shard_path) != shard.sha256:
+        raise _bad(shard_where, "hash mismatch")
+
+    payload = _safe_load_torch(shard_path, shard_where)
+    (
+        structure_count,
+        atom_count,
+        _,
+        _,
+    ) = _validate_shard_payload(
+        payload,
+        cache_id=committed.cache_id,
+        split=split,
+        shard_index=shard.shard_index,
+        expected_start=expected_start,
+        where=shard_where,
+    )
+    if (
+        structure_count != shard.num_structures
+        or atom_count != shard.num_atoms
+    ):
+        raise _bad(shard_where, "committed counts are false")
+
+    return _batch_attributes(
+        {
+            field: payload[field]
+            for field in _CONTINUOUS_BATCH_FIELDS
+        },
+        shard_where,
+    )
+
+
+def _independent_structure(
+    batch: ContinuousBatch, structure_index: int
+) -> ContinuousBatch:
+    """Copy one sliced structure so pending output owns bounded storage."""
+    structure = _one_structure(batch, structure_index)
+    return ContinuousBatch(
+        structure_index=structure.structure_index.clone(),
+        structure_id=structure.structure_id,
+        atomic_numbers=structure.atomic_numbers.clone(),
+        atom_offsets=structure.atom_offsets.clone(),
+        scalar_features=structure.scalar_features.clone(),
+        force_prediction=structure.force_prediction.clone(),
+        force_reference=structure.force_reference.clone(),
+        energy_prediction=structure.energy_prediction.clone(),
+        energy_reference=structure.energy_reference.clone(),
+    )
+
+
 def iter_cache_batches(
     manifest: CacheManifest, split: str, batch_size: int
 ) -> Iterator[ContinuousBatch]:
@@ -1075,42 +1137,14 @@ def iter_cache_batches(
     pending: list[ContinuousBatch] = []
     expected_structure_index = 0
     for shard in committed.splits.get(split, ()):
-        shard_path = committed.root / split / shard.filename
-        shard_where = f"{split}/{shard.filename}"
-        if not shard_path.is_file():
-            raise _bad(shard_where, "is missing")
-        if sha256_file(shard_path) != shard.sha256:
-            raise _bad(shard_where, "hash mismatch")
-
-        payload = _safe_load_torch(shard_path, shard_where)
-        (
-            structure_count,
-            atom_count,
-            _,
-            _,
-        ) = _validate_shard_payload(
-            payload,
-            cache_id=committed.cache_id,
+        shard_batch = _load_iterator_shard(
+            committed=committed,
             split=split,
-            shard_index=shard.shard_index,
+            shard=shard,
             expected_start=expected_structure_index,
-            where=shard_where,
         )
-        if (
-            structure_count != shard.num_structures
-            or atom_count != shard.num_atoms
-        ):
-            raise _bad(shard_where, "committed counts are false")
-        expected_structure_index += structure_count
-
-        shard_batch = _batch_attributes(
-            {
-                field: payload[field]
-                for field in _CONTINUOUS_BATCH_FIELDS
-            },
-            shard_where,
-        )
-        for structure_index in range(structure_count):
+        expected_structure_index += shard.num_structures
+        for structure_index in range(shard.num_structures):
             structure = _one_structure(shard_batch, structure_index)
             if (
                 pending
@@ -1124,6 +1158,72 @@ def iter_cache_batches(
                 yield _repack(pending)
                 pending.clear()
 
+    if pending:
+        yield _repack(pending)
+
+
+def iter_shuffled_cache_batches(
+    manifest: CacheManifest,
+    split: str,
+    batch_size: int,
+    *,
+    seed: int,
+) -> Iterator[ContinuousBatch]:
+    """Yield a bounded deterministic shard-and-structure shuffle.
+
+    Manifest binding first performs the existing independent full-cache
+    audit. After that succeeds, the consumption phase loads each target
+    shard exactly once and keeps at most that payload plus copied pending
+    output structures. Seed is an integer in [0, 2**63 - 1].
+    """
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    if type(seed) is not int or not 0 <= seed < 2**63:
+        raise ValueError("seed must be an integer in [0, 2**63 - 1]")
+    split = _split_name(split, "split")
+    committed = _bind_manifest(manifest)
+    shards = committed.splits.get(split, ())
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    shard_order = torch.randperm(
+        len(shards), generator=generator
+    ).tolist()
+    expected_starts: list[int] = []
+    expected_start = 0
+    for shard in shards:
+        expected_starts.append(expected_start)
+        expected_start += shard.num_structures
+
+    pending: list[ContinuousBatch] = []
+    for shard_position in shard_order:
+        shard = shards[shard_position]
+        shard_batch = _load_iterator_shard(
+            committed=committed,
+            split=split,
+            shard=shard,
+            expected_start=expected_starts[shard_position],
+        )
+        structure_order = torch.randperm(
+            shard.num_structures, generator=generator
+        ).tolist()
+        for structure_index in structure_order:
+            structure = _independent_structure(
+                shard_batch, structure_index
+            )
+            if (
+                pending
+                and _non_feature_dtype_signature(structure)
+                != _non_feature_dtype_signature(pending[-1])
+            ):
+                yield _repack(pending)
+                pending.clear()
+            pending.append(structure)
+            if len(pending) == batch_size:
+                yield _repack(pending)
+                pending.clear()
+
+        del shard_batch
     if pending:
         yield _repack(pending)
 
