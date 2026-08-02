@@ -446,6 +446,7 @@ def _validate_optimizer(
     raw_state = state["state"]
     if type(raw_state) is not dict or set(raw_state) != set(ordered_ids):
         raise ValueError("optimizer state parameter coverage differs")
+    committed_step: float | None = None
     for identifier in ordered_ids:
         entry = raw_state[identifier]
         expected_keys = {"step", "exp_avg", "exp_avg_sq"}
@@ -476,8 +477,12 @@ def _validate_optimizer(
         ):
             raise ValueError(f"optimizer state {identifier} step differs")
         step_value = float(step.item())
-        if step_value < 0.0 or not step_value.is_integer():
+        if step_value <= 0.0 or not step_value.is_integer():
             raise ValueError(f"optimizer state {identifier} step differs")
+        if committed_step is None:
+            committed_step = step_value
+        elif step_value != committed_step:
+            raise ValueError("optimizer parameter steps must be exactly equal")
     return state
 
 

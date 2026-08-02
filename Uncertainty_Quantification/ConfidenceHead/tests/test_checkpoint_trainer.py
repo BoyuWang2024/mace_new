@@ -314,6 +314,67 @@ def _append_optimizer_param_group(payload: dict[str, Any]) -> None:
     groups.append(copy.deepcopy(groups[0]))
 
 
+def _adamw_checkpoint_for_step_test(tmp_path: Path, *, amsgrad: bool):
+    config = _config(tmp_path)
+    source = _model(config)
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3, amsgrad=amsgrad)
+    _prime_adamw(source, optimizer)
+    path = save_last(
+        tmp_path / f"steps-{amsgrad}.pt",
+        model=source,
+        optimizer=optimizer,
+        identity=IDENTITY,
+        validation_metrics={"total_loss": 0.5},
+        state=TrainingState(1, 0, 0.5, 0, False),
+    )
+    return config, path
+
+
+@pytest.mark.parametrize("amsgrad", [False, True])
+def test_load_last_accepts_equal_positive_committed_adamw_steps(
+    tmp_path: Path, amsgrad: bool
+):
+    config, path = _adamw_checkpoint_for_step_test(tmp_path, amsgrad=amsgrad)
+    target = _model(config)
+    optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3, amsgrad=amsgrad)
+
+    state = load_last(path, target, optimizer, IDENTITY)
+
+    assert state == TrainingState(1, 0, 0.5, 0, False)
+    steps = [
+        float(entry["step"].item())
+        for entry in optimizer.state_dict()["state"].values()
+    ]
+    assert steps and set(steps) == {1.0}
+
+
+@pytest.mark.parametrize("amsgrad", [False, True])
+@pytest.mark.parametrize("corruption", ["zero", "unequal"])
+def test_load_last_rejects_uncommitted_or_divergent_adamw_steps_before_mutation(
+    tmp_path: Path, amsgrad: bool, corruption: str
+):
+    config, path = _adamw_checkpoint_for_step_test(tmp_path, amsgrad=amsgrad)
+    payload = load_torch_artifact(path)
+    entries = list(payload["optimizer_state"]["state"].values())
+    if corruption == "zero":
+        for entry in entries:
+            entry["step"] = torch.tensor(0.0, dtype=torch.float32)
+    else:
+        entries[0]["step"] = torch.tensor(2.0, dtype=torch.float32)
+    torch.save(payload, path)
+
+    target = _model(config)
+    optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3, amsgrad=amsgrad)
+    before_model = copy.deepcopy(target.state_dict())
+    before_optimizer = copy.deepcopy(optimizer.state_dict())
+    before_rng = capture_rng_state()
+    with pytest.raises(ValueError, match="optimizer.*step"):
+        load_last(path, target, optimizer, IDENTITY)
+    assert _nested_equal(before_model, target.state_dict())
+    assert _nested_equal(before_optimizer, optimizer.state_dict())
+    assert _nested_equal(before_rng, capture_rng_state())
+
+
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [
