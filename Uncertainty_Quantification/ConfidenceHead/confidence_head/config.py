@@ -55,7 +55,7 @@ class BinConfig:
 
 @dataclass(frozen=True)
 class BinningConfig:
-    algorithm: Literal["fixed_linear_v1"]
+    algorithm: Literal["fixed_linear_v1", "train_quantile_log_v1"]
     force: BinConfig
     energy: BinConfig
 
@@ -271,9 +271,12 @@ def _cache(value: Any) -> CacheConfig:
 
 def _binning(value: Any) -> BinningConfig:
     mapping = _keys(value, {"algorithm", "force", "energy"}, "binning")
-    if _string(mapping["algorithm"], "binning.algorithm") != "fixed_linear_v1":
-        raise ConfigError("binning.algorithm must be fixed_linear_v1")
-    return BinningConfig("fixed_linear_v1", _bin_config(mapping["force"], "binning.force"), _bin_config(mapping["energy"], "binning.energy"))
+    algorithm = _string(mapping["algorithm"], "binning.algorithm")
+    if algorithm not in {"fixed_linear_v1", "train_quantile_log_v1"}:
+        raise ConfigError(
+            "binning.algorithm must be fixed_linear_v1 or train_quantile_log_v1"
+        )
+    return BinningConfig(algorithm, _bin_config(mapping["force"], "binning.force"), _bin_config(mapping["energy"], "binning.energy"))
 
 
 def _model(value: Any) -> ModelConfig:
