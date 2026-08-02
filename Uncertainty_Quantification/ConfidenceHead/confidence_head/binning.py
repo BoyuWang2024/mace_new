@@ -14,6 +14,7 @@ from .identity import stable_id
 BINNING_SCHEMA_VERSION = 1
 BINNING_FORMULA_VERSION = "confidence_head_binning_v1"
 SUPPORTED_ALGORITHMS = frozenset({"fixed_linear_v1", "train_quantile_log_v1"})
+FORCE_TARGET_MODES = frozenset({"atom_mean", "component"})
 
 
 def _errors(value: object, *, name: str = "values") -> torch.Tensor:
@@ -46,6 +47,28 @@ def _num_bins(value: object) -> int:
     if type(value) is not int or value < 3:
         raise ValueError("num_bins must be an integer of at least 3")
     return value
+
+
+def _positive_float(value: object, *, name: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
+        raise ValueError(f"{name} must be finite and positive")
+    return float(value)
+
+
+def _artifact_vector(value: object, *, name: str) -> torch.Tensor:
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.ndim != 1
+        or value.dtype != torch.float64
+        or value.device.type != "cpu"
+    ):
+        raise ValueError(f"{name} must be a CPU float64 tensor")
+    return _errors(value, name=name)
 
 
 def labels_from_thresholds(values: object, thresholds: object) -> torch.Tensor:
@@ -114,9 +137,9 @@ class BranchBinning:
         payload: dict[str, Any] = {
             "num_bins": self.num_bins,
             "thresholds": self.thresholds,
-            "representatives": self.representatives,
+            "reps": self.representatives,
             "counts": self.counts,
-            "representative_sources": self.representative_sources,
+            "sources": self.representative_sources,
             "overflow_count": self.overflow_count,
         }
         if self.algorithm == "fixed_linear_v1":
@@ -128,17 +151,7 @@ class BranchBinning:
         return payload
 
     def identity_payload(self) -> dict[str, Any]:
-        payload = self.to_payload()
-        return {
-            key: (
-                value.tolist()
-                if isinstance(value, torch.Tensor)
-                else list(value)
-                if isinstance(value, tuple)
-                else value
-            )
-            for key, value in payload.items()
-        }
+        return _jsonable(self.to_payload())
 
 
 def fit_fixed_linear(
@@ -147,14 +160,7 @@ def fit_fixed_linear(
     """Fit analytic fixed-width bins and count clamped overflows."""
     error_values = _errors(values)
     bins = _num_bins(num_bins)
-    if (
-        isinstance(max_error, bool)
-        or not isinstance(max_error, (int, float))
-        or not math.isfinite(float(max_error))
-        or float(max_error) <= 0.0
-    ):
-        raise ValueError("max_error must be a finite positive number")
-    maximum = float(max_error)
+    maximum = _positive_float(max_error, name="max_error")
     width = maximum / bins
     thresholds = torch.arange(1, bins, dtype=torch.float64) * width
     representatives = (torch.arange(bins, dtype=torch.float64) + 0.5) * width
@@ -184,11 +190,7 @@ def fit_train_quantile_log(values: object, *, num_bins: int) -> BranchBinning:
     upper = float(upper_tensor.item())
     if not 0.0 < lower < upper:
         raise ValueError("quantile anchors must satisfy 0 < lower < upper")
-    thresholds = torch.exp(
-        torch.linspace(math.log(lower), math.log(upper), bins - 1, dtype=torch.float64)
-    )
-    thresholds[0] = lower_tensor
-    thresholds[-1] = upper_tensor
+    thresholds = _log_thresholds(lower, upper, bins)
     labels = torch.bucketize(error_values, thresholds, right=True)
     representatives, sources = _representatives_and_sources(error_values, thresholds)
     return BranchBinning(
@@ -203,19 +205,118 @@ def fit_train_quantile_log(values: object, *, num_bins: int) -> BranchBinning:
     )
 
 
+def _log_thresholds(lower: float, upper: float, num_bins: int) -> torch.Tensor:
+    thresholds = torch.exp(
+        torch.linspace(
+            math.log(lower), math.log(upper), num_bins - 1, dtype=torch.float64
+        )
+    )
+    thresholds[0] = lower
+    thresholds[-1] = upper
+    return thresholds
+
+
 def _exact_keys(value: object, expected: set[str], where: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or set(value) != expected:
         raise ValueError(f"{where} schema keys differ")
     return value
 
 
+def _counts(value: object, *, bins: int, where: str) -> torch.Tensor:
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.ndim != 1
+        or value.dtype != torch.long
+        or value.device.type != "cpu"
+        or value.numel() != bins
+        or bool(torch.any(value < 0).item())
+    ):
+        raise ValueError(f"{where}.counts differs")
+    if int(value.sum().item()) < 1:
+        raise ValueError(f"{where}.counts must contain samples")
+    return value
+
+
+def _sources(value: object, *, bins: int, where: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, tuple)
+        or len(value) != bins
+        or any(not isinstance(source, str) for source in value)
+    ):
+        raise ValueError(f"{where}.sources differs")
+    return value
+
+
+def _overflow(value: object, *, last_count: int, where: str) -> int:
+    if type(value) is not int or value < 0 or value > last_count:
+        raise ValueError(f"{where}.overflow_count differs")
+    return value
+
+
+def _validate_fixed(branch: BranchBinning, *, where: str) -> None:
+    maximum = _positive_float(branch.max_error, name="max_error")
+    width = _positive_float(branch.bin_width, name="bin_width")
+    expected_width = maximum / branch.num_bins
+    if width != expected_width:
+        raise ValueError("fixed_linear_v1 bin_width formula differs")
+    expected_thresholds = (
+        torch.arange(1, branch.num_bins, dtype=torch.float64) * expected_width
+    )
+    expected_reps = (
+        torch.arange(branch.num_bins, dtype=torch.float64) + 0.5
+    ) * expected_width
+    if not torch.equal(branch.thresholds, expected_thresholds):
+        raise ValueError("fixed_linear_v1 threshold formula differs")
+    if not torch.equal(branch.representatives, expected_reps):
+        raise ValueError("fixed_linear_v1 representative formula differs")
+    if branch.representative_sources != ("analytic_center",) * branch.num_bins:
+        raise ValueError("fixed_linear_v1 sources differ")
+
+
+def _fallback(index: int, *, thresholds: torch.Tensor, num_bins: int) -> torch.Tensor:
+    if index == 0:
+        return thresholds[0] / 2.0
+    if index == num_bins - 1:
+        return thresholds[-1] * torch.sqrt(thresholds[-1] / thresholds[-2])
+    return torch.sqrt(thresholds[index - 1] * thresholds[index])
+
+
+def _validate_log(branch: BranchBinning, *, where: str) -> None:
+    lower = _positive_float(branch.lower, name="lower")
+    upper = _positive_float(branch.upper, name="upper")
+    if lower >= upper:
+        raise ValueError("train_quantile_log_v1 anchors must satisfy lower < upper")
+    if branch.thresholds[0].item() != lower or branch.thresholds[-1].item() != upper:
+        raise ValueError("train_quantile_log_v1 threshold endpoints differ")
+    if not torch.equal(
+        branch.thresholds, _log_thresholds(lower, upper, branch.num_bins)
+    ):
+        raise ValueError("train_quantile_log_v1 threshold formula differs")
+    for index, (count, source) in enumerate(
+        zip(branch.counts.tolist(), branch.representative_sources)
+    ):
+        expected_source = "analytic_fallback" if count == 0 else "median"
+        if source != expected_source:
+            raise ValueError("train_quantile_log_v1 sources differ")
+        if (
+            count == 0
+            and branch.representatives[index].item()
+            != _fallback(
+                index,
+                thresholds=branch.thresholds,
+                num_bins=branch.num_bins,
+            ).item()
+        ):
+            raise ValueError("train_quantile_log_v1 analytic fallback differs")
+
+
 def _branch_from_payload(algorithm: str, value: object, where: str) -> BranchBinning:
     common = {
         "num_bins",
         "thresholds",
-        "representatives",
+        "reps",
         "counts",
-        "representative_sources",
+        "sources",
         "overflow_count",
     }
     extras = (
@@ -224,67 +325,89 @@ def _branch_from_payload(algorithm: str, value: object, where: str) -> BranchBin
         else {"lower", "upper"}
     )
     mapping = _exact_keys(value, common | extras, where)
-    thresholds = _thresholds(mapping["thresholds"])
+    thresholds = _thresholds(
+        _artifact_vector(mapping["thresholds"], name=f"{where}.thresholds")
+    )
     bins = _num_bins(mapping["num_bins"])
     if thresholds.numel() != bins - 1:
         raise ValueError(f"{where} threshold count differs")
-    representatives = _errors(
-        mapping["representatives"], name=f"{where}.representatives"
-    )
-    counts = mapping["counts"]
-    if (
-        not isinstance(counts, torch.Tensor)
-        or counts.ndim != 1
-        or counts.dtype != torch.long
-        or counts.device.type != "cpu"
-        or counts.numel() != bins
-        or bool(torch.any(counts < 0).item())
-    ):
-        raise ValueError(f"{where}.counts differs")
-    sources = mapping["representative_sources"]
-    if (
-        not isinstance(sources, tuple)
-        or len(sources) != bins
-        or any(
-            source not in {"median", "analytic_fallback", "analytic_center"}
-            for source in sources
-        )
-    ):
-        raise ValueError(f"{where}.representative_sources differs")
-    overflow = mapping["overflow_count"]
-    if type(overflow) is not int or overflow < 0:
-        raise ValueError(f"{where}.overflow_count differs")
+    representatives = _artifact_vector(mapping["reps"], name=f"{where}.reps")
     if representatives.numel() != bins:
         raise ValueError(f"{where} representative count differs")
+    counts = _counts(mapping["counts"], bins=bins, where=where)
+    sources = _sources(mapping["sources"], bins=bins, where=where)
+    overflow = _overflow(
+        mapping["overflow_count"],
+        last_count=int(counts[-1].item()),
+        where=where,
+    )
     if algorithm == "fixed_linear_v1":
-        maximum = mapping["max_error"]
-        width = mapping["bin_width"]
-        if not isinstance(maximum, float) or not isinstance(width, float):
-            raise ValueError(f"{where} fixed parameters differ")
-        return BranchBinning(
+        branch = BranchBinning(
             algorithm,
             thresholds,
             representatives,
             counts,
             sources,
             overflow,
-            max_error=maximum,
-            bin_width=width,
+            max_error=mapping["max_error"],
+            bin_width=mapping["bin_width"],
         )
-    lower = mapping["lower"]
-    upper = mapping["upper"]
-    if not isinstance(lower, float) or not isinstance(upper, float):
-        raise ValueError(f"{where} quantile anchors differ")
-    return BranchBinning(
+        _validate_fixed(branch, where=where)
+        return branch
+    branch = BranchBinning(
         algorithm,
         thresholds,
         representatives,
         counts,
         sources,
         overflow,
-        lower=lower,
-        upper=upper,
+        lower=mapping["lower"],
+        upper=mapping["upper"],
     )
+    _validate_log(branch, where=where)
+    return branch
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.tolist()
+    if isinstance(value, Mapping):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def _validate_semantics(
+    branches: Mapping[str, BranchBinning], force_target_mode: str | None
+) -> None:
+    if not branches or not set(branches) <= {"force", "energy"}:
+        raise ValueError("binning artifact branches differ")
+    if "force" in branches:
+        if force_target_mode not in FORCE_TARGET_MODES:
+            raise ValueError("force_target_mode is required for force binning")
+    elif force_target_mode is not None:
+        raise ValueError("force_target_mode must be absent when force is disabled")
+
+
+def _identity_content(
+    *,
+    cache_id: str,
+    algorithm: str,
+    branches: Mapping[str, BranchBinning],
+    force_target_mode: str | None,
+) -> dict[str, Any]:
+    _validate_semantics(branches, force_target_mode)
+    return {
+        "schema_version": BINNING_SCHEMA_VERSION,
+        "formula_version": BINNING_FORMULA_VERSION,
+        "cache_id": cache_id,
+        "algorithm": algorithm,
+        "force_target_mode": force_target_mode,
+        "branches": {
+            name: branches[name].identity_payload() for name in sorted(branches)
+        },
+    }
 
 
 @dataclass(frozen=True)
@@ -295,6 +418,7 @@ class BinningArtifact:
     run_id: str
     algorithm: str
     branches: dict[str, BranchBinning]
+    force_target_mode: str | None
     schema_version: int = BINNING_SCHEMA_VERSION
     formula_version: str = BINNING_FORMULA_VERSION
 
@@ -306,19 +430,22 @@ class BinningArtifact:
         experiment_id: str,
         algorithm: str,
         branches: dict[str, BranchBinning],
+        force_target_mode: str | None,
     ) -> BinningArtifact:
         if algorithm not in SUPPORTED_ALGORITHMS:
             raise ValueError("binning algorithm is unsupported")
-        content = {
-            "schema_version": BINNING_SCHEMA_VERSION,
-            "formula_version": BINNING_FORMULA_VERSION,
-            "cache_id": cache_id,
-            "experiment_id": experiment_id,
-            "algorithm": algorithm,
-            "branches": {
-                name: branch.identity_payload() for name, branch in branches.items()
-            },
+        validated = {
+            name: _branch_from_payload(
+                algorithm, branch.to_payload(), f"branches.{name}"
+            )
+            for name, branch in sorted(branches.items())
         }
+        content = _identity_content(
+            cache_id=cache_id,
+            algorithm=algorithm,
+            branches=validated,
+            force_target_mode=force_target_mode,
+        )
         identity = stable_id(content)
         return cls(
             cache_id=cache_id,
@@ -326,21 +453,17 @@ class BinningArtifact:
             binning_id=identity,
             run_id=make_run_id(experiment_id, identity),
             algorithm=algorithm,
-            branches=branches,
+            branches=validated,
+            force_target_mode=force_target_mode,
         )
 
     def identity_content(self) -> dict[str, Any]:
-        return {
-            "schema_version": self.schema_version,
-            "formula_version": self.formula_version,
-            "cache_id": self.cache_id,
-            "experiment_id": self.experiment_id,
-            "algorithm": self.algorithm,
-            "branches": {
-                name: branch.identity_payload()
-                for name, branch in self.branches.items()
-            },
-        }
+        return _identity_content(
+            cache_id=self.cache_id,
+            algorithm=self.algorithm,
+            branches=self.branches,
+            force_target_mode=self.force_target_mode,
+        )
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -357,7 +480,12 @@ class BinningArtifact:
         }
 
     @classmethod
-    def from_payload(cls, value: object) -> BinningArtifact:
+    def from_payload(
+        cls,
+        value: object,
+        *,
+        force_target_mode: str | None = None,
+    ) -> BinningArtifact:
         keys = {
             "schema_version",
             "formula_version",
@@ -377,11 +505,7 @@ class BinningArtifact:
         if algorithm not in SUPPORTED_ALGORITHMS:
             raise ValueError("binning artifact algorithm differs")
         raw_branches = mapping["branches"]
-        if (
-            not isinstance(raw_branches, Mapping)
-            or not raw_branches
-            or not set(raw_branches) <= {"force", "energy"}
-        ):
+        if not isinstance(raw_branches, Mapping):
             raise ValueError("binning artifact branches differ")
         branches = {
             name: _branch_from_payload(
@@ -389,6 +513,7 @@ class BinningArtifact:
             )
             for name in sorted(raw_branches)
         }
+        _validate_semantics(branches, force_target_mode)
         artifact = cls(
             cache_id=mapping["cache_id"],
             experiment_id=mapping["experiment_id"],
@@ -396,6 +521,7 @@ class BinningArtifact:
             run_id=mapping["run_id"],
             algorithm=algorithm,
             branches=branches,
+            force_target_mode=force_target_mode,
             schema_version=mapping["schema_version"],
             formula_version=mapping["formula_version"],
         )

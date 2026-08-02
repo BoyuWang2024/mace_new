@@ -48,16 +48,32 @@ class CacheConfig:
 
 
 @dataclass(frozen=True)
-class BinConfig:
+class FixedBinConfig:
     num_bins: int
     max_error: float
 
 
 @dataclass(frozen=True)
-class BinningConfig:
-    algorithm: Literal["fixed_linear_v1", "train_quantile_log_v1"]
-    force: BinConfig
-    energy: BinConfig
+class LogBinConfig:
+    num_bins: int
+
+
+@dataclass(frozen=True)
+class FixedLinearBinningConfig:
+    algorithm: Literal["fixed_linear_v1"]
+    force: FixedBinConfig
+    energy: FixedBinConfig
+
+
+@dataclass(frozen=True)
+class TrainQuantileLogBinningConfig:
+    algorithm: Literal["train_quantile_log_v1"]
+    force: LogBinConfig
+    energy: LogBinConfig
+
+
+BinConfig = FixedBinConfig | LogBinConfig
+BinningConfig = FixedLinearBinningConfig | TrainQuantileLogBinningConfig
 
 
 @dataclass(frozen=True)
@@ -235,9 +251,14 @@ def _dims(value: Any, field: str) -> tuple[int, ...]:
     return tuple(_int(item, field, 1) for item in value)
 
 
-def _bin_config(value: Any, field: str) -> BinConfig:
+def _fixed_bin_config(value: Any, field: str) -> FixedBinConfig:
     mapping = _keys(value, {"num_bins", "max_error"}, field)
-    return BinConfig(_int(mapping["num_bins"], f"{field}.num_bins", 3), _positive_float(mapping["max_error"], f"{field}.max_error"))
+    return FixedBinConfig(_int(mapping["num_bins"], f"{field}.num_bins", 3), _positive_float(mapping["max_error"], f"{field}.max_error"))
+
+
+def _log_bin_config(value: Any, field: str) -> LogBinConfig:
+    mapping = _keys(value, {"num_bins"}, field)
+    return LogBinConfig(_int(mapping["num_bins"], f"{field}.num_bins", 3))
 
 
 def _checkpoint(source_dir: Path, value: Any) -> CheckpointConfig:
@@ -272,11 +293,19 @@ def _cache(value: Any) -> CacheConfig:
 def _binning(value: Any) -> BinningConfig:
     mapping = _keys(value, {"algorithm", "force", "energy"}, "binning")
     algorithm = _string(mapping["algorithm"], "binning.algorithm")
-    if algorithm not in {"fixed_linear_v1", "train_quantile_log_v1"}:
-        raise ConfigError(
-            "binning.algorithm must be fixed_linear_v1 or train_quantile_log_v1"
+    if algorithm == "fixed_linear_v1":
+        return FixedLinearBinningConfig(
+            algorithm,
+            _fixed_bin_config(mapping["force"], "binning.force"),
+            _fixed_bin_config(mapping["energy"], "binning.energy"),
         )
-    return BinningConfig(algorithm, _bin_config(mapping["force"], "binning.force"), _bin_config(mapping["energy"], "binning.energy"))
+    if algorithm == "train_quantile_log_v1":
+        return TrainQuantileLogBinningConfig(
+            algorithm,
+            _log_bin_config(mapping["force"], "binning.force"),
+            _log_bin_config(mapping["energy"], "binning.energy"),
+        )
+    raise ConfigError("binning.algorithm must be fixed_linear_v1 or train_quantile_log_v1")
 
 
 def _model(value: Any) -> ModelConfig:

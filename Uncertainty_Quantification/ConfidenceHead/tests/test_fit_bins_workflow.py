@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 from confidence_head.artifacts import (
     atomic_json_dump,
     atomic_torch_save,
@@ -17,6 +18,17 @@ from confidence_head.config import load_config
 from confidence_head.run_naming import make_run_tag
 from confidence_head.workflows import fit_bins as workflow
 from conftest import update_yaml, write_valid_config
+
+
+def _configure_log_binning(path: Path) -> None:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["binning"]["algorithm"] = "train_quantile_log_v1"
+    document["binning"]["force"].pop("max_error")
+    document["binning"]["energy"].pop("max_error")
+    path.write_text(
+        yaml.safe_dump(document, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def _batch(
@@ -135,18 +147,43 @@ def test_fit_bins_reads_only_train_from_complete_cache(tmp_path: Path) -> None:
     assert manifest["enabled_branches"] == ["energy", "force"]
     assert manifest["train_structure_count"] == 2
     assert manifest["train_atom_count"] == 2
+    common = {
+        "num_bins",
+        "thresholds",
+        "reps",
+        "counts",
+        "sources",
+        "overflow_count",
+    }
+    fixed = common | {"max_error", "bin_width"}
+    assert set(artifact["branches"]["force"]) == fixed
+    assert set(manifest["branches"]["force"]) == fixed
 
 
-def test_fit_bins_omits_disabled_branch(tmp_path: Path) -> None:
+def test_fit_bins_omits_disabled_branch(monkeypatch, tmp_path: Path) -> None:
     path = write_valid_config(tmp_path)
     update_yaml(path, {"loss.force_coefficient": 0.0})
     config = load_config(path)
     _write_complete_cache(config)
+    monkeypatch.setattr(workflow, "force_errors", pytest.fail)
 
     root = workflow.run_fit_bins(config)
 
     artifact = load_torch_artifact(root / "binning.pt")
     assert set(artifact["branches"]) == {"energy"}
+
+
+def test_fit_bins_energy_disabled_never_computes_energy_errors(
+    monkeypatch, tmp_path: Path
+) -> None:
+    path = write_valid_config(tmp_path)
+    update_yaml(path, {"loss.energy_coefficient": 0.0})
+    config = load_config(path)
+    _write_complete_cache(config)
+    monkeypatch.setattr(workflow, "energy_errors", pytest.fail)
+
+    root = workflow.run_fit_bins(config)
+    assert set(load_torch_artifact(root / "binning.pt")["branches"]) == {"force"}
 
 
 def test_fit_bins_reuses_identical_artifacts_without_rewriting(
@@ -162,6 +199,24 @@ def test_fit_bins_reuses_identical_artifacts_without_rewriting(
     assert workflow.run_fit_bins(config) == root
 
     assert (artifact_path.read_bytes(), manifest_path.read_bytes()) == before
+
+
+def test_binning_id_ignores_training_hyperparameters(tmp_path: Path) -> None:
+    path = write_valid_config(tmp_path)
+    first_config = load_config(path)
+    _write_complete_cache(first_config)
+    first_root = workflow.run_fit_bins(first_config)
+    first = load_torch_artifact(first_root / "binning.pt")
+
+    update_yaml(path, {"optimizer.learning_rate": 0.002})
+    second_config = load_config(path)
+    assert workflow._cache_identity(second_config) == first["cache_id"]
+    second_root = workflow.run_fit_bins(second_config)
+    second = load_torch_artifact(second_root / "binning.pt")
+
+    assert first["experiment_id"] != second["experiment_id"]
+    assert first["binning_id"] == second["binning_id"]
+    assert first["run_id"] != second["run_id"]
 
 
 def test_fit_bins_rejects_existing_different_artifact_without_overwrite(
@@ -234,9 +289,65 @@ def test_fit_bins_rejects_incomplete_artifact_pair_without_overwrite(
 
 def test_train_quantile_algorithm_is_loaded_from_config(tmp_path: Path) -> None:
     path = write_valid_config(tmp_path)
+    _configure_log_binning(path)
+
+    config = load_config(path)
+    assert config.binning.algorithm == "train_quantile_log_v1"
+    assert not hasattr(config.binning.force, "max_error")
+    assert not hasattr(config.binning.energy, "max_error")
+
+
+def test_log_artifact_and_manifest_use_exact_branch_schema(tmp_path: Path) -> None:
+    path = write_valid_config(tmp_path)
+    _configure_log_binning(path)
+    config = load_config(path)
+    _write_complete_cache(config)
+
+    root = workflow.run_fit_bins(config)
+    artifact = load_torch_artifact(root / "binning.pt")
+    manifest = json.loads((root / "binning_manifest.json").read_text(encoding="utf-8"))
+    common = {
+        "num_bins",
+        "thresholds",
+        "reps",
+        "counts",
+        "sources",
+        "overflow_count",
+    }
+    expected = common | {"lower", "upper"}
+    assert set(artifact["branches"]["force"]) == expected
+    assert set(manifest["branches"]["force"]) == expected
+
+
+def test_fixed_binning_requires_exact_fixed_branch_fields(tmp_path: Path) -> None:
+    path = write_valid_config(tmp_path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["binning"]["force"].pop("max_error")
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing.*max_error"):
+        load_config(path)
+
+    document["binning"]["force"]["max_error"] = 0.3
+    document["binning"]["force"]["lower"] = 0.01
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown.*lower"):
+        load_config(path)
+
+
+def test_log_binning_rejects_fixed_or_extra_branch_fields(tmp_path: Path) -> None:
+    path = write_valid_config(tmp_path)
     update_yaml(path, {"binning.algorithm": "train_quantile_log_v1"})
 
-    assert load_config(path).binning.algorithm == "train_quantile_log_v1"
+    with pytest.raises(ValueError, match="unknown.*max_error"):
+        load_config(path)
+
+    _configure_log_binning(path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["binning"]["energy"]["upper"] = 1.0
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown.*upper"):
+        load_config(path)
 
 
 @pytest.mark.parametrize(
@@ -262,6 +373,8 @@ def test_run_tag_is_human_readable_and_deterministic(
 ) -> None:
     path = write_valid_config(tmp_path)
     update_yaml(path, updates)
+    if updates.get("binning.algorithm") == "train_quantile_log_v1":
+        _configure_log_binning(path)
 
     assert make_run_tag(load_config(path)) == expected
 

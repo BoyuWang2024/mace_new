@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 
 import pytest
 import torch
 from confidence_head.binning import (
+    BINNING_FORMULA_VERSION,
+    BINNING_SCHEMA_VERSION,
+    BinningArtifact,
     fit_fixed_linear,
     fit_train_quantile_log,
     labels_from_thresholds,
     representatives_from_thresholds,
 )
+from confidence_head.identity import run_id, stable_id
 from confidence_head.labels import energy_errors, force_errors
 
 
@@ -173,3 +178,162 @@ def test_labels_reject_invalid_threshold_contracts() -> None:
         labels_from_thresholds(torch.tensor([0.1]), torch.tensor([0.2, 0.2]))
     with pytest.raises(ValueError, match="non-negative"):
         labels_from_thresholds(torch.tensor([-0.1]), torch.tensor([0.2, 0.4]))
+
+
+def _jsonable(value):
+    if isinstance(value, torch.Tensor):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def _artifact_payload(branch, *, experiment_id: str = "experiment-a") -> dict:
+    return {
+        "schema_version": BINNING_SCHEMA_VERSION,
+        "formula_version": BINNING_FORMULA_VERSION,
+        "cache_id": "cache-a",
+        "experiment_id": experiment_id,
+        "binning_id": "pending",
+        "run_id": "pending",
+        "algorithm": branch.algorithm,
+        "branches": {"force": branch.to_payload()},
+    }
+
+
+def _synchronize_semantic_ids(payload: dict, target_mode: str) -> None:
+    content = {
+        "schema_version": payload["schema_version"],
+        "formula_version": payload["formula_version"],
+        "cache_id": payload["cache_id"],
+        "algorithm": payload["algorithm"],
+        "force_target_mode": target_mode,
+        "branches": _jsonable(payload["branches"]),
+    }
+    payload["binning_id"] = stable_id(content)
+    payload["run_id"] = run_id(payload["experiment_id"], payload["binning_id"])
+
+
+def test_binning_id_ignores_experiment_training_identity() -> None:
+    parameters = inspect.signature(BinningArtifact.create).parameters
+    assert "force_target_mode" in parameters
+    branch = fit_fixed_linear(torch.tensor([0.1, 0.2]), num_bins=3, max_error=0.3)
+
+    first = BinningArtifact.create(
+        cache_id="cache",
+        experiment_id="training-a",
+        algorithm="fixed_linear_v1",
+        branches={"force": branch},
+        force_target_mode="atom_mean",
+    )
+    second = BinningArtifact.create(
+        cache_id="cache",
+        experiment_id="training-b",
+        algorithm="fixed_linear_v1",
+        branches={"force": branch},
+        force_target_mode="atom_mean",
+    )
+
+    assert first.binning_id == second.binning_id
+    assert first.run_id != second.run_id
+
+
+def test_binning_id_includes_enabled_force_target_mode() -> None:
+    parameters = inspect.signature(BinningArtifact.create).parameters
+    assert "force_target_mode" in parameters
+    branch = fit_fixed_linear(torch.tensor([0.1, 0.2]), num_bins=3, max_error=0.3)
+
+    atom_mean = BinningArtifact.create(
+        cache_id="cache",
+        experiment_id="same-experiment",
+        algorithm="fixed_linear_v1",
+        branches={"force": branch},
+        force_target_mode="atom_mean",
+    )
+    component = BinningArtifact.create(
+        cache_id="cache",
+        experiment_id="same-experiment",
+        algorithm="fixed_linear_v1",
+        branches={"force": branch},
+        force_target_mode="component",
+    )
+
+    assert atom_mean.binning_id != component.binning_id
+
+
+def test_safe_load_rejects_synchronized_fixed_formula_attack() -> None:
+    branch = fit_fixed_linear(torch.tensor([0.0, 0.1, 0.2]), num_bins=3, max_error=0.3)
+    payload = _artifact_payload(branch)
+    payload["branches"]["force"]["thresholds"][0] = 0.11
+    _synchronize_semantic_ids(payload, "atom_mean")
+
+    with pytest.raises(ValueError, match="fixed_linear_v1 threshold formula"):
+        BinningArtifact.from_payload(payload)
+
+
+def test_safe_load_rejects_synchronized_fixed_source_attack() -> None:
+    branch = fit_fixed_linear(torch.tensor([0.0, 0.1, 0.2]), num_bins=3, max_error=0.3)
+    payload = _artifact_payload(branch)
+    source_key = (
+        "sources"
+        if "sources" in payload["branches"]["force"]
+        else "representative_sources"
+    )
+    payload["branches"]["force"][source_key] = ("median",) * 3
+    _synchronize_semantic_ids(payload, "atom_mean")
+
+    with pytest.raises(ValueError, match="fixed_linear_v1 sources"):
+        BinningArtifact.from_payload(payload)
+
+
+def test_safe_load_rejects_synchronized_nonfinite_fixed_parameter() -> None:
+    branch = fit_fixed_linear(torch.tensor([0.0, 0.1, 0.2]), num_bins=3, max_error=0.3)
+    payload = _artifact_payload(branch)
+    payload["branches"]["force"]["max_error"] = float("nan")
+    _synchronize_semantic_ids(payload, "atom_mean")
+
+    with pytest.raises(ValueError, match="max_error.*finite"):
+        BinningArtifact.from_payload(payload)
+
+
+def test_safe_load_rejects_synchronized_log_endpoint_attack() -> None:
+    branch = fit_train_quantile_log(
+        torch.tensor([0.0, 1.0, 2.0, 3.0, 100.0]), num_bins=4
+    )
+    payload = _artifact_payload(branch)
+    payload["branches"]["force"]["lower"] *= 0.9
+    _synchronize_semantic_ids(payload, "atom_mean")
+
+    with pytest.raises(ValueError, match="train_quantile_log_v1 threshold endpoints"):
+        BinningArtifact.from_payload(payload)
+
+
+def test_safe_load_rejects_synchronized_log_fallback_attack() -> None:
+    branch = fit_train_quantile_log(
+        torch.tensor([0.0, 1.0, 2.0, 3.0, 100.0]), num_bins=6
+    )
+    payload = _artifact_payload(branch)
+    branch_payload = payload["branches"]["force"]
+    source_key = "sources" if "sources" in branch_payload else "representative_sources"
+    reps_key = "reps" if "reps" in branch_payload else "representatives"
+    fallback_index = list(branch_payload[source_key]).index("analytic_fallback")
+    branch_payload[reps_key][fallback_index] += 0.25
+    _synchronize_semantic_ids(payload, "atom_mean")
+
+    with pytest.raises(ValueError, match="analytic fallback"):
+        BinningArtifact.from_payload(payload)
+
+
+def test_safe_load_rejects_synchronized_non_float64_artifact_tensor() -> None:
+    branch = fit_train_quantile_log(
+        torch.arange(1.0, 11.0, dtype=torch.float64), num_bins=3
+    )
+    assert all(source == "median" for source in branch.representative_sources)
+    payload = _artifact_payload(branch)
+    payload["branches"]["force"]["reps"] = payload["branches"]["force"]["reps"].float()
+    _synchronize_semantic_ids(payload, "atom_mean")
+
+    with pytest.raises(ValueError, match="reps.*CPU float64"):
+        BinningArtifact.from_payload(payload, force_target_mode="atom_mean")

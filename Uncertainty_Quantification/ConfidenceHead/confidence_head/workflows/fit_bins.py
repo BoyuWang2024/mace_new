@@ -23,7 +23,12 @@ from ..cache import (
     iter_cache_batches,
     load_complete_cache,
 )
-from ..config import BinConfig, ConfidenceHeadConfig
+from ..config import (
+    BinConfig,
+    ConfidenceHeadConfig,
+    FixedBinConfig,
+    LogBinConfig,
+)
 from ..identity import cache_id, code_identity, experiment_id, sha256_file
 from ..labels import energy_errors, force_errors
 from ..run_naming import make_run_tag
@@ -95,12 +100,16 @@ def _fit_branch(
     config: BinConfig,
 ) -> BranchBinning:
     if algorithm == "fixed_linear_v1":
+        if not isinstance(config, FixedBinConfig):
+            raise ValueError("fixed_linear_v1 binning config differs")
         return fit_fixed_linear(
             values,
             num_bins=config.num_bins,
             max_error=config.max_error,
         )
     if algorithm == "train_quantile_log_v1":
+        if not isinstance(config, LogBinConfig):
+            raise ValueError("train_quantile_log_v1 binning config differs")
         return fit_train_quantile_log(values, num_bins=config.num_bins)
     raise ValueError("binning algorithm is unsupported")
 
@@ -134,17 +143,14 @@ def _payload_equal(left: object, right: object) -> bool:
 
 
 def _branch_diagnostics(branch: BranchBinning) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "num_bins": branch.num_bins,
-        "counts": branch.counts.tolist(),
-        "representative_sources": list(branch.representative_sources),
-        "overflow_count": branch.overflow_count,
+    return {
+        key: value.tolist()
+        if isinstance(value, torch.Tensor)
+        else list(value)
+        if isinstance(value, tuple)
+        else value
+        for key, value in branch.to_payload().items()
     }
-    if branch.algorithm == "fixed_linear_v1":
-        payload.update({"max_error": branch.max_error, "bin_width": branch.bin_width})
-    else:
-        payload.update({"lower": branch.lower, "upper": branch.upper})
-    return payload
 
 
 def _manifest_payload(
@@ -192,12 +198,15 @@ def _validate_existing(
     *,
     train_structure_count: int,
     train_atom_count: int,
+    force_target_mode: str | None,
 ) -> None:
     artifact_path = root / "binning.pt"
     manifest_path = root / "binning_manifest.json"
     try:
         payload = load_torch_artifact(artifact_path)
-        actual = BinningArtifact.from_payload(payload)
+        actual = BinningArtifact.from_payload(
+            payload, force_target_mode=force_target_mode
+        )
     except Exception as error:
         raise BinningIdentityError(
             f"existing binning artifact differs: {error}"
@@ -221,6 +230,7 @@ def _persist_or_reuse(
     *,
     train_structure_count: int,
     train_atom_count: int,
+    force_target_mode: str | None,
 ) -> None:
     artifact_path = root / "binning.pt"
     manifest_path = root / "binning_manifest.json"
@@ -236,6 +246,7 @@ def _persist_or_reuse(
             artifact,
             train_structure_count=train_structure_count,
             train_atom_count=train_atom_count,
+            force_target_mode=force_target_mode,
         )
         return
     if root.exists() and any(root.iterdir()):
@@ -243,7 +254,10 @@ def _persist_or_reuse(
     root.mkdir(parents=True, exist_ok=True)
     atomic_torch_save(artifact_path, artifact.to_payload())
     try:
-        reloaded = BinningArtifact.from_payload(load_torch_artifact(artifact_path))
+        reloaded = BinningArtifact.from_payload(
+            load_torch_artifact(artifact_path),
+            force_target_mode=force_target_mode,
+        )
     except Exception as error:
         raise BinningIdentityError(
             f"new binning artifact failed validation: {error}"
@@ -264,6 +278,7 @@ def _persist_or_reuse(
         artifact,
         train_structure_count=train_structure_count,
         train_atom_count=train_atom_count,
+        force_target_mode=force_target_mode,
     )
 
 
@@ -324,6 +339,9 @@ def run_fit_bins(config: ConfidenceHeadConfig) -> Path:
         experiment_id=experiment_identity,
         algorithm=config.binning.algorithm,
         branches=branches,
+        force_target_mode=(
+            config.model.force.target_mode if config.force_enabled else None
+        ),
     )
     root = _binning_root(config, experiment_identity)
     _persist_or_reuse(
@@ -331,5 +349,8 @@ def run_fit_bins(config: ConfidenceHeadConfig) -> Path:
         artifact,
         train_structure_count=train_structure_count,
         train_atom_count=train_atom_count,
+        force_target_mode=(
+            config.model.force.target_mode if config.force_enabled else None
+        ),
     )
     return root
