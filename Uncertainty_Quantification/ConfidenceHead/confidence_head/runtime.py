@@ -148,6 +148,11 @@ def restore_rng_state(state: object) -> None:
         )
         for index, item in enumerate(cuda_states)
     ]
+    cpu_validator = torch.Generator(device="cpu")
+    cpu_validator.set_state(cpu_state)
+    for index, cuda_state in enumerate(checked_cuda):
+        cuda_validator = torch.Generator(device=f"cuda:{index}")
+        cuda_validator.set_state(cuda_state)
 
     # Validation is complete before any process RNG is changed.
     try:

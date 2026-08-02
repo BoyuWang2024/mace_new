@@ -188,6 +188,77 @@ def test_restore_rng_state_rejects_corrupt_or_incompatible_state(
         restore_rng_state(state)
 
 
+def test_restore_rejects_internally_corrupt_torch_state_before_mutating_any_rng() -> (
+    None
+):
+    configure_runtime(seed=11, deterministic=True, device="cpu")
+    corrupt = capture_rng_state()
+    corrupt["torch_cpu"] = torch.zeros_like(corrupt["torch_cpu"])
+
+    configure_runtime(seed=22, deterministic=True, device="cpu")
+    before = capture_rng_state()
+    with pytest.raises(RuntimeError, match="state"):
+        restore_rng_state(corrupt)
+    after = capture_rng_state()
+
+    assert after["python"] == before["python"]
+    assert after["numpy"]["algorithm"] == before["numpy"]["algorithm"]
+    assert torch.equal(after["numpy"]["keys"], before["numpy"]["keys"])
+    assert after["numpy"]["position"] == before["numpy"]["position"]
+    assert after["numpy"]["has_gauss"] == before["numpy"]["has_gauss"]
+    assert after["numpy"]["cached_gaussian"] == before["numpy"]["cached_gaussian"]
+    assert torch.equal(after["torch_cpu"], before["torch_cpu"])
+    assert len(after["torch_cuda"]) == len(before["torch_cuda"])
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(after["torch_cuda"], before["torch_cuda"])
+    )
+
+
+def test_restore_prevalidates_each_cuda_state_before_global_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_runtime(seed=31, deterministic=True, device="cpu")
+    corrupt = capture_rng_state()
+    corrupt["torch_cuda"] = [torch.zeros(4, dtype=torch.uint8)]
+
+    configure_runtime(seed=32, deterministic=True, device="cpu")
+    before_python = random.getstate()
+    before_numpy = np.random.get_state()
+    before_torch = torch.get_rng_state().clone()
+    current_cuda = torch.ones(4, dtype=torch.uint8)
+    validated_devices: list[str] = []
+
+    class ValidatingGenerator:
+        def __init__(self, device: object) -> None:
+            self.device = str(device)
+            validated_devices.append(self.device)
+
+        def set_state(self, state: torch.Tensor) -> None:
+            if self.device == "cuda:0":
+                raise RuntimeError("corrupt CUDA state")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [current_cuda])
+    monkeypatch.setattr(torch, "Generator", ValidatingGenerator)
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_rng_state_all",
+        lambda _: (_ for _ in ()).throw(AssertionError("global CUDA commit occurred")),
+    )
+
+    with pytest.raises(RuntimeError, match="corrupt CUDA state"):
+        restore_rng_state(corrupt)
+
+    after_numpy = np.random.get_state()
+    assert random.getstate() == before_python
+    assert after_numpy[0] == before_numpy[0]
+    assert np.array_equal(after_numpy[1], before_numpy[1])
+    assert after_numpy[2:] == before_numpy[2:]
+    assert torch.equal(torch.get_rng_state(), before_torch)
+    assert validated_devices == ["cpu", "cuda:0"]
+
+
 def test_environment_snapshot_is_exact_json_data_with_git_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
