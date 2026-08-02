@@ -1,0 +1,81 @@
+profile: production
+
+checkpoint:
+  path: /home/bywang/code/UQ/mace/UQ_orb_post_train_force/data/MACE-matpes-r2scan-omat-ft.model
+  expected_sha256: 8f147ecffa1d06a696e5648b13b81abda9c96fda9d0fb3faba3cd3fb27d9bba9
+  feature_modules:
+    - name: products.0
+      expected_dim: 512
+    - name: products.1
+      expected_dim: 128
+
+data:
+  train:
+    path: /home/bywang/code/UQ/mace/UQ_orb_post_train_force/data/matpes_train.extxyz
+    expected_sha256: 12ff9403254c955537827ba96c140ee1753a7410ada7910f13c42be0aa308cec
+  validation:
+    path: /home/bywang/code/UQ/mace/UQ_orb_post_train_force/data/matpes_val.extxyz
+    expected_sha256: 5b2ce7f0835f0f69d27840116608ee264536d2cc0ac253a33625ece29f985eef
+  test:
+    path: /home/bywang/code/UQ/mace/UQ_orb_post_train_force/data/matpes_test.extxyz
+    expected_sha256: 1ffcdcad2fc6f0b0907b91cd29bfee340eb02cddf6b525268290c6329f56182d
+
+cache:
+  build_batch_size: 32
+  shard_max_atoms: 100000
+  num_workers: 0
+  pin_memory: true
+  resume: true
+
+binning:
+  algorithm: fixed_linear_v1
+  force:
+    num_bins: 50
+    max_error: 0.3
+  energy:
+    num_bins: 50
+    max_error: 0.5
+
+model:
+  force:
+    target_mode: atom_mean
+    hidden_dims: [256, 256, 256]
+    dropout: 0.0
+  energy:
+    cumulant_order: 6
+    projection_dim: 512
+    adapter_dropout: 0.0
+    hidden_dims: [256, 256]
+    dropout: 0.0
+    signed_root: true
+
+loss:
+  force_coefficient: 0.0
+  energy_coefficient: 1.0
+
+optimizer:
+  name: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+trainer:
+  batch_size: 32
+  max_epochs: 100
+  early_stopping_patience: 20
+  resume: true
+
+runtime:
+  seed: 1234
+  device: cuda
+  deterministic: true
+
+logging:
+  jsonl: true
+  wandb: true
+  wandb_project: mace-confidence-head
+  wandb_mode: auto
+
+run:
+  name_prefix: mace_matpes_full
+  output_root: /home/bywang/code/UQ/mace_new/Uncertainty_Quantification/ConfidenceHead/outputs
+

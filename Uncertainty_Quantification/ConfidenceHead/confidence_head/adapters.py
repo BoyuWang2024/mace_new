@@ -77,8 +77,8 @@ class LocalToGlobalCumulantAdapter(nn.Module):
         super().__init__()
         self.input_dim = _positive_integer(input_dim, "input_dim")
         self.order = _positive_integer(order, "order")
-        if self.order > 5:
-            raise ValueError("order must be in 1..5")
+        if self.order > 8:
+            raise ValueError("order must be in 1..8")
         self.projection_dim = _positive_integer(projection_dim, "projection_dim")
         if not isinstance(signed_root, bool):
             raise ValueError("signed_root must be a boolean")

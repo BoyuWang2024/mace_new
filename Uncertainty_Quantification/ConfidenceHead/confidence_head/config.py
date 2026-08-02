@@ -316,8 +316,8 @@ def _model(value: Any) -> ModelConfig:
         raise ConfigError("model.force.target_mode must be atom_mean or component")
     energy = _keys(mapping["energy"], {"cumulant_order", "projection_dim", "adapter_dropout", "hidden_dims", "dropout", "signed_root"}, "model.energy")
     order = _int(energy["cumulant_order"], "model.energy.cumulant_order")
-    if not 1 <= order <= 5:
-        raise ConfigError("model.energy.cumulant_order must be in 1..5")
+    if not 1 <= order <= 8:
+        raise ConfigError("model.energy.cumulant_order must be in 1..8")
     projection_dim = _int(energy["projection_dim"], "model.energy.projection_dim")
     if projection_dim != 512:
         raise ConfigError("model.energy.projection_dim must be 512")

@@ -24,7 +24,7 @@ def _scalar_cumulants(values: torch.Tensor, order: int) -> torch.Tensor:
     return torch.stack([value for value in cumulants[1:] if value is not None])
 
 
-@pytest.mark.parametrize("order", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("order", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_cumulants_match_scalar_reference(order: int) -> None:
     values = torch.tensor([[1.0], [2.0], [4.0]], dtype=torch.float64)
     adapter = LocalToGlobalCumulantAdapter(
@@ -175,7 +175,7 @@ def test_adapter_rejects_invalid_features_and_offsets(
         (0, 1, 4, True, 0.0),
         (True, 1, 4, True, 0.0),
         (2, 0, 4, True, 0.0),
-        (2, 6, 4, True, 0.0),
+        (2, 9, 4, True, 0.0),
         (2, 1, 0, True, 0.0),
         (2, 1, 4, True, -0.1),
         (2, 1, 4, True, 1.0),

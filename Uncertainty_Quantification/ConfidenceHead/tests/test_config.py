@@ -107,8 +107,8 @@ def test_binning_requires_at_least_three_bins(tmp_path: Path, num_bins: int) -> 
         load_config(path)
 
 
-@pytest.mark.parametrize("order", [0, 6])
-def test_energy_cumulant_order_is_limited_to_one_through_five(
+@pytest.mark.parametrize("order", [0, 9])
+def test_energy_cumulant_order_is_limited_to_one_through_eight(
     tmp_path: Path, order: int
 ) -> None:
     path = write_valid_config(tmp_path)
