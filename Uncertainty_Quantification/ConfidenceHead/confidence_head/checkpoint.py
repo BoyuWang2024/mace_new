@@ -143,6 +143,12 @@ class TrainingState:
             if self.best_epoch >= self.next_epoch:
                 raise ValueError("best_epoch must precede next_epoch")
         _exact_int(self.bad_epochs, "bad_epochs")
+        if self.best_epoch is not None:
+            expected_bad_epochs = self.next_epoch - self.best_epoch - 1
+            if self.bad_epochs != expected_bad_epochs:
+                raise ValueError("bad_epochs must equal next_epoch - best_epoch - 1")
+        if self.best_epoch is None and self.bad_epochs != 0:
+            raise ValueError("initial training state cannot contain bad epochs")
         if type(self.completed) is not bool:
             raise ValueError("completed must be a boolean")
 
@@ -265,6 +271,24 @@ def save_best(
     return destination
 
 
+def _validate_resume_semantics(
+    state: TrainingState, validation_metrics: Mapping[str, int | float]
+) -> None:
+    if state.best_epoch is None:
+        raise ValueError("committed checkpoint requires a best epoch")
+    epoch = state.next_epoch - 1
+    current_total = float(validation_metrics["total_loss"])
+    if epoch == state.best_epoch:
+        if state.bad_epochs != 0 or current_total != state.best_validation_loss:
+            raise ValueError(
+                "current best checkpoint validation total differs from best loss"
+            )
+    elif current_total < state.best_validation_loss:
+        raise ValueError(
+            "non-best checkpoint validation total cannot be below best loss"
+        )
+
+
 def save_last(
     path: Path,
     *,
@@ -277,7 +301,11 @@ def save_last(
     """Atomically commit the complete resume state after an epoch event."""
     if not isinstance(state, TrainingState) or state.next_epoch < 1:
         raise ValueError("last checkpoint requires committed TrainingState")
+    adamw = _require_adamw(optimizer)
     model_parameters = {id(parameter) for parameter in model.parameters()}
+    checked_metrics = _metrics(dict(validation_metrics))
+    _validate_resume_semantics(state, checked_metrics)
+    checked_optimizer = _validate_optimizer(adamw.state_dict(), adamw)
     optimizer_parameters = {
         id(parameter)
         for group in optimizer.param_groups
@@ -290,12 +318,12 @@ def save_last(
         model=model,
         identity=identity,
         epoch=state.next_epoch - 1,
-        validation_metrics=validation_metrics,
+        validation_metrics=checked_metrics,
     )
     payload.update(
         {
             "next_epoch": state.next_epoch,
-            "optimizer_state": _portable(optimizer.state_dict(), "optimizer state"),
+            "optimizer_state": checked_optimizer,
             "early_stopping_state": early,
             "best_epoch": state.best_epoch,
             "best_validation_loss": state.best_validation_loss,
@@ -355,17 +383,101 @@ def _validate_saved_model(
     return checked
 
 
+def _require_adamw(
+    optimizer: torch.optim.Optimizer,
+) -> torch.optim.AdamW:
+    if type(optimizer) is not torch.optim.AdamW:
+        raise ValueError("optimizer must be exactly torch.optim.AdamW")
+    return optimizer
+
+
 def _validate_optimizer(
     value: object, optimizer: torch.optim.Optimizer
 ) -> dict[str, Any]:
+    adamw = _require_adamw(optimizer)
     state = _portable(value, "optimizer state")
     if type(state) is not dict or set(state) != {"state", "param_groups"}:
         raise ValueError("optimizer state schema differs")
-    candidate = copy.deepcopy(optimizer)
-    try:
-        candidate.load_state_dict(copy.deepcopy(state))
-    except (KeyError, TypeError, ValueError, RuntimeError) as error:
-        raise ValueError(f"optimizer state is incompatible: {error}") from error
+    saved_groups = state["param_groups"]
+    current_groups = adamw.state_dict()["param_groups"]
+    if (
+        not isinstance(saved_groups, list)
+        or len(saved_groups) != len(current_groups)
+        or len(saved_groups) != len(adamw.param_groups)
+    ):
+        raise ValueError("optimizer param_groups differ")
+
+    parameter_by_id: dict[int, nn.Parameter] = {}
+    amsgrad_by_id: dict[int, bool] = {}
+    ordered_ids: list[int] = []
+    for index, (saved, current, live) in enumerate(
+        zip(saved_groups, current_groups, adamw.param_groups)
+    ):
+        if type(saved) is not dict or set(saved) != set(current):
+            raise ValueError(f"optimizer param_group {index} schema differs")
+        saved_ids = saved["params"]
+        current_ids = current["params"]
+        live_parameters = live["params"]
+        if (
+            not isinstance(saved_ids, list)
+            or saved_ids != current_ids
+            or len(saved_ids) != len(live_parameters)
+            or any(type(identifier) is not int for identifier in saved_ids)
+        ):
+            raise ValueError(f"optimizer param_group {index} params mapping differs")
+        for key, current_value in current.items():
+            if key == "params":
+                continue
+            saved_value = saved[key]
+            if (
+                type(saved_value) is not type(current_value)
+                or saved_value != current_value
+            ):
+                raise ValueError(
+                    f"optimizer param_group {index} hyperparameter {key} differs"
+                )
+        for identifier, parameter in zip(saved_ids, live_parameters):
+            if identifier in parameter_by_id:
+                raise ValueError("optimizer parameter mapping contains duplicates")
+            parameter_by_id[identifier] = parameter
+            amsgrad_by_id[identifier] = current["amsgrad"]
+            ordered_ids.append(identifier)
+
+    raw_state = state["state"]
+    if type(raw_state) is not dict or set(raw_state) != set(ordered_ids):
+        raise ValueError("optimizer state parameter coverage differs")
+    for identifier in ordered_ids:
+        entry = raw_state[identifier]
+        expected_keys = {"step", "exp_avg", "exp_avg_sq"}
+        if amsgrad_by_id[identifier]:
+            expected_keys.add("max_exp_avg_sq")
+        if type(entry) is not dict or set(entry) != expected_keys:
+            raise ValueError(f"optimizer state {identifier} keys differ")
+        parameter = parameter_by_id[identifier]
+        for name in expected_keys - {"step"}:
+            moment = entry[name]
+            if (
+                not isinstance(moment, torch.Tensor)
+                or moment.device.type != "cpu"
+                or moment.shape != parameter.shape
+                or moment.dtype != parameter.dtype
+                or not bool(torch.isfinite(moment).all().item())
+            ):
+                raise ValueError(
+                    f"optimizer state {identifier} {name} metadata differs"
+                )
+        step = entry["step"]
+        if (
+            not isinstance(step, torch.Tensor)
+            or step.device.type != "cpu"
+            or step.dtype != torch.float32
+            or step.ndim != 0
+            or not bool(torch.isfinite(step).item())
+        ):
+            raise ValueError(f"optimizer state {identifier} step differs")
+        step_value = float(step.item())
+        if step_value < 0.0 or not step_value.is_integer():
+            raise ValueError(f"optimizer state {identifier} step differs")
     return state
 
 
@@ -398,7 +510,7 @@ def load_last(
     next_epoch = _exact_int(payload["next_epoch"], "next_epoch", minimum=1)
     if next_epoch != epoch + 1:
         raise ValueError("checkpoint next_epoch is inconsistent")
-    _metrics(payload["validation_metrics"])
+    checked_metrics = _metrics(payload["validation_metrics"])
     early = EarlyStoppingState.from_payload(payload["early_stopping_state"])
     best_epoch = _exact_int(payload["best_epoch"], "best_epoch")
     best_loss = _finite_float(payload["best_validation_loss"], "best_validation_loss")
@@ -411,6 +523,7 @@ def load_last(
     state = TrainingState(
         next_epoch, best_epoch, best_loss, early.bad_epochs, payload["completed"]
     )
+    _validate_resume_semantics(state, checked_metrics)
     checked_model = _validate_saved_model(payload, model)
     checked_optimizer = _validate_optimizer(payload["optimizer_state"], optimizer)
     checked_rng = _prevalidate_rng(payload["rng_state"])

@@ -61,6 +61,14 @@ def _model(config, *, feature_dim: int = 4) -> MultiBranchConfidenceModel:
     return MultiBranchConfidenceModel.from_config(config, feature_dim=feature_dim)
 
 
+def _prime_adamw(model: nn.Module, optimizer: torch.optim.AdamW) -> None:
+    optimizer.zero_grad(set_to_none=True)
+    loss = sum(parameter.square().sum() for parameter in model.parameters())
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
 def _artifact(config) -> BinningArtifact:
     branches = {}
     if config.force_enabled:
@@ -146,6 +154,7 @@ def test_best_and_last_checkpoint_exact_model_only_and_resume_keys(tmp_path: Pat
     config = _config(tmp_path)
     model = _model(config)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    _prime_adamw(model, optimizer)
     metrics = {"force_loss": 0.4, "energy_loss": 0.2, "total_loss": 0.46}
 
     best_path = save_best(
@@ -239,6 +248,72 @@ def test_save_last_rejects_optimizer_bound_to_another_model(tmp_path: Path):
         )
 
 
+def test_save_load_and_trainer_reject_non_adamw_optimizer(tmp_path: Path):
+    config = _config(tmp_path)
+    model = _model(config)
+    sgd = torch.optim.SGD(model.parameters(), lr=1e-3)
+    with pytest.raises(ValueError, match="AdamW"):
+        save_last(
+            tmp_path / "sgd-last.pt",
+            model=model,
+            optimizer=sgd,
+            identity=IDENTITY,
+            validation_metrics={"total_loss": 0.5},
+            state=TrainingState(1, 0, 0.5, 0, False),
+        )
+
+    adamw = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    _prime_adamw(model, adamw)
+    path = save_last(
+        tmp_path / "last.pt",
+        model=model,
+        optimizer=adamw,
+        identity=IDENTITY,
+        validation_metrics={"total_loss": 0.5},
+        state=TrainingState(1, 0, 0.5, 0, False),
+    )
+    target = _model(config)
+    target_sgd = torch.optim.SGD(target.parameters(), lr=1e-3)
+    with pytest.raises(ValueError, match="AdamW"):
+        load_last(path, target, target_sgd, IDENTITY)
+
+    logger = _logger(tmp_path / "events-sgd.jsonl")
+    try:
+        with pytest.raises(ValueError, match="AdamW"):
+            ConfidenceTrainer(
+                model=target,
+                optimizer=target_sgd,
+                config=config,
+                binning=_artifact(config),
+                device=torch.device("cpu"),
+                logger=logger,
+                identity=IDENTITY,
+                best_path=tmp_path / "best.pt",
+                last_path=tmp_path / "trainer-last.pt",
+            )
+    finally:
+        logger.close()
+
+
+def _first_optimizer_entry(payload: dict[str, Any]) -> dict[str, Any]:
+    return next(iter(payload["optimizer_state"]["state"].values()))
+
+
+def _drop_optimizer_parameter_state(payload: dict[str, Any]) -> None:
+    state = payload["optimizer_state"]["state"]
+    state.pop(next(iter(state)))
+
+
+def _add_optimizer_parameter_state(payload: dict[str, Any]) -> None:
+    state = payload["optimizer_state"]["state"]
+    state[max(state) + 1] = copy.deepcopy(next(iter(state.values())))
+
+
+def _append_optimizer_param_group(payload: dict[str, Any]) -> None:
+    groups = payload["optimizer_state"]["param_groups"]
+    groups.append(copy.deepcopy(groups[0]))
+
+
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [
@@ -255,6 +330,51 @@ def test_save_last_rejects_optimizer_bound_to_another_model(tmp_path: Path):
                 next(iter(payload["parameter_schema"]))
             ),
             "schema",
+        ),
+        (
+            lambda payload: _first_optimizer_entry(payload).update(
+                exp_avg=_first_optimizer_entry(payload)["exp_avg"].reshape(-1)
+            ),
+            "optimizer",
+        ),
+        (
+            lambda payload: _first_optimizer_entry(payload).update(
+                exp_avg_sq=_first_optimizer_entry(payload)["exp_avg_sq"].double()
+            ),
+            "optimizer",
+        ),
+        (
+            lambda payload: _first_optimizer_entry(payload).pop("exp_avg"),
+            "optimizer",
+        ),
+        (
+            lambda payload: _first_optimizer_entry(payload).update(
+                unexpected=torch.tensor(0.0)
+            ),
+            "optimizer",
+        ),
+        (
+            lambda payload: _first_optimizer_entry(payload).update(
+                step=torch.tensor(-1.5)
+            ),
+            "optimizer",
+        ),
+        (_drop_optimizer_parameter_state, "optimizer"),
+        (_add_optimizer_parameter_state, "optimizer"),
+        (_append_optimizer_param_group, "optimizer"),
+        (
+            lambda payload: payload["optimizer_state"]["param_groups"][0].update(
+                params=list(
+                    reversed(payload["optimizer_state"]["param_groups"][0]["params"])
+                )
+            ),
+            "optimizer",
+        ),
+        (
+            lambda payload: payload["optimizer_state"]["param_groups"][0].update(
+                lr=0.002
+            ),
+            "optimizer",
         ),
         (lambda payload: payload.pop("optimizer_state"), "keys"),
         (lambda payload: payload.pop("rng_state"), "keys"),
@@ -290,6 +410,7 @@ def test_load_last_rejects_corruption_before_model_or_rng_mutation(
     config = _config(tmp_path)
     source = _model(config)
     source_optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    _prime_adamw(source, source_optimizer)
     path = save_last(
         tmp_path / "last.pt",
         model=source,
@@ -305,10 +426,12 @@ def test_load_last_rejects_corruption_before_model_or_rng_mutation(
     target = _model(config)
     target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
     before_model = copy.deepcopy(target.state_dict())
+    before_optimizer = copy.deepcopy(target_optimizer.state_dict())
     before_rng = capture_rng_state()
     with pytest.raises((TypeError, ValueError, RuntimeError), match=match):
         load_last(path, target, target_optimizer, IDENTITY)
     assert _nested_equal(before_model, target.state_dict())
+    assert _nested_equal(before_optimizer, target_optimizer.state_dict())
     assert _nested_equal(before_rng, capture_rng_state())
 
 
@@ -316,6 +439,7 @@ def test_load_last_rejects_parameter_shape_and_dtype_mismatch(tmp_path: Path):
     config = _config(tmp_path)
     model = _model(config)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    _prime_adamw(model, optimizer)
     path = save_last(
         tmp_path / "last.pt",
         model=model,
@@ -341,6 +465,65 @@ def test_load_last_rejects_parameter_shape_and_dtype_mismatch(tmp_path: Path):
             validation_metrics={"total_loss": 0.5},
             state=TrainingState(1, 0, 0.5, 0, False),
         )
+
+
+@pytest.mark.parametrize(
+    ("state", "current_total", "mutation"),
+    [
+        (
+            TrainingState(2, 0, 0.5, 1, False),
+            0.6,
+            lambda payload: payload["early_stopping_state"].update(bad_epochs=0),
+        ),
+        (
+            TrainingState(2, 0, 0.5, 1, False),
+            0.6,
+            lambda payload: payload.update(epoch=0),
+        ),
+        (
+            TrainingState(1, 0, 0.5, 0, False),
+            0.5,
+            lambda payload: payload["validation_metrics"].update(total_loss=0.6),
+        ),
+        (
+            TrainingState(2, 0, 0.5, 1, False),
+            0.6,
+            lambda payload: payload["validation_metrics"].update(total_loss=0.4),
+        ),
+    ],
+)
+def test_load_last_rejects_inconsistent_resume_semantics_before_mutation(
+    tmp_path: Path,
+    state: TrainingState,
+    current_total: float,
+    mutation,
+):
+    config = _config(tmp_path)
+    source = _model(config)
+    source_optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    _prime_adamw(source, source_optimizer)
+    path = save_last(
+        tmp_path / "semantic-last.pt",
+        model=source,
+        optimizer=source_optimizer,
+        identity=IDENTITY,
+        validation_metrics={"total_loss": current_total},
+        state=state,
+    )
+    payload = load_torch_artifact(path)
+    mutation(payload)
+    torch.save(payload, path)
+
+    target = _model(config)
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
+    before_model = copy.deepcopy(target.state_dict())
+    before_optimizer = copy.deepcopy(target_optimizer.state_dict())
+    before_rng = capture_rng_state()
+    with pytest.raises(ValueError, match="checkpoint|early|best|validation"):
+        load_last(path, target, target_optimizer, IDENTITY)
+    assert _nested_equal(before_model, target.state_dict())
+    assert _nested_equal(before_optimizer, target_optimizer.state_dict())
+    assert _nested_equal(before_rng, capture_rng_state())
 
 
 def test_early_stopping_strict_improvement_equality_and_patience():
@@ -552,6 +735,52 @@ def test_epochs_reject_empty_batches_and_nonfinite_data(tmp_path: Path, method: 
     trainer.logger.close()
 
 
+@pytest.mark.parametrize(
+    ("updates", "state"),
+    [
+        (
+            {"trainer.max_epochs": 8, "trainer.early_stopping_patience": 2},
+            TrainingState(3, 0, 0.5, 2, False),
+        ),
+        (
+            {"trainer.max_epochs": 3, "trainer.early_stopping_patience": 4},
+            TrainingState(3, 2, 0.5, 0, False),
+        ),
+    ],
+)
+def test_fit_rejects_unmarked_terminal_resume_before_requesting_batches(
+    tmp_path: Path, updates: dict[str, Any], state: TrainingState
+):
+    config = _config(tmp_path, **updates)
+    model = _model(config)
+    logger = _logger(tmp_path / "terminal-events.jsonl")
+    for epoch in range(state.next_epoch):
+        logger.append_epoch({"epoch": epoch})
+    trainer = ConfidenceTrainer(
+        model=model,
+        optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+        config=config,
+        binning=_artifact(config),
+        device=torch.device("cpu"),
+        logger=logger,
+        identity=IDENTITY,
+        best_path=tmp_path / "best.pt",
+        last_path=tmp_path / "last.pt",
+    )
+    requested: list[int] = []
+
+    def train_factory(epoch: int):
+        requested.append(epoch)
+        return []
+
+    try:
+        with pytest.raises(ValueError, match="completed|terminal"):
+            trainer.fit(train_factory, lambda: [], state=state)
+        assert requested == []
+    finally:
+        logger.close()
+
+
 class ControlledEpochStop(RuntimeError):
     pass
 
@@ -640,9 +869,11 @@ def test_fit_stops_on_patience_and_marks_last_completed(tmp_path: Path, monkeypa
         tmp_path, **{"trainer.max_epochs": 8, "trainer.early_stopping_patience": 2}
     )
     model = _model(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    _prime_adamw(model, optimizer)
     trainer = ConfidenceTrainer(
         model=model,
-        optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+        optimizer=optimizer,
         config=config,
         binning=_artifact(config),
         device=torch.device("cpu"),

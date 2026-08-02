@@ -44,6 +44,8 @@ class ConfidenceTrainer:
             raise TypeError("model must be a torch module")
         if not isinstance(optimizer, torch.optim.Optimizer):
             raise TypeError("optimizer must be a torch optimizer")
+        if type(optimizer) is not torch.optim.AdamW:
+            raise ValueError("optimizer must be exactly torch.optim.AdamW")
         if not isinstance(config, ConfidenceHeadConfig):
             raise TypeError("config must be a ConfidenceHeadConfig")
         if not isinstance(binning, BinningArtifact):
@@ -318,8 +320,10 @@ class ConfidenceTrainer:
             raise TypeError("state must be a TrainingState")
         if current.completed:
             raise ValueError("training state is already completed")
-        if current.next_epoch > self.config.trainer.max_epochs:
-            raise ValueError("next_epoch exceeds configured max_epochs")
+        if current.next_epoch >= self.config.trainer.max_epochs:
+            raise ValueError("training state is terminal at configured max_epochs")
+        if current.bad_epochs >= self.config.trainer.early_stopping_patience:
+            raise ValueError("training state is terminal at early-stopping patience")
         expected_last_event = current.next_epoch - 1 if current.next_epoch else None
         if self.logger.local.last_epoch != expected_last_event:
             raise ValueError("event log does not match the checkpoint boundary")
