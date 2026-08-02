@@ -905,6 +905,13 @@ def _write_shuffle_cache(root: Path):
         )
     )
     writer.finalize_split("train")
+    writer.append(
+        batch_with_atom_counts(
+            [2], structure_prefix="validation"
+        ),
+        split="validation",
+    )
+    writer.finalize_split("validation")
     return writer.finalize()
 
 
@@ -1059,32 +1066,70 @@ def test_shuffled_iterator_does_not_mutate_global_rng_states(
     assert torch.equal(torch.random.get_rng_state(), torch_state)
 
 
-def test_shuffled_iterator_consumes_each_shard_once_in_permuted_order(
+def test_shuffled_iterator_audits_all_shards_before_streaming_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import confidence_head.cache as cache_module
     from confidence_head.cache import iter_shuffled_cache_batches
 
     manifest = _write_shuffle_cache(tmp_path)
-    original = cache_module._load_iterator_shard
-    loaded: list[int] = []
+    original_safe_load = cache_module._safe_load_torch
+    original_iterator_load = cache_module._load_iterator_shard
+    events: list[tuple[str, str, int]] = []
 
-    def recording_loader(*args, **kwargs):
+    def recording_safe_load(path: Path, where: str):
+        if path.name.startswith("shard-"):
+            events.append(
+                ("load", path.parent.name, int(path.stem.split("-")[1]))
+            )
+        return original_safe_load(path, where)
+
+    def recording_iterator_load(*args, **kwargs):
         shard = kwargs["shard"]
-        loaded.append(shard.shard_index)
-        return original(*args, **kwargs)
+        events.append(("consume", kwargs["split"], shard.shard_index))
+        return original_iterator_load(*args, **kwargs)
 
     monkeypatch.setattr(
-        cache_module, "_load_iterator_shard", recording_loader
+        cache_module, "_safe_load_torch", recording_safe_load
+    )
+    monkeypatch.setattr(
+        cache_module, "_load_iterator_shard", recording_iterator_load
     )
 
     iterator = iter_shuffled_cache_batches(manifest, "train", 2, seed=7)
     next(iterator)
-    assert len(loaded) == 1
+
+    first_consume = next(
+        index
+        for index, event in enumerate(events)
+        if event[0] == "consume"
+    )
+    audited = {
+        (split, shard_index)
+        for event, split, shard_index in events[:first_consume]
+        if event == "load"
+    }
+    declared = {
+        (split, shard.shard_index)
+        for split, shards in manifest.splits.items()
+        for shard in shards
+    }
+    assert audited == declared
+    assert first_consume == len(declared)
+    assert [
+        event for event in events if event[0] == "consume"
+    ] == [("consume", "train", 1)]
+
     list(iterator)
 
-    assert sorted(loaded) == [0, 1]
-    assert loaded != [0, 1]
+    consumed = [
+        event for event in events if event[0] == "consume"
+    ]
+    assert sorted(consumed) == [
+        ("consume", "train", 0),
+        ("consume", "train", 1),
+    ]
+    assert len(consumed) == len(manifest.splits["train"])
 
 
 @pytest.mark.parametrize("seed", [True, -1, 2**63])
@@ -1131,7 +1176,7 @@ def test_shuffled_iterator_empty_split_and_tampering_contracts(
     manifest = _write_shuffle_cache(tmp_path)
     assert list(
         iter_shuffled_cache_batches(
-            manifest, "validation", 2, seed=0
+            manifest, "test", 2, seed=0
         )
     ) == []
 
@@ -1142,6 +1187,26 @@ def test_shuffled_iterator_empty_split_and_tampering_contracts(
                 manifest, "train", 2, seed=0
             )
         )
+
+
+def test_shuffled_iterator_rejects_non_target_corruption_before_first_yield(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import (
+        CacheCorruptionError,
+        iter_shuffled_cache_batches,
+    )
+
+    manifest = _write_shuffle_cache(tmp_path)
+    (tmp_path / "validation" / "shard-000000.pt").write_bytes(
+        b"corrupt"
+    )
+
+    iterator = iter_shuffled_cache_batches(
+        manifest, "train", batch_size=2, seed=7
+    )
+    with pytest.raises(CacheCorruptionError, match="validation"):
+        next(iterator)
 
 
 @pytest.mark.parametrize("batch_size", [True, 0])
