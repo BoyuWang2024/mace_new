@@ -119,8 +119,13 @@ class LocalToGlobalCumulantAdapter(nn.Module):
         transformed = [raw_cumulants[0]]
         for rank, cumulant in enumerate(raw_cumulants[1:], start=2):
             if self.signed_root:
+                zero = cumulant == 0
+                safe_magnitude = torch.where(
+                    zero, torch.ones_like(cumulant), torch.abs(cumulant)
+                )
+                rooted = torch.sign(cumulant) * safe_magnitude.pow(1.0 / rank)
                 transformed.append(
-                    torch.sign(cumulant) * torch.abs(cumulant).pow(1.0 / rank)
+                    torch.where(zero, torch.zeros_like(cumulant), rooted)
                 )
             else:
                 transformed.append(cumulant)

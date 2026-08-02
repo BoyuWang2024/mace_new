@@ -79,6 +79,27 @@ def test_signed_root_preserves_negative_third_cumulant() -> None:
     assert rooted_result[0, 2] == pytest.approx(-(-expected_raw[2]).pow(1 / 3))
 
 
+def test_zero_high_order_cumulants_have_finite_gradients() -> None:
+    features = torch.full((2, 1), 2.0, requires_grad=True)
+    adapter = LocalToGlobalCumulantAdapter(
+        1, 3, projection_dim=4, signed_root=True, dropout=0.0
+    )
+
+    cumulants = adapter.cumulants(features, torch.tensor([0, 2]))
+    output = adapter(features, torch.tensor([0, 2]))
+    weights = torch.arange(1, output.numel() + 1, dtype=output.dtype).reshape_as(output)
+    (output * weights).sum().backward()
+
+    assert torch.equal(cumulants, torch.tensor([[2.0, 0.0, 0.0]]))
+    assert features.grad is not None
+    assert torch.isfinite(features.grad).all()
+    projection_gradient = adapter.projection.weight.grad
+    assert projection_gradient is not None
+    assert torch.isfinite(projection_gradient).all()
+    assert torch.count_nonzero(projection_gradient[:, 0]) > 0
+    assert torch.count_nonzero(projection_gradient[:, 1:]) == 0
+
+
 def test_energy_projection_and_features_receive_finite_nonzero_gradients() -> None:
     torch.manual_seed(7)
     features = torch.randn(5, 4, requires_grad=True)
