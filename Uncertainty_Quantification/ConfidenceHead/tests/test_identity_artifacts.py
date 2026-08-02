@@ -10,7 +10,11 @@ import pytest
 import torch
 from git import Repo
 
-from confidence_head.artifacts import atomic_json_dump, atomic_torch_save, load_torch_artifact
+from confidence_head.artifacts import (
+    atomic_json_dump,
+    atomic_torch_save,
+    load_torch_artifact,
+)
 from confidence_head.config import load_config
 from confidence_head.identity import (
     CodeIdentity,
@@ -72,11 +76,60 @@ def test_experiment_id_does_not_require_fitted_thresholds(
 def test_experiment_id_excludes_output_location(
     valid_config, cache_identity: str, clean_code_identity: CodeIdentity, tmp_path: Path
 ) -> None:
-    relocated = replace(valid_config, run=replace(valid_config.run, output_root=tmp_path / "elsewhere"))
-
-    assert experiment_id(valid_config, cache_identity, code=clean_code_identity) == experiment_id(
-        relocated, cache_identity, code=clean_code_identity
+    relocated = replace(
+        valid_config, run=replace(valid_config.run, output_root=tmp_path / "elsewhere")
     )
+
+    assert experiment_id(
+        valid_config, cache_identity, code=clean_code_identity
+    ) == experiment_id(relocated, cache_identity, code=clean_code_identity)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("batch_size", 16),
+        ("max_epochs", 101),
+        ("early_stopping_patience", 21),
+    ],
+)
+def test_experiment_id_changes_with_trainer_scientific_semantics(
+    valid_config,
+    cache_identity: str,
+    clean_code_identity: CodeIdentity,
+    field: str,
+    value: int,
+) -> None:
+    changed = replace(
+        valid_config,
+        trainer=replace(valid_config.trainer, **{field: value}),
+    )
+
+    assert experiment_id(
+        valid_config, cache_identity, code=clean_code_identity
+    ) != experiment_id(changed, cache_identity, code=clean_code_identity)
+
+
+def test_experiment_id_excludes_resume_logging_and_output_policy(
+    valid_config,
+    cache_identity: str,
+    clean_code_identity: CodeIdentity,
+    tmp_path: Path,
+) -> None:
+    operational_change = replace(
+        valid_config,
+        trainer=replace(valid_config.trainer, resume=False),
+        logging=replace(
+            valid_config.logging,
+            wandb=True,
+            wandb_mode="offline",
+        ),
+        run=replace(valid_config.run, output_root=tmp_path / "relocated"),
+    )
+
+    assert experiment_id(
+        valid_config, cache_identity, code=clean_code_identity
+    ) == experiment_id(operational_change, cache_identity, code=clean_code_identity)
 
 
 def test_run_id_changes_with_actual_binning_id(valid_config) -> None:
@@ -107,7 +160,9 @@ def test_code_identity_includes_staged_and_unstaged_changes_but_not_ignored_outp
     assert with_output == without_output
 
 
-def test_atomic_json_dump_replaces_destination_without_temporary_files(tmp_path: Path) -> None:
+def test_atomic_json_dump_replaces_destination_without_temporary_files(
+    tmp_path: Path,
+) -> None:
     destination = tmp_path / "metadata.json"
 
     atomic_json_dump(destination, {"b": 2, "a": 1})
@@ -116,7 +171,9 @@ def test_atomic_json_dump_replaces_destination_without_temporary_files(tmp_path:
     assert list(tmp_path.glob("*.tmp")) == []
 
 
-def test_atomic_torch_save_cleans_temporary_file_on_failure(tmp_path: Path, monkeypatch) -> None:
+def test_atomic_torch_save_cleans_temporary_file_on_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
     destination = tmp_path / "value.pt"
     monkeypatch.setattr(
         "os.replace", lambda source, target: (_ for _ in ()).throw(OSError("boom"))

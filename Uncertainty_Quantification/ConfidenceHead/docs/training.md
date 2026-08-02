@@ -10,7 +10,7 @@
 
 对原子 i 的 Force 分量 c，连续绝对误差为 `a_i,c = abs(F_pred_i,c - F_ref_i,c)`。`atom_mean` 模式定义 `e_force_i = mean_c(a_i,c)`，每个原子产生一个标签，logits 形状为 `[N_atom, B_force]`。`component` 模式保留三个标签，形状为 `[N_atom, 3]`；x、y、z 三个 head 拥有相同网络结构但参数彼此独立，交叉熵前把它们视为 `3*N_atom` 个真实样本。
 
-结构 s 的 Energy 标签采用每原子绝对误差：`e_energy_s = abs(E_pred_s - E_ref_s) / N_atom_s`。因此大结构不会仅因原子数更多而隐式放大 Energy loss。每个结构先对 640 维逐原子特征计算 raw moments，再递归计算 cumulant：`kappa_r = m'_r - sum C(r-1,j-1) * kappa_j * m'_(r-j)`。一阶是均值；二阶及以上使用 signed root，即 `sign(kappa_r) * abs(kappa_r)^(1/r)`，避免奇偶阶符号信息丢失和量纲快速膨胀。
+结构 s 的 Energy 标签采用每原子绝对误差：`e_energy_s = abs(E_pred_s - E_ref_s) / N_atom_s`。因此大结构不会仅因原子数更多而隐式放大 Energy loss。每个结构先对 640 维逐原子特征计算 raw moments，再递归计算 cumulant：`kappa_r = m'_r - sum C(r-1,j-1) * kappa_j * m'_(r-j)`。一阶是均值。仅当 `signed_root: true` 时，才对 `r >= 2` 的 cumulants 应用 signed root，即 `sign(kappa_r) * abs(kappa_r)^(1/r)`；`signed_root: false` 保留二阶及以上 raw cumulants，不做开方变换。
 
 从一阶到 K 阶的统计量拼接后进入可训练的 `Linear(640×K, 512)`、LayerNorm、Dropout 和 Energy head。投影层属于模型参数，必须参与优化、checkpoint 保存、严格参数 schema 比较和恢复。每个隐藏块固定为 Linear、SiLU、LayerNorm、Dropout，末层输出 bin logits。
 
@@ -32,7 +32,7 @@
 
 `experiment_id` 在拟合前由规范化配置、`cache_id` 与代码身份生成，用于确定稳定运行目录。batch size、optimizer、严格确定性开关等训练语义变化必须改变它；W&B 在线或离线状态不进入科学身份。
 
-`run_id` 最终绑定 `experiment_id` 和 `binning_id`。checkpoint、事件、摘要、validation 和 completion manifest 必须引用同一组四层身份。目录名相似不是相同实验，文件名相同也不能替代内容身份比较。
+`run_id` 最终绑定 `experiment_id` 和 `binning_id`。四个 ID 的完整值由 `run_identity.json`、`best.pt`、`last.pt`、`training_summary.json`、`training_validation.json` 与 `training_manifest.json` 保存。`events.jsonl` 不逐条保存四个 ID；共享验证器通过运行目录上下文、`last.pt` 与 `training_summary.json` 将事件绑定到同一身份。目录名相似不是相同实验，文件名相同也不能替代内容身份比较。
 
 Git clean commit 与 dirty 工作树属于不同代码身份。允许 dirty Git 运行，但会记录 `git_dirty: true`，并将规范化实际 diff 的 `git_diff_sha256` 纳入身份；因此 dirty 结果不能冒充同 commit 的 clean 发布结果。发布前应尽量使用已提交且干净的代码，并把 commit、dirty 状态和环境记录一并归档。
 
@@ -60,7 +60,7 @@ W&B 只镜像已经形成的本地事件。`auto` 以有限超时尝试 online�
 
 ## 8. 用户可见产物树
 
-一个 name prefix 下包含 `cache/<cache_id>/` 和 `runs/<run_tag>-<experiment_id>/`。cache 目录包含 `progress.pt`、各 split 的 `shard-*.pt` 与最终 `cache_manifest.json`。run 目录的 `config/` 保存 source YAML 与 resolved JSON；`identity/` 保存 run、environment 和 Git 记录；`binning/` 保存 artifact 与 manifest；`run/` 保存事件、best、last、summary、validation、completion manifest 和 W&B 镜像。
+一个 name prefix 下包含 `cache/<cache_id>/` 和 `runs/<run_tag>-<experiment_id前12位>/`。例如生产默认 run 目录是 `mace_matpes_linear_atommean-f50_e50-order3-<experiment_id前12位>/`。目录名只使用 experiment ID 的可读短前缀，完整 identity 保存在目录内文件中。cache 目录包含 `progress.pt`、各 split 的 `shard-*.pt` 与最终 `cache_manifest.json`。run 目录的 `config/` 保存 source YAML 与 resolved JSON；`identity/` 保存 run、environment 和 Git 记录；`binning/` 保存 artifact 与 manifest；`run/` 保存事件、best、last、summary、validation、completion manifest 和 W&B 镜像。
 
 source YAML 用于人类复核，resolved JSON 用于显示路径解析和规范化语义；两者不能互相替代。`.pt` 文件按内部安全 schema 读取，只保存 tensor/基础类型，不序列化任意模型对象。manifest 记录关联身份和内容 SHA，可发现复制不全、位翻转、手工编辑或拿错 checkpoint。
 
@@ -95,7 +95,7 @@ source YAML 用于人类复核，resolved JSON 用于显示路径解析和规范
 
 1. 四个脚本均返回零，且最终 `training_manifest.json` 存在。
 2. `training_validation.json` 的 valid 为真，所列 SHA 与实际文件一致。
-3. cache、binning、experiment、run 四个 ID 在所有 artifact 中闭合一致。
+3. 在保存完整身份的 run identity、checkpoint、summary、validation 与 manifest 中核对 cache、binning、experiment、run 四个 ID，并由共享验证器确认事件上下文闭合一致。
 4. best epoch 与事件中最小 validation total 一致，last 显示正常完成。
 5. Force/Energy 启用状态与模型参数、bins 和指标字段完全一致。
 6. 检查 Force 与 Energy 的 overflow_count；异常比例必须解释，不能隐去。

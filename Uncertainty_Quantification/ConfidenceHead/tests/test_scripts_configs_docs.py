@@ -209,6 +209,43 @@ def test_training_guide_covers_math_identity_resume_and_release_checks():
         assert phrase in text
 
 
+def test_training_guide_states_signed_root_toggle_contract():
+    text = TRAINING_GUIDE.read_text(encoding="utf-8")
+
+    assert (
+        "仅当 `signed_root: true` 时，才对 `r >= 2` 的 cumulants 应用 signed root"
+        in text
+    )
+    assert "`signed_root: false` 保留二阶及以上 raw cumulants，不做开方变换" in text
+
+
+def test_training_guide_describes_identity_storage_without_overstating_events():
+    text = TRAINING_GUIDE.read_text(encoding="utf-8")
+
+    assert (
+        "四个 ID 的完整值由 `run_identity.json`、`best.pt`、`last.pt`、"
+        "`training_summary.json`、`training_validation.json` 与 "
+        "`training_manifest.json` 保存"
+    ) in text
+    assert (
+        "`events.jsonl` 不逐条保存四个 ID；共享验证器通过运行目录上下文、"
+        "`last.pt` 与 `training_summary.json` 将事件绑定到同一身份"
+    ) in text
+    assert (
+        "事件、摘要、validation 和 completion manifest 必须引用同一组四层身份"
+        not in text
+    )
+    assert "四个 ID 在所有 artifact 中" not in text
+
+
+def test_training_guide_uses_truncated_experiment_id_in_run_directory():
+    text = TRAINING_GUIDE.read_text(encoding="utf-8")
+
+    assert "runs/<run_tag>-<experiment_id前12位>/" in text
+    assert "mace_matpes_linear_atommean-f50_e50-order3-<experiment_id前12位>/" in text
+    assert "完整 identity 保存在目录内文件中" in text
+
+
 def test_release_text_and_configs_contain_no_machine_or_retired_paths():
     files = [
         CONFIG_ROOT / "mace_matpes_production.yaml",

@@ -80,6 +80,11 @@ def cache_id(
 
 def _experiment_payload(config: ConfidenceHeadConfig) -> dict[str, Any]:
     return {
+        "trainer": {
+            "batch_size": config.trainer.batch_size,
+            "max_epochs": config.trainer.max_epochs,
+            "early_stopping_patience": config.trainer.early_stopping_patience,
+        },
         "model": asdict(config.model),
         "loss": asdict(config.loss),
         "optimizer": asdict(config.optimizer),
