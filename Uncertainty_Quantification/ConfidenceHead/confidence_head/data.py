@@ -38,6 +38,7 @@ class StructureBatch:
     indices: torch.Tensor
     structure_ids: tuple[str, ...]
     num_atoms: torch.Tensor
+    atomic_numbers: torch.Tensor
     atom_offsets: torch.Tensor
     mace_batch: Batch
     reference_energy: torch.Tensor
@@ -217,6 +218,7 @@ def build_structure_batch(
     forces: list[np.ndarray] = []
     ids: list[str] = []
     counts: list[int] = []
+    atomic_numbers: list[np.ndarray] = []
     for index, atoms in enumerate(structures):
         _validate_structure(
             atoms, supported_atomic_numbers=supported, context=f"structure {index}"
@@ -239,6 +241,7 @@ def build_structure_batch(
         forces.append(np.asarray(reference_forces))
         ids.append(structure_id(atoms))
         counts.append(len(atoms))
+        atomic_numbers.append(np.asarray(atoms.get_atomic_numbers()))
 
     target_device = torch.device(device)
     num_atoms = torch.tensor(counts, dtype=torch.long, device=target_device)
@@ -253,6 +256,11 @@ def build_structure_batch(
         indices=torch.tensor(indices, dtype=torch.long, device=target_device),
         structure_ids=tuple(ids),
         num_atoms=num_atoms,
+        atomic_numbers=torch.as_tensor(
+            np.concatenate(atomic_numbers, axis=0),
+            dtype=torch.long,
+            device=target_device,
+        ),
         atom_offsets=atom_offsets,
         mace_batch=mace_batch,
         reference_energy=torch.tensor(

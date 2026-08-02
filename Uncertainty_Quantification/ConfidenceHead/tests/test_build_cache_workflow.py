@@ -9,14 +9,19 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from ase import Atoms
+from ase.io import write
 
+from confidence_head.backbone import BackboneIdentity
 from confidence_head.cache import (
     CacheCorruptionError,
     CacheIncompleteError,
 )
 from confidence_head.config import load_config
+from confidence_head.data import structure_id
 from confidence_head.errors import DataContractError
 from confidence_head.identity import CodeIdentity
 from confidence_head.workflows import build_cache as workflow
@@ -408,10 +413,11 @@ def test_cache_one_split_uses_ordered_indices_force_and_one_forward_per_batch(
         atom_count = len(items)
         model_input = {
             "batch": len(items),
-            "atomic_numbers": torch.ones(atom_count, dtype=torch.long),
+            "node_attrs": torch.ones(atom_count, 2),
         }
         return SimpleNamespace(
             indices=torch.tensor(tuple(indices), dtype=torch.long),
+            atomic_numbers=torch.ones(atom_count, dtype=torch.long),
             atom_offsets=torch.tensor([0, atom_count]),
             structure_ids=structure_ids[indices[0] : indices[-1] + 1],
             reference_energy=torch.zeros(len(items)),
@@ -424,7 +430,7 @@ def test_cache_one_split_uses_ordered_indices_force_and_one_forward_per_batch(
 
     def model(batch, **kwargs):
         forwards.append((batch, kwargs))
-        atom_count = len(batch["atomic_numbers"])
+        atom_count = len(batch["node_attrs"])
         return {
             "energy": torch.ones(batch["batch"], requires_grad=True),
             "forces": torch.ones(atom_count, 3, requires_grad=True),
@@ -473,13 +479,15 @@ def test_cache_one_split_writes_actual_predictions_and_batch_atomic_numbers(
         structure_ids=("structure-0", "structure-1"),
     )
     monkeypatch.setattr(workflow, "read_structures", lambda _path: structures)
+    source_atomic_numbers = torch.tensor([1, 8, 6], dtype=torch.int32)
     model_input = {
         "batch": torch.tensor([0, 0, 1], dtype=torch.long),
-        "atomic_numbers": torch.tensor([1, 8, 6], dtype=torch.int32),
+        "node_attrs": torch.ones(3, 3),
     }
     structure_batch = SimpleNamespace(
         indices=torch.tensor([0, 1], dtype=torch.long),
         structure_ids=handle.structure_ids,
+        atomic_numbers=source_atomic_numbers,
         atom_offsets=torch.tensor([0, 2, 3], dtype=torch.long),
         reference_energy=torch.tensor([1.25, -0.5], dtype=torch.float32),
         reference_forces=torch.full((3, 3), 0.25, dtype=torch.float16),
@@ -529,7 +537,7 @@ def test_cache_one_split_writes_actual_predictions_and_batch_atomic_numbers(
     )
     cached, split = appended[0]
     assert split == "train"
-    assert torch.equal(cached.atomic_numbers, model_input["atomic_numbers"])
+    assert torch.equal(cached.atomic_numbers, source_atomic_numbers)
     assert torch.equal(cached.force_prediction, force_prediction)
     assert torch.equal(cached.energy_prediction, energy_prediction)
     assert cached.scalar_features.dtype is torch.float32
@@ -537,6 +545,93 @@ def test_cache_one_split_writes_actual_predictions_and_batch_atomic_numbers(
     assert cached.energy_reference.dtype is torch.float32
     assert not cached.force_prediction.requires_grad
     assert not cached.energy_prediction.requires_grad
+
+
+@pytest.mark.filterwarnings(
+    "ignore:Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, "
+    "since the`weights_only` argument was not explicitly passed to "
+    "`torch\\.load`, forcing weights_only=False\\.:UserWarning"
+)
+@pytest.mark.filterwarnings(
+    "ignore:`torch\\.jit\\.script` is deprecated\\. Please switch to "
+    "`torch\\.compile` or `torch\\.export`\\.:DeprecationWarning"
+)
+def test_cache_one_split_uses_source_atomic_numbers_with_real_mace_graph(
+    tmp_path: Path, valid_config
+) -> None:
+    structures = [
+        Atoms(
+            numbers=(1, 8),
+            positions=((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            cell=np.eye(3) * 8.0,
+            pbc=False,
+        ),
+        Atoms(
+            numbers=(8,),
+            positions=((0.5, 0.5, 0.5),),
+            cell=np.eye(3) * 8.0,
+            pbc=False,
+        ),
+    ]
+    for index, atoms in enumerate(structures):
+        atoms.info["REF_energy"] = -1.0 + index
+        atoms.arrays["REF_forces"] = np.zeros((len(atoms), 3))
+    split_path = tmp_path / "real-mace-graph.extxyz"
+    write(split_path, structures, format="extxyz")
+    round_tripped = workflow.read_structures(split_path)
+    handle = SimpleNamespace(
+        path=split_path,
+        size=2,
+        structure_ids=tuple(structure_id(atoms) for atoms in round_tripped),
+    )
+    identity = BackboneIdentity(
+        sha256="a" * 64,
+        model_class="ScaleShiftMACE",
+        heads=("Default",),
+        selected_head="Default",
+        r_max=5.0,
+        atomic_numbers=(1, 8),
+        dtype=torch.float64,
+        feature_modules=(("products.0", 512), ("products.1", 128)),
+    )
+    forwards = []
+
+    def model(model_input, **kwargs):
+        forwards.append((model_input, kwargs))
+        assert "node_attrs" in model_input
+        assert "atomic_numbers" not in model_input
+        atom_count = model_input["node_attrs"].shape[0]
+        return {
+            "energy": torch.zeros(2, dtype=torch.float64),
+            "forces": torch.zeros(atom_count, 3, dtype=torch.float64),
+        }
+
+    appended = []
+    workflow.cache_one_split(
+        "train",
+        handle=handle,
+        loaded=SimpleNamespace(model=model, identity=identity),
+        capture=SimpleNamespace(
+            take=lambda *, expected_atoms: torch.zeros(
+                expected_atoms, 640, dtype=torch.float64
+            )
+        ),
+        writer=SimpleNamespace(
+            append=lambda batch, *, split: appended.append((batch, split))
+        ),
+        config=valid_config,
+        next_index=0,
+    )
+
+    assert len(forwards) == 1
+    assert forwards[0][1] == {
+        "training": False,
+        "compute_force": True,
+    }
+    cached, split = appended[0]
+    assert split == "train"
+    assert cached.atomic_numbers.dtype is torch.long
+    assert cached.atomic_numbers.tolist() == [1, 8, 8]
 
 
 @pytest.mark.parametrize(
@@ -568,13 +663,14 @@ def test_cache_one_split_rejects_malformed_prediction_shapes(
         lambda *_args, **_kwargs: SimpleNamespace(
             indices=torch.tensor([0, 1], dtype=torch.long),
             structure_ids=handle.structure_ids,
+            atomic_numbers=torch.tensor([1, 8, 6]),
             atom_offsets=torch.tensor([0, 2, 3], dtype=torch.long),
             reference_energy=torch.zeros(2),
             reference_forces=torch.zeros(3, 3),
             mace_batch=SimpleNamespace(
                 to_dict=lambda: {
                     "batch": torch.tensor([0, 0, 1]),
-                    "atomic_numbers": torch.tensor([1, 8, 6]),
+                    "node_attrs": torch.ones(3, 3),
                 }
             ),
         ),
@@ -613,6 +709,7 @@ def run_nonfinite_prediction_case(monkeypatch, valid_config, predictions):
     )
     batch = SimpleNamespace(
         indices=torch.tensor([0], dtype=torch.long),
+        atomic_numbers=torch.tensor([1], dtype=torch.long),
         atom_offsets=torch.tensor([0, 1]),
         structure_ids=("structure-0",),
         reference_energy=torch.zeros(1),
@@ -620,7 +717,7 @@ def run_nonfinite_prediction_case(monkeypatch, valid_config, predictions):
         mace_batch=SimpleNamespace(
             to_dict=lambda: {
                 "batch": 1,
-                "atomic_numbers": torch.tensor([1], dtype=torch.long),
+                "node_attrs": torch.ones(1, 2),
             }
         ),
     )

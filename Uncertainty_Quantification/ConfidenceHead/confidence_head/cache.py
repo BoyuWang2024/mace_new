@@ -211,6 +211,21 @@ _CONTINUOUS_BATCH_FIELDS = (
 _INTEGRAL_DTYPES = frozenset(
     {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
 )
+_NON_FEATURE_DTYPE_FIELDS = (
+    "force_prediction",
+    "force_reference",
+    "energy_prediction",
+    "energy_reference",
+)
+
+
+def _non_feature_dtype_signature(
+    batch: ContinuousBatch,
+) -> tuple[torch.dtype, ...]:
+    return tuple(
+        getattr(batch, field).dtype
+        for field in _NON_FEATURE_DTYPE_FIELDS
+    )
 
 
 def _batch_attributes(batch: object, where: str) -> ContinuousBatch:
@@ -778,6 +793,12 @@ class CacheWriter:
         self._active_split = split
         for structure_index in range(len(normalized.structure_id)):
             structure = _one_structure(normalized, structure_index)
+            if (
+                self._buffer
+                and _non_feature_dtype_signature(structure)
+                != _non_feature_dtype_signature(self._buffer[-1])
+            ):
+                self._flush(split)
             atom_count = int(structure.atom_offsets[-1].item())
             buffered_atoms = sum(
                 int(item.atom_offsets[-1].item())
@@ -1090,9 +1111,15 @@ def iter_cache_batches(
             shard_where,
         )
         for structure_index in range(structure_count):
-            pending.append(
-                _one_structure(shard_batch, structure_index)
-            )
+            structure = _one_structure(shard_batch, structure_index)
+            if (
+                pending
+                and _non_feature_dtype_signature(structure)
+                != _non_feature_dtype_signature(pending[-1])
+            ):
+                yield _repack(pending)
+                pending.clear()
+            pending.append(structure)
             if len(pending) == batch_size:
                 yield _repack(pending)
                 pending.clear()

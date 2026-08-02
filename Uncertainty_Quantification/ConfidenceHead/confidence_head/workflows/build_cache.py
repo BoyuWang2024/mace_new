@@ -149,9 +149,8 @@ def _extract_predictions(
 
 
 def _atomic_numbers(
-    model_input: Mapping[str, Any], *, expected_atoms: int
+    value: object, *, expected_atoms: int
 ) -> torch.Tensor:
-    value = model_input.get("atomic_numbers")
     if not isinstance(value, torch.Tensor):
         raise DataContractError(
             "MACE structure batch atomic_numbers must be a tensor"
@@ -237,7 +236,7 @@ def cache_one_split(
         model_input = batch.mace_batch.to_dict()
         expected_atoms = int(batch.atom_offsets[-1].item())
         atomic_numbers = _atomic_numbers(
-            model_input, expected_atoms=expected_atoms
+            batch.atomic_numbers, expected_atoms=expected_atoms
         )
         output = loaded.model(
             model_input,

@@ -294,6 +294,7 @@ def test_structure_batch_and_continuous_batch_preserve_backbone_dtype(
     batch = build_structure_batch(atoms, indices=(3, 7), backbone=identity)
     assert batch.indices.tolist() == [3, 7]
     assert batch.num_atoms.tolist() == [2, 1]
+    assert batch.atomic_numbers.tolist() == [1, 1, 8]
     assert batch.atom_offsets.tolist() == [0, 2, 3]
     assert batch.reference_energy.shape == (2,)
     assert batch.reference_forces.shape == (3, 3)
@@ -305,6 +306,7 @@ def test_structure_batch_and_continuous_batch_preserve_backbone_dtype(
     assert continuous.features.shape == (3, 640)
     assert continuous.features.dtype == torch.float64
     assert continuous.features.requires_grad is False
+    assert continuous.atomic_numbers.tolist() == [1, 1, 8]
     assert continuous.structure_ids == tuple(structure_id(item) for item in atoms)
 
     wrong_dtype = torch.ones(3, 640, dtype=torch.float32)

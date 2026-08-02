@@ -20,6 +20,7 @@ class ContinuousBatch:
     indices: torch.Tensor
     structure_ids: tuple[str, ...]
     num_atoms: torch.Tensor
+    atomic_numbers: torch.Tensor
     atom_offsets: torch.Tensor
     features: torch.Tensor
     reference_energy: torch.Tensor
@@ -150,6 +151,7 @@ def to_continuous_batch(
         indices=batch.indices,
         structure_ids=batch.structure_ids,
         num_atoms=batch.num_atoms,
+        atomic_numbers=batch.atomic_numbers,
         atom_offsets=batch.atom_offsets,
         features=detached,
         reference_energy=batch.reference_energy,

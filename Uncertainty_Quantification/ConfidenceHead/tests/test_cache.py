@@ -209,6 +209,104 @@ def test_approved_payload_round_trip_and_repacking_preserve_independent_dtypes(
     assert repacked[0].energy_reference.dtype is torch.float32
 
 
+_NON_FEATURE_DTYPE_FIELDS = (
+    "force_prediction",
+    "force_reference",
+    "energy_prediction",
+    "energy_reference",
+)
+
+
+def batch_with_changed_field_dtype(
+    *,
+    field: str,
+    index_start: int,
+    structure_prefix: str,
+) -> ContinuousBatch:
+    batch = approved_payload_batch(
+        [1],
+        index_start=index_start,
+        structure_prefix=structure_prefix,
+    )
+    source = getattr(batch, field)
+    target_dtype = (
+        torch.float32
+        if source.dtype is not torch.float32
+        else torch.float64
+    )
+    return replace(batch, **{field: source.to(dtype=target_dtype)})
+
+
+@pytest.mark.parametrize("field", _NON_FEATURE_DTYPE_FIELDS)
+def test_writer_flushes_before_each_non_feature_dtype_transition(
+    tmp_path: Path, field: str
+) -> None:
+    from confidence_head.cache import CacheWriter
+
+    first = approved_payload_batch(
+        [1], structure_prefix=f"{field}-first"
+    )
+    second = batch_with_changed_field_dtype(
+        field=field,
+        index_start=1,
+        structure_prefix=f"{field}-second",
+    )
+    writer = CacheWriter(
+        tmp_path, cache_id="cache", shard_max_atoms=10
+    )
+    writer.append(first)
+    writer.append(second)
+    writer.finalize_split("train")
+
+    payloads = [
+        load_torch_artifact(path)
+        for path in sorted((tmp_path / "train").glob("shard-*.pt"))
+    ]
+    assert len(payloads) == 2
+    assert [payload[field].dtype for payload in payloads] == [
+        getattr(first, field).dtype,
+        getattr(second, field).dtype,
+    ]
+    assert all(
+        payload["scalar_features"].dtype is torch.float32
+        for payload in payloads
+    )
+
+
+@pytest.mark.parametrize("field", _NON_FEATURE_DTYPE_FIELDS)
+def test_iterator_yields_before_each_non_feature_dtype_transition(
+    tmp_path: Path, field: str
+) -> None:
+    from confidence_head.cache import CacheWriter, iter_cache_batches
+
+    first = approved_payload_batch(
+        [1], structure_prefix=f"{field}-first"
+    )
+    second = batch_with_changed_field_dtype(
+        field=field,
+        index_start=1,
+        structure_prefix=f"{field}-second",
+    )
+    writer = CacheWriter(
+        tmp_path, cache_id="cache", shard_max_atoms=1
+    )
+    writer.append(first)
+    writer.append(second)
+    writer.finalize_split("train")
+    manifest = writer.finalize()
+
+    batches = list(iter_cache_batches(manifest, "train", batch_size=10))
+    assert len(batches) == 2
+    assert [getattr(batch, field).dtype for batch in batches] == [
+        getattr(first, field).dtype,
+        getattr(second, field).dtype,
+    ]
+    assert all(
+        batch.scalar_features.dtype is torch.float32
+        for batch in batches
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
