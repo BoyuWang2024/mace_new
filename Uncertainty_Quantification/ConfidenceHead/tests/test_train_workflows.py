@@ -15,11 +15,14 @@ import pytest
 from confidence_head.artifacts import atomic_torch_save, load_torch_artifact
 from confidence_head.cache import CacheWriter, ContinuousBatch
 from confidence_head.config import load_config
+from confidence_head.runtime import capture_rng_state
 from confidence_head.workflows.check_training import run_check_training
 from confidence_head.workflows.fit_bins import run_fit_bins
 from confidence_head.workflows.train import (
     ControlledEpochStop,
     RunConflictError,
+    _load_run_inputs,
+    _new_model_optimizer,
     run_train,
 )
 
@@ -268,6 +271,92 @@ def test_energy_only_run_updates_projection_and_omits_force_state(
     assert report["energy_projection_updated"] is True
     assert any(name.startswith("energy_adapter.projection.") for name in state)
     assert all(not name.startswith("force_head.") for name in state)
+
+
+@pytest.mark.parametrize("corruption", ["initial_and_moments", "moments_only"])
+def test_check_rejects_energy_projection_reset_to_seed_initialization(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    config, bins = _ready_force_run(
+        tmp_path,
+        {
+            "loss.force_coefficient": 0.0,
+            "loss.energy_coefficient": 0.3,
+            "binning.energy.num_bins": 3,
+            "model.energy.cumulant_order": 1,
+            "model.energy.hidden_dims": [8],
+            "trainer.max_epochs": 1,
+        },
+    )
+    run_train(config)
+    run_dir = bins.parent / "run"
+    inputs = _load_run_inputs(config)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(config.runtime.seed)
+        initial_model, _ = _new_model_optimizer(
+            inputs, device=torch.device("cpu"), dtype=torch.float32
+        )
+    initial_state = initial_model.state_dict()
+    projection_names = [
+        name
+        for name, _ in initial_model.named_parameters()
+        if name.startswith("energy_adapter.projection.")
+    ]
+    assert projection_names == [
+        "energy_adapter.projection.weight",
+        "energy_adapter.projection.bias",
+    ]
+
+    if corruption == "initial_and_moments":
+        best_path = run_dir / "best.pt"
+        best = load_torch_artifact(best_path)
+        for name in projection_names:
+            best["model_state"][name] = initial_state[name].clone()
+        atomic_torch_save(best_path, best)
+
+    last_path = run_dir / "last.pt"
+    last = load_torch_artifact(last_path)
+    saved_ids = last["optimizer_state"]["param_groups"][0]["params"]
+    parameter_ids = dict(
+        zip((name for name, _ in initial_model.named_parameters()), saved_ids)
+    )
+    for name in projection_names:
+        if corruption == "initial_and_moments":
+            last["model_state"][name] = initial_state[name].clone()
+        optimizer_entry = last["optimizer_state"]["state"][parameter_ids[name]]
+        optimizer_entry["exp_avg"].zero_()
+        optimizer_entry["exp_avg_sq"].zero_()
+    atomic_torch_save(last_path, last)
+
+    with pytest.raises(RunConflictError, match="energy projection"):
+        run_check_training(config)
+
+
+def test_check_energy_projection_validation_preserves_caller_rng(
+    tmp_path: Path,
+) -> None:
+    config, _ = _ready_force_run(
+        tmp_path,
+        {
+            "loss.force_coefficient": 0.0,
+            "loss.energy_coefficient": 0.3,
+            "binning.energy.num_bins": 3,
+            "model.energy.cumulant_order": 1,
+            "model.energy.hidden_dims": [8],
+            "trainer.max_epochs": 1,
+        },
+    )
+    run_train(config)
+    random.seed(987)
+    np.random.seed(654)
+    torch.manual_seed(321)
+    before = capture_rng_state()
+
+    run_check_training(config)
+
+    after = capture_rng_state()
+    assert _state_equal(before, after)
 
 
 def test_training_uses_epoch_seed_shuffle_and_complete_validation(

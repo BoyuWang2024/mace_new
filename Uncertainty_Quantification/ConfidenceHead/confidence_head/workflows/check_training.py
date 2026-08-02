@@ -101,12 +101,78 @@ def _validate_checkpoint_base(
     _validate_tensor_state(payload, expected_schema, where=where)
 
 
+def _initial_model_optimizer(
+    inputs: RunInputs,
+    *,
+    dtype: torch.dtype,
+) -> tuple[torch.nn.Module, torch.optim.AdamW, dict[str, torch.Tensor]]:
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(inputs.config.runtime.seed)
+        model, optimizer = _new_model_optimizer(
+            inputs, device=torch.device("cpu"), dtype=dtype
+        )
+    initial_projection = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if name.startswith("energy_adapter.projection.")
+    }
+    return model, optimizer, initial_projection
+
+
+def _validate_energy_projection(
+    *,
+    enabled: bool,
+    best_model_state: Mapping[str, torch.Tensor],
+    initial_projection: Mapping[str, torch.Tensor],
+    model: torch.nn.Module,
+    optimizer: torch.optim.AdamW,
+) -> bool:
+    if not enabled:
+        return False
+    expected_names = {
+        name
+        for name, _ in model.named_parameters()
+        if name.startswith("energy_adapter.projection.")
+    }
+    if not expected_names or set(initial_projection) != expected_names:
+        raise RunConflictError("energy projection parameter coverage differs")
+    for name in sorted(expected_names):
+        trained = best_model_state[name]
+        initial = initial_projection[name]
+        if not bool(torch.isfinite(trained).all().item()) or torch.equal(
+            trained, initial
+        ):
+            raise RunConflictError(
+                f"energy projection parameter {name} was not updated"
+            )
+
+    parameter_by_name = dict(model.named_parameters())
+    for name in sorted(expected_names):
+        state = optimizer.state.get(parameter_by_name[name])
+        if type(state) is not dict:
+            raise RunConflictError(
+                f"energy projection optimizer state {name} is missing"
+            )
+        for moment_name in ("exp_avg", "exp_avg_sq"):
+            moment = state.get(moment_name)
+            if (
+                not isinstance(moment, torch.Tensor)
+                or not bool(torch.isfinite(moment).all().item())
+                or not bool(torch.count_nonzero(moment).item())
+            ):
+                raise RunConflictError(
+                    f"energy projection optimizer {moment_name} for {name} is invalid"
+                )
+    return True
+
+
 def _validate_checkpoints(
     inputs: RunInputs,
     events: list[dict[str, Any]],
     state: TrainingState,
     model: torch.nn.Module,
     optimizer: torch.optim.AdamW,
+    initial_projection: Mapping[str, torch.Tensor],
 ) -> bool:
     expected_schema = parameter_schema(model)
     best = load_torch_artifact(inputs.run_dir / "best.pt")
@@ -147,7 +213,13 @@ def _validate_checkpoints(
         or last_payload["completed"] is not True
     ):
         raise RunConflictError("last.pt does not correspond to the final event")
-    return inputs.config.energy_enabled
+    return _validate_energy_projection(
+        enabled=inputs.config.energy_enabled,
+        best_model_state=best["model_state"],
+        initial_projection=initial_projection,
+        model=model,
+        optimizer=optimizer,
+    )
 
 
 def _validate_summary(inputs: RunInputs, state: TrainingState) -> dict[str, Any]:
@@ -287,11 +359,11 @@ def run_check_training(config: ConfidenceHeadConfig) -> Path:
 
         events, state = _validate_event_history(inputs, require_completed=True)
         dtype = _feature_dtype(inputs.cache, config.trainer.batch_size)
-        model, optimizer = _new_model_optimizer(
-            inputs, device=torch.device("cpu"), dtype=dtype
+        model, optimizer, initial_projection = _initial_model_optimizer(
+            inputs, dtype=dtype
         )
         energy_projection_updated = _validate_checkpoints(
-            inputs, events, state, model, optimizer
+            inputs, events, state, model, optimizer, initial_projection
         )
         _validate_summary(inputs, state)
         validation = _validation_payload(
