@@ -16,6 +16,7 @@ profile = "black"
 faulthandler_timeout = 300
 markers = [
     "full_chain: run the real CPU n20 LLPR workflow and inspect its artifacts",
+    "confidence_head_full_chain: run real MACE+n20 cache, binning, interrupted training, resume, and validation",
 ]
 
 [tool.pylint.'MESSAGES CONTROL']

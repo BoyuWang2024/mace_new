@@ -161,6 +161,56 @@ def approved_payload_batch(
     )
 
 
+def test_smoke_writer_allows_only_cross_split_duplicates_and_resumes(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import (
+        CacheCorruptionError,
+        CacheWriter,
+        load_complete_cache,
+    )
+
+    root = tmp_path / "cross-split"
+    writer = CacheWriter(
+        root,
+        cache_id="cache",
+        shard_max_atoms=8,
+        allow_cross_split_duplicates=True,
+    )
+    duplicate = batch_with_atom_counts([2])
+    writer.append(duplicate, split="train")
+    writer.finalize_split("train")
+
+    writer = CacheWriter.resume(
+        root,
+        expected_cache_id="cache",
+        allow_cross_split_duplicates=True,
+    )
+    writer.append(duplicate, split="validation")
+    writer.finalize_split("validation")
+    manifest = writer.finalize()
+    assert manifest.allow_cross_split_duplicates is True
+    with pytest.raises(CacheCorruptionError, match="duplicate structure_ids"):
+        load_complete_cache(root, expected_cache_id="cache")
+    assert load_complete_cache(
+        root,
+        expected_cache_id="cache",
+        allow_cross_split_duplicates=True,
+    ) == manifest
+
+    same_split = CacheWriter(
+        tmp_path / "same-split",
+        cache_id="cache",
+        shard_max_atoms=8,
+        allow_cross_split_duplicates=True,
+    )
+    same_split.append(duplicate, split="train")
+    with pytest.raises(CacheCorruptionError, match="duplicate structure_ids"):
+        same_split.append(
+            batch_with_atom_counts([2], index_start=1), split="train"
+        )
+
+
 @pytest.mark.parametrize(
     "field",
     ("atomic_numbers", "force_prediction", "energy_prediction"),

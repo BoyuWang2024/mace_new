@@ -288,6 +288,7 @@ def run_fit_bins(config: ConfidenceHeadConfig) -> Path:
     manifest = load_complete_cache(
         _cache_root(config, cache_identity),
         expected_cache_id=cache_identity,
+        allow_cross_split_duplicates=config.profile == "smoke_test",
     )
     code = code_identity(REPOSITORY_ROOT)
     experiment_identity = experiment_id(config, cache_identity, code=code)

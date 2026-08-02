@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 import json
 from dataclasses import dataclass
@@ -57,13 +58,22 @@ def _array_payload(value: object) -> dict[str, object]:
 
 
 def _reference_values(atoms: Atoms, *, context: str) -> tuple[object, np.ndarray]:
-    if ENERGY_KEY not in atoms.info:
+    calculator_results = getattr(getattr(atoms, "calc", None), "results", {})
+    if not isinstance(calculator_results, Mapping):
+        calculator_results = {}
+    if ENERGY_KEY in atoms.info:
+        energy = atoms.info[ENERGY_KEY]
+    elif "energy" in calculator_results:
+        energy = calculator_results["energy"]
+    else:
         raise DataContractError(f"{context} is missing {ENERGY_KEY}")
-    if FORCES_KEY not in atoms.arrays:
+    if FORCES_KEY in atoms.arrays:
+        forces = np.asarray(atoms.arrays[FORCES_KEY])
+    elif "forces" in calculator_results:
+        forces = np.asarray(calculator_results["forces"])
+    else:
         raise DataContractError(f"{context} is missing {FORCES_KEY}")
-    energy = atoms.info[ENERGY_KEY]
     energy_array = np.asarray(energy)
-    forces = np.asarray(atoms.arrays[FORCES_KEY])
     if energy_array.shape != ():
         raise DataContractError(f"{context} {ENERGY_KEY} must be scalar")
     if forces.shape != (len(atoms), 3):

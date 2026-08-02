@@ -331,6 +331,7 @@ def _load_run_inputs(config: ConfidenceHeadConfig) -> RunInputs:
     cache = load_complete_cache(
         fit_bins_workflow._cache_root(config, cache_identity),
         expected_cache_id=cache_identity,
+        allow_cross_split_duplicates=config.profile == "smoke_test",
     )
     experiment_identity = experiment_id(config, cache_identity, code=code)
     run_root = fit_bins_workflow._binning_root(config, experiment_identity).parent

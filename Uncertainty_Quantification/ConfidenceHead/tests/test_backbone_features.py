@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import write
 from torch import nn
 
@@ -173,6 +174,31 @@ def test_structure_id_is_deterministic_and_includes_reference_array_dtype():
     different_dtype = reference_atoms(forces_dtype=np.dtype("float64"))
     assert structure_id(first) == structure_id(same)
     assert structure_id(first) != structure_id(different_dtype)
+
+def test_dataset_load_accepts_ase_reserved_calculator_labels(tmp_path):
+    def reserved_labels(energy: float) -> Atoms:
+        atoms = Atoms(
+            numbers=(1, 8),
+            positions=((0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            cell=np.eye(3) * 8.0,
+            pbc=True,
+        )
+        atoms.calc = SinglePointCalculator(
+            atoms,
+            energy=energy,
+            forces=np.full((2, 3), 0.125, dtype=np.float64),
+        )
+        return atoms
+
+    first_path = write_split(
+        tmp_path / "reserved-first.extxyz", [reserved_labels(-1.25)]
+    )
+    second_path = write_split(
+        tmp_path / "reserved-second.extxyz", [reserved_labels(-1.5)]
+    )
+    first = load_dataset(first_path, sha256_file(first_path), (1, 8))
+    second = load_dataset(second_path, sha256_file(second_path), (1, 8))
+    assert first.structure_ids != second.structure_ids
 
 
 def test_dataset_load_validates_hash_targets_elements_and_finiteness(tmp_path):

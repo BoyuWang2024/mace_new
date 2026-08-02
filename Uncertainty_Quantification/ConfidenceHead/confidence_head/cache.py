@@ -120,12 +120,14 @@ class CacheManifest:
     root: Path
     cache_id: str
     complete: bool
+    allow_cross_split_duplicates: bool
     splits: dict[str, tuple[CacheShard, ...]]
 
 
 @dataclass(frozen=True)
 class _ValidationResult:
     structure_ids: frozenset[str]
+    split_structure_ids: dict[str, frozenset[str]]
     feature_dtype: torch.dtype | None
     splits: dict[str, tuple[CacheShard, ...]]
 
@@ -527,9 +529,13 @@ def _reject_undeclared_shards(
 
 
 def _validate_cache(
-    root: Path, progress: CacheProgress
+    root: Path,
+    progress: CacheProgress,
+    *,
+    allow_cross_split_duplicates: bool = False,
 ) -> _ValidationResult:
     structure_ids: set[str] = set()
+    split_ids_by_name: dict[str, frozenset[str]] = {}
     feature_dtype: torch.dtype | None = None
     declared_paths: set[Path] = set()
     parsed_splits: dict[str, tuple[CacheShard, ...]] = {}
@@ -540,6 +546,7 @@ def _validate_cache(
         expected_structure_index = 0
         total_atoms = 0
         parsed_records: list[CacheShard] = []
+        split_structure_ids: set[str] = set()
 
         for position, raw_record in enumerate(state["shards"]):
             record_where = (
@@ -580,12 +587,19 @@ def _validate_cache(
             ):
                 raise _bad(shard_where, "committed counts are false")
 
-            duplicates = structure_ids.intersection(shard_ids)
-            if duplicates:
+            same_split_duplicates = split_structure_ids.intersection(shard_ids)
+            if same_split_duplicates:
+                raise _bad(
+                    shard_where,
+                    "duplicate structure_ids within a cache split",
+                )
+            cross_split_duplicates = structure_ids.intersection(shard_ids)
+            if not allow_cross_split_duplicates and cross_split_duplicates:
                 raise _bad(
                     shard_where,
                     "duplicate structure_ids across cache splits or shards",
                 )
+            split_structure_ids.update(shard_ids)
             structure_ids.update(shard_ids)
 
             if feature_dtype is None:
@@ -616,10 +630,12 @@ def _validate_cache(
             raise _bad(split, "committed progress counts are false")
         parsed_splits[split] = tuple(parsed_records)
 
+        split_ids_by_name[split] = frozenset(split_structure_ids)
     _reject_undeclared_shards(root, declared_paths)
     return _ValidationResult(
         structure_ids=frozenset(structure_ids),
         feature_dtype=feature_dtype,
+        split_structure_ids=split_ids_by_name,
         splits=parsed_splits,
     )
 
@@ -683,19 +699,24 @@ class CacheWriter:
         *,
         cache_id: str,
         shard_max_atoms: int,
+        allow_cross_split_duplicates: bool = False,
     ) -> None:
         if not isinstance(cache_id, str) or not cache_id:
             raise ValueError("cache_id must be a non-empty string")
         if type(shard_max_atoms) is not int or shard_max_atoms < 1:
             raise ValueError("shard_max_atoms must be a positive integer")
+        if type(allow_cross_split_duplicates) is not bool:
+            raise ValueError("allow_cross_split_duplicates must be a boolean")
 
         self.root = Path(root)
         self.cache_id = cache_id
         self.shard_max_atoms = shard_max_atoms
+        self.allow_cross_split_duplicates = allow_cross_split_duplicates
         self.splits: dict[str, dict[str, Any]] = {}
         self._buffer: list[ContinuousBatch] = []
         self._active_split: str | None = None
         self._seen_structure_ids: set[str] = set()
+        self._seen_structure_ids_by_split: dict[str, set[str]] = {}
         self._feature_dtype: torch.dtype | None = None
 
         self.root.mkdir(parents=True, exist_ok=True)
@@ -705,26 +726,42 @@ class CacheWriter:
         progress_path = self.root / "progress.pt"
         if progress_path.exists():
             progress = _load_progress(self.root, cache_id)
-            validation = _validate_cache(self.root, progress)
+            validation = _validate_cache(
+                self.root,
+                progress,
+                allow_cross_split_duplicates=allow_cross_split_duplicates,
+            )
             if progress.shard_max_atoms != shard_max_atoms:
                 raise _bad("progress.pt", "shard_max_atoms mismatch")
             self.splits = progress.splits
             self._seen_structure_ids.update(validation.structure_ids)
             self._feature_dtype = validation.feature_dtype
+            self._seen_structure_ids_by_split.update(
+                {name: set(ids) for name, ids in validation.split_structure_ids.items()}
+            )
         else:
             self._save_progress()
 
     @classmethod
     def resume(
-        cls, root: Path, *, expected_cache_id: str
+        cls,
+        root: Path,
+        *,
+        expected_cache_id: str,
+        allow_cross_split_duplicates: bool = False,
     ) -> "CacheWriter":
         cache_root = Path(root)
         progress = _load_progress(cache_root, expected_cache_id)
-        _validate_cache(cache_root, progress)
+        _validate_cache(
+            cache_root,
+            progress,
+            allow_cross_split_duplicates=allow_cross_split_duplicates,
+        )
         return cls(
             cache_root,
             cache_id=expected_cache_id,
             shard_max_atoms=progress.shard_max_atoms,
+            allow_cross_split_duplicates=allow_cross_split_duplicates,
         )
 
     def _save_progress(self) -> None:
@@ -771,9 +808,12 @@ class CacheWriter:
         buffered_ids = {
             structure.structure_id[0] for structure in self._buffer
         }
-        duplicates = set(validated.structure_id).intersection(
-            self._seen_structure_ids | buffered_ids
+        seen_ids = (
+            self._seen_structure_ids_by_split.get(split, set()) | buffered_ids
         )
+        if not self.allow_cross_split_duplicates:
+            seen_ids |= self._seen_structure_ids
+        duplicates = set(validated.structure_id).intersection(seen_ids)
         if duplicates:
             raise _bad(
                 split,
@@ -896,6 +936,9 @@ class CacheWriter:
         state["num_atoms"] += atom_count
         state["next_shard_index"] += 1
         self._seen_structure_ids.update(structure_ids)
+        self._seen_structure_ids_by_split.setdefault(split, set()).update(
+            structure_ids
+        )
         self._buffer.clear()
         self._save_progress()
 
@@ -922,7 +965,11 @@ class CacheWriter:
             raise CacheIncompleteError("cache has incomplete splits")
 
         progress = _load_progress(self.root, self.cache_id)
-        _validate_cache(self.root, progress)
+        _validate_cache(
+            self.root,
+            progress,
+            allow_cross_split_duplicates=self.allow_cross_split_duplicates,
+        )
         atomic_json_dump(
             self.root / "cache_manifest.json",
             {
@@ -936,7 +983,9 @@ class CacheWriter:
             },
         )
         return load_complete_cache(
-            self.root, expected_cache_id=self.cache_id
+            self.root,
+            expected_cache_id=self.cache_id,
+            allow_cross_split_duplicates=self.allow_cross_split_duplicates,
         )
 
 
@@ -1002,8 +1051,13 @@ def _load_manifest_payload(
 
 
 def load_complete_cache(
-    root: Path, *, expected_cache_id: str
+    root: Path,
+    *,
+    expected_cache_id: str,
+    allow_cross_split_duplicates: bool = False,
 ) -> CacheManifest:
+    if type(allow_cross_split_duplicates) is not bool:
+        raise ValueError("allow_cross_split_duplicates must be a boolean")
     cache_root = Path(root)
     manifest_path = cache_root / "cache_manifest.json"
     if not manifest_path.is_file():
@@ -1013,7 +1067,11 @@ def load_complete_cache(
         manifest_path, expected_cache_id=expected_cache_id
     )
     progress = _load_progress(cache_root, expected_cache_id)
-    validation = _validate_cache(cache_root, progress)
+    validation = _validate_cache(
+        cache_root,
+        progress,
+        allow_cross_split_duplicates=allow_cross_split_duplicates,
+    )
     if not progress.splits or not all(
         state["complete"] is True for state in progress.splits.values()
     ):
@@ -1038,6 +1096,7 @@ def load_complete_cache(
         root=cache_root,
         cache_id=expected_cache_id,
         complete=True,
+        allow_cross_split_duplicates=allow_cross_split_duplicates,
         splits=manifest_splits,
     )
 
@@ -1052,11 +1111,15 @@ def _bind_manifest(manifest: object) -> CacheManifest:
         raise _bad("manifest.complete", "must be a boolean")
     if not manifest.complete:
         raise CacheIncompleteError("cache manifest is incomplete")
+    if type(manifest.allow_cross_split_duplicates) is not bool:
+        raise _bad("manifest.allow_cross_split_duplicates", "must be a boolean")
     if not isinstance(manifest.splits, dict):
         raise _bad("manifest.splits", "must be a mapping")
 
     committed = load_complete_cache(
-        manifest.root, expected_cache_id=manifest.cache_id
+        manifest.root,
+        expected_cache_id=manifest.cache_id,
+        allow_cross_split_duplicates=manifest.allow_cross_split_duplicates,
     )
     if manifest != committed:
         raise _bad("manifest", "object is not bound to the committed manifest")

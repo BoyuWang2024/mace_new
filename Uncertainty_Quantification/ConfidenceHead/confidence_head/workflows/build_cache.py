@@ -276,7 +276,11 @@ def _open_writer(
             raise CacheIncompleteError(
                 "partial cache exists but cache.resume is disabled"
             )
-        return CacheWriter.resume(root, expected_cache_id=identity)
+        return CacheWriter.resume(
+            root,
+            expected_cache_id=identity,
+            allow_cross_split_duplicates=config.profile == "smoke_test",
+        )
 
     if root.exists() and any(root.iterdir()):
         raise CacheCorruptionError(
@@ -286,6 +290,7 @@ def _open_writer(
         root,
         cache_id=identity,
         shard_max_atoms=config.cache.shard_max_atoms,
+        allow_cross_split_duplicates=config.profile == "smoke_test",
     )
 
 
@@ -307,7 +312,11 @@ def run_build_cache(config: ConfidenceHeadConfig) -> Path:
     identity = _cache_identity(config)
     root = _cache_root(config, identity)
     try:
-        manifest = load_complete_cache(root, expected_cache_id=identity)
+        manifest = load_complete_cache(
+            root,
+            expected_cache_id=identity,
+            allow_cross_split_duplicates=config.profile == "smoke_test",
+        )
     except CacheIncompleteError:
         pass
     else:
