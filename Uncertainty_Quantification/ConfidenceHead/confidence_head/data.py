@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import Mapping
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
@@ -25,6 +26,9 @@ if TYPE_CHECKING:
 
 ENERGY_KEY = "REF_energy"
 FORCES_KEY = "REF_forces"
+_SAMPLE_ID_PATTERN = re.compile(
+    r"^(?P<content>[0-9a-f]{64})#(?P<occurrence>0|[1-9][0-9]*)$"
+)
 
 
 @dataclass(frozen=True)
@@ -223,6 +227,7 @@ def build_structure_batch(
     indices: Sequence[int],
     backbone: BackboneIdentity,
     device: str | torch.device = "cpu",
+    sample_ids: Sequence[str] | None = None,
 ) -> StructureBatch:
     """Convert ordered ASE structures to a typed MACE graph batch."""
     from mace.data import AtomicData, KeySpecification, config_from_atoms
@@ -231,9 +236,12 @@ def build_structure_batch(
 
     if len(structures) != len(indices):
         raise DataContractError("structure indices must align with the batch")
+    if sample_ids is not None and len(structures) != len(sample_ids):
+        raise DataContractError("sample IDs must align with the batch")
     if not structures:
         raise DataContractError("cannot build an empty structure batch")
 
+    supplied_sample_ids = tuple(sample_ids) if sample_ids is not None else None
     supported = set(backbone.atomic_numbers)
     z_table = AtomicNumberTable(list(backbone.atomic_numbers))
     keys = KeySpecification.from_defaults()
@@ -263,7 +271,21 @@ def build_structure_batch(
         graphs.append(graph)
         energies.append(float(energy))
         forces.append(np.asarray(reference_forces))
-        ids.append(structure_id(atoms))
+        content_id = structure_id(atoms)
+        if supplied_sample_ids is None:
+            ids.append(f"{content_id}#0")
+        else:
+            sample_id = supplied_sample_ids[index]
+            match = _SAMPLE_ID_PATTERN.fullmatch(sample_id)
+            if match is None:
+                raise DataContractError(
+                    "sample ID must match <64-lowercase-hex>#<occurrence>"
+                )
+            if match.group("content") != content_id:
+                raise DataContractError(
+                    "sample ID content prefix does not match structure content"
+                )
+            ids.append(sample_id)
         counts.append(len(atoms))
         atomic_numbers.append(np.asarray(atoms.get_atomic_numbers()))
 

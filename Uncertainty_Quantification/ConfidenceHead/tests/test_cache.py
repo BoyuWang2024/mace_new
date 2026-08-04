@@ -639,6 +639,25 @@ def test_invalid_batch_does_not_partially_mutate_writer(tmp_path: Path) -> None:
     )["structure_id"] == batch.structure_id
 
 
+def test_writer_accepts_duplicate_content_with_unique_sample_ids(
+    tmp_path: Path,
+) -> None:
+    from confidence_head.cache import CacheWriter
+
+    content_id = "a" * 64
+    batch = replace(
+        batch_with_atom_counts([2, 2]),
+        structure_id=(f"{content_id}#0", f"{content_id}#1"),
+    )
+    writer = CacheWriter(tmp_path, cache_id="cache", shard_max_atoms=10)
+
+    writer.append(batch, split="train")
+    writer.finalize_split("train")
+
+    shard = load_torch_artifact(tmp_path / "train" / "shard-000000.pt")
+    assert shard["structure_id"] == batch.structure_id
+
+
 def test_writer_rejects_dtype_changes_between_batches(tmp_path: Path) -> None:
     from confidence_head.cache import CacheCorruptionError, CacheWriter
 

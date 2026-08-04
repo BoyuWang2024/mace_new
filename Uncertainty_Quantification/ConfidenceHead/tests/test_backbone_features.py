@@ -373,8 +373,15 @@ def test_structure_batch_and_continuous_batch_preserve_backbone_dtype(
     install_fake_backbone(monkeypatch, model)
     identity = load_frozen_backbone(checkpoint_config(checkpoint)).identity
     atoms = (reference_atoms(), reference_atoms(numbers=(8,), energy=0.75))
+    content_ids = tuple(structure_id(item) for item in atoms)
+    sample_ids = (f"{content_ids[0]}#3", f"{content_ids[1]}#7")
 
-    batch = build_structure_batch(atoms, indices=(3, 7), backbone=identity)
+    batch = build_structure_batch(
+        atoms,
+        indices=(3, 7),
+        backbone=identity,
+        sample_ids=sample_ids,
+    )
     assert batch.indices.tolist() == [3, 7]
     assert batch.num_atoms.tolist() == [2, 1]
     assert batch.atomic_numbers.tolist() == [1, 1, 8]
@@ -390,8 +397,50 @@ def test_structure_batch_and_continuous_batch_preserve_backbone_dtype(
     assert continuous.features.dtype == torch.float64
     assert continuous.features.requires_grad is False
     assert continuous.atomic_numbers.tolist() == [1, 1, 8]
-    assert continuous.structure_ids == tuple(structure_id(item) for item in atoms)
+    assert continuous.structure_ids == sample_ids
 
     wrong_dtype = torch.ones(3, 640, dtype=torch.float32)
     with pytest.raises(FeatureSchemaError, match="dtype and device"):
         to_continuous_batch(batch, wrong_dtype)
+
+
+@pytest.mark.parametrize(
+    ("sample_ids_factory", "message"),
+    (
+        (lambda content_id: (), "sample IDs must align"),
+        (lambda content_id: (content_id,), "sample ID must match"),
+        (lambda content_id: (f"{'0' * 64}#0",), "content prefix"),
+        (lambda content_id: (f"{content_id}#01",), "sample ID must match"),
+    ),
+)
+def test_structure_batch_rejects_invalid_sample_ids(
+    tmp_path, monkeypatch, sample_ids_factory, message
+):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    model = FakeScaleShiftMACE(dtype=torch.float64)
+    install_fake_backbone(monkeypatch, model)
+    identity = load_frozen_backbone(checkpoint_config(checkpoint)).identity
+    atoms = (reference_atoms(),)
+    content_id = structure_id(atoms[0])
+
+    with pytest.raises(DataContractError, match=message):
+        build_structure_batch(
+            atoms,
+            indices=(0,),
+            backbone=identity,
+            sample_ids=sample_ids_factory(content_id),
+        )
+
+
+def test_structure_batch_fallback_uses_zero_occurrence(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    model = FakeScaleShiftMACE(dtype=torch.float64)
+    install_fake_backbone(monkeypatch, model)
+    identity = load_frozen_backbone(checkpoint_config(checkpoint)).identity
+    atoms = (reference_atoms(),)
+
+    batch = build_structure_batch(atoms, indices=(0,), backbone=identity)
+
+    assert batch.structure_ids == (f"{structure_id(atoms[0])}#0",)

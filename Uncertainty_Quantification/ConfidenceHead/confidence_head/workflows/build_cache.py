@@ -223,13 +223,14 @@ def cache_one_split(
     batch_size = config.cache.build_batch_size
     for start in range(next_index, handle.size, batch_size):
         stop = min(start + batch_size, handle.size)
+        expected_ids = handle.structure_ids[start:stop]
         batch = build_structure_batch(
             structures[start:stop],
             indices=range(start, stop),
             backbone=loaded.identity,
             device=config.runtime.device,
+            sample_ids=expected_ids,
         )
-        expected_ids = handle.structure_ids[start:stop]
         if batch.structure_ids != expected_ids:
             raise DataContractError(f"{name} changed after identity validation")
 

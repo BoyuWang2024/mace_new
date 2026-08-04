@@ -406,10 +406,12 @@ def test_cache_one_split_uses_ordered_indices_force_and_one_forward_per_batch(
     )
     monkeypatch.setattr(workflow, "read_structures", lambda _path: structures)
     built_indices = []
+    built_sample_ids = []
 
-    def fake_build(items, *, indices, backbone, device):
+    def fake_build(items, *, indices, backbone, device, sample_ids):
         del backbone, device
         built_indices.append(tuple(indices))
+        built_sample_ids.append(tuple(sample_ids))
         atom_count = len(items)
         model_input = {
             "batch": len(items),
@@ -458,6 +460,10 @@ def test_cache_one_split_uses_ordered_indices_force_and_one_forward_per_batch(
     )
 
     assert built_indices == [(1, 2), (3, 4)]
+    assert built_sample_ids == [
+        structure_ids[1:3],
+        structure_ids[3:5],
+    ]
     assert len(forwards) == 2
     assert [item[0]["batch"] for item in forwards] == [2, 2]
     assert [item[1] for item in forwards] == [
@@ -582,7 +588,7 @@ def test_cache_one_split_uses_source_atomic_numbers_with_real_mace_graph(
     handle = SimpleNamespace(
         path=split_path,
         size=2,
-        structure_ids=tuple(structure_id(atoms) for atoms in round_tripped),
+        structure_ids=tuple(f"{structure_id(atoms)}#0" for atoms in round_tripped),
     )
     identity = BackboneIdentity(
         sha256="a" * 64,
