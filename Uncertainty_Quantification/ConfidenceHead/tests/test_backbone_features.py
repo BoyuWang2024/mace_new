@@ -16,6 +16,7 @@ from torch import nn
 from confidence_head.backbone import load_frozen_backbone
 from confidence_head.config import CheckpointConfig, FeatureModuleConfig
 from confidence_head.data import (
+    DatasetHandle,
     build_structure_batch,
     load_dataset,
     structure_id,
@@ -201,13 +202,40 @@ def test_dataset_load_accepts_ase_reserved_calculator_labels(tmp_path):
     assert first.structure_ids != second.structure_ids
 
 
+def test_dataset_load_assigns_occurrence_qualified_sample_ids(tmp_path):
+    duplicate = reference_atoms(energy=-1.25)
+    distinct = reference_atoms(energy=-1.5)
+    path = write_split(
+        tmp_path / "duplicates.extxyz",
+        [duplicate, duplicate.copy(), distinct],
+    )
+
+    handle = load_dataset(path, sha256_file(path), (1, 8))
+
+    duplicate_content = "6fadd5132db5dd3c003289e0d8f078b0903c524973c6f4bc63da8ec69173b3d0"
+    distinct_content = "d771b445bcfebd3a02cdf07abb824f148a8e5fa1d3053a1bca3a13ef73cedc35"
+    assert handle.content_ids == (
+        duplicate_content,
+        duplicate_content,
+        distinct_content,
+    )
+    assert handle.structure_ids == (
+        f"{duplicate_content}#0",
+        f"{duplicate_content}#1",
+        f"{distinct_content}#0",
+    )
+    assert handle.size == 3
+
+
 def test_dataset_load_validates_hash_targets_elements_and_finiteness(tmp_path):
     valid_path = write_split(tmp_path / "valid.extxyz", [reference_atoms()])
     handle = load_dataset(valid_path, sha256_file(valid_path), (1, 8))
     assert handle.path == valid_path.resolve()
     assert handle.sha256 == sha256_file(valid_path)
     assert handle.size == 1
-    assert handle.structure_ids == (structure_id(reference_atoms()),)
+    content_id = "6fadd5132db5dd3c003289e0d8f078b0903c524973c6f4bc63da8ec69173b3d0"
+    assert handle.content_ids == (content_id,)
+    assert handle.structure_ids == (f"{content_id}#0",)
 
     with pytest.raises(DataContractError, match="SHA-256"):
         load_dataset(valid_path, "0" * 64, (1, 8))
@@ -250,6 +278,35 @@ def test_production_splits_reject_structure_level_overlap(tmp_path):
     with pytest.raises(DataContractError, match="overlap"):
         validate_split_isolation(train, validation, test, profile="production")
     validate_split_isolation(train, validation, test, profile="smoke_test")
+
+
+def test_production_split_isolation_compares_content_not_sample_ids(tmp_path):
+    shared = "a" * 64
+    distinct = "b" * 64
+    train = DatasetHandle(
+        path=tmp_path / "train.extxyz",
+        sha256="1" * 64,
+        content_ids=(shared,),
+        structure_ids=(f"{shared}#7",),
+        size=1,
+    )
+    validation = DatasetHandle(
+        path=tmp_path / "validation.extxyz",
+        sha256="2" * 64,
+        content_ids=(distinct,),
+        structure_ids=(f"{distinct}#0",),
+        size=1,
+    )
+    test = DatasetHandle(
+        path=tmp_path / "test.extxyz",
+        sha256="3" * 64,
+        content_ids=(shared,),
+        structure_ids=(f"{shared}#0",),
+        size=1,
+    )
+
+    with pytest.raises(DataContractError, match="overlap"):
+        validate_split_isolation(train, validation, test, profile="production")
 
 
 def test_load_frozen_backbone_verifies_type_default_head_and_sha(monkeypatch, tmp_path):

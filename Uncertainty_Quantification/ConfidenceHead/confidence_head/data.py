@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 import hashlib
 import json
@@ -30,6 +31,7 @@ FORCES_KEY = "REF_forces"
 class DatasetHandle:
     path: Path
     sha256: str
+    content_ids: tuple[str, ...]
     structure_ids: tuple[str, ...]
     size: int
 
@@ -100,6 +102,16 @@ def structure_id(atoms: Atoms) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _sample_ids(content_ids: Sequence[str]) -> tuple[str, ...]:
+    occurrences: Counter[str] = Counter()
+    sample_ids = []
+    for content_id in content_ids:
+        occurrence = occurrences[content_id]
+        sample_ids.append(f"{content_id}#{occurrence}")
+        occurrences[content_id] += 1
+    return tuple(sample_ids)
+
+
 def _read_structures(path: Path) -> list[Atoms]:
     try:
         structures = ase.io.read(path, index=":")
@@ -141,23 +153,25 @@ def load_dataset(
         )
     structures = _read_structures(resolved)
     supported = {int(number) for number in supported_atomic_numbers}
-    structure_ids = []
+    content_ids = []
     for index, atoms in enumerate(structures):
         _validate_structure(
             atoms, supported_atomic_numbers=supported, context=f"structure {index}"
         )
-        structure_ids.append(structure_id(atoms))
+        content_ids.append(structure_id(atoms))
+    content_ids_tuple = tuple(content_ids)
     return DatasetHandle(
         path=resolved,
         sha256=actual_sha256,
-        structure_ids=tuple(structure_ids),
+        content_ids=content_ids_tuple,
+        structure_ids=_sample_ids(content_ids_tuple),
         size=len(structures),
     )
 
 
-def _structure_ids(source: Path | DatasetHandle) -> tuple[str, ...]:
+def _content_ids(source: Path | DatasetHandle) -> tuple[str, ...]:
     if isinstance(source, DatasetHandle):
-        return source.structure_ids
+        return source.content_ids
     structures = _read_structures(Path(source).resolve())
     for index, atoms in enumerate(structures):
         _validate_structure(
@@ -179,9 +193,9 @@ def validate_split_isolation(
     if profile != "production":
         return
     split_ids = {
-        "train": set(_structure_ids(train)),
-        "validation": set(_structure_ids(validation)),
-        "test": set(_structure_ids(test)),
+        "train": set(_content_ids(train)),
+        "validation": set(_content_ids(validation)),
+        "test": set(_content_ids(test)),
     }
     for left, right in (
         ("train", "validation"),
