@@ -40,6 +40,12 @@ Git clean commit 与 dirty 工作树属于不同代码身份。允许 dirty Git 
 
 cache-v2 的每个 shard 只保存 tensor 和基础类型，包括结构 ID、原子序数、原子 offsets、640 维特征、Force/Energy prediction 与 reference。一个结构绝不跨 shard。feature dtype 在同一 cache 内统一，预测与参考保留各自来源 dtype；拟合连续误差时统一提升为 CPU float64。manifest 记录每个 shard 的 SHA、范围、结构数、原子数、shape 和 dtype。
 
+这里的结构 ID 是“样本 ID”，格式固定为 `<64 位小写十六进制内容哈希>#<出现序号>`。内容哈希覆盖规范化后的原子序数、坐标、晶胞、周期边界、参考能量和参考力；出现序号从 0 开始，按原始 extxyz 顺序对同一内容分别编号。因此，完全相同的两条记录会得到相同内容哈希、不同样本 ID（例如 `...#0` 与 `...#1`），两条记录都会参与缓存、分箱和训练，不会被静默去重。
+
+生产 split 隔离仍按“内容哈希”比较，而不是按样本 ID 比较：同一内容位于不同 split 时仍会被视为数据泄漏并拒绝。cache writer 则按“样本 ID”检查全局唯一性，所以同一 split 内的重复记录可以安全保存，同时真正的重复写入、乱序恢复或跨 shard ID 冲突仍会失败。
+
+该样本身份规则属于缓存语义。由旧代码生成、结构 ID 不带 `#出现序号` 的未完成缓存不能续用；升级后必须从索引 0 重建。不要手工改写 shard 或 `progress.pt`。完整旧缓存应作为不可变证据保留或移出当前输出根；确认没有任务正在使用且没有 complete manifest 后，才可以删除明确定位的未完成缓存目录。
+
 构建进度只在一个完整 shard 原子提交后前移。恢复前重新核验已经提交的全部 shard；只有 complete manifest 存在且重新验证通过，后续阶段才能读取缓存。binning 也采取“一旦存在即严格重验”的不可变规则：artifact 和 manifest 必须成对出现，内容哈希与身份必须完全相符，半成品不会被默默覆盖。
 
 epoch 采样以完整结构为单位。每个 epoch 使用 `seed + epoch` 派生确定性结构 shuffle，再按配置 batch size 拼接原子和 offsets。中断恢复会从上一个完整 epoch 使用相同 seed 重建相同顺序；不会保存或恢复一个未提交 epoch 的半批次。validation 不 shuffle，并在 `eval` 与 `no_grad` 下按真实样本数汇总。
