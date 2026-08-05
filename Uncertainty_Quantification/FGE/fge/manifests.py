@@ -46,6 +46,7 @@ def build_training_manifest(
     project_name: str,
     k_requested: int,
     base_model_path: Path,
+    base_model_metrics: Mapping[str, Any],
     members: Sequence[Mapping[str, Any]],
     warnings: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -53,6 +54,12 @@ def build_training_manifest(
 
     if k_requested < 2 or len(members) != k_requested:
         raise HardFailure("training manifest K does not match committed members")
+    if set(base_model_metrics) != {"energy_rmse", "forces_rmse"}:
+        raise HardFailure("base model metrics must contain energy_rmse and forces_rmse")
+    serialized_base_metrics = deepcopy(dict(base_model_metrics))
+    _require_finite_json(serialized_base_metrics, "base_model_metrics")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 for value in serialized_base_metrics.values()):
+        raise HardFailure("base model RMSE values must be finite and nonnegative")
     serialized_members: list[dict[str, Any]] = []
     for index, member in enumerate(members, start=1):
         expected_id = f"member_{index:02d}"
@@ -88,6 +95,7 @@ def build_training_manifest(
         "k_requested": k_requested,
         "k_committed": len(serialized_members),
         "base_model_sha256": sha256_file(base_model_path),
+        "base_model_metrics": serialized_base_metrics,
         "members": serialized_members,
         "warnings": warning_payload,
     }

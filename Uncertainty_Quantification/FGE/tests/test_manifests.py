@@ -29,14 +29,15 @@ def test_training_manifest_uses_contiguous_members_and_current_hashes(tmp_path: 
         project_name="case",
         k_requested=2,
         base_model_path=base,
+        base_model_metrics={"energy_rmse": 1.2, "forces_rmse": 2.2},
         members=[
             {
                 "member_id": "member_01",
                 "cycle": 1,
                 "raw_path": raw_1,
                 "ema_path": ema_1,
-                "raw_metrics": {"rmse_e_per_atom": 1.0, "rmse_f": 2.0},
-                "ema_metrics": {"rmse_e_per_atom": 1.1, "rmse_f": 2.1},
+                "raw_metrics": {"energy_rmse": 1.0, "forces_rmse": 2.0},
+                "ema_metrics": {"energy_rmse": 1.1, "forces_rmse": 2.1},
                 "frozen_backbone_verified": True,
             },
             {
@@ -44,8 +45,8 @@ def test_training_manifest_uses_contiguous_members_and_current_hashes(tmp_path: 
                 "cycle": 2,
                 "raw_path": raw_2,
                 "ema_path": ema_2,
-                "raw_metrics": {"rmse_e_per_atom": 0.9, "rmse_f": 1.9},
-                "ema_metrics": {"rmse_e_per_atom": 1.0, "rmse_f": 2.0},
+                "raw_metrics": {"energy_rmse": 0.9, "forces_rmse": 1.9},
+                "ema_metrics": {"energy_rmse": 1.0, "forces_rmse": 2.0},
                 "frozen_backbone_verified": True,
             },
         ],
@@ -54,6 +55,7 @@ def test_training_manifest_uses_contiguous_members_and_current_hashes(tmp_path: 
 
     assert manifest["k_requested"] == manifest["k_committed"] == 2
     assert manifest["base_model_sha256"] == sha256_file(base)
+    assert manifest["base_model_metrics"] == {"energy_rmse": 1.2, "forces_rmse": 2.2}
     assert manifest["members"][0]["raw"]["path"] == (
         "training/members/raw/member_01.model"
     )
