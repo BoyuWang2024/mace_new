@@ -1,0 +1,44 @@
+schema_version: fge.v1
+project: {name: mace_fge_full_gpu_b64_lr1e-7_1e-6, method: FGE, backend: mace}
+paths:
+  base_checkpoint: ../../../data/checkpoint/MACE-matpes-r2scan-omat-ft.model
+  train_data: ../../../data/dataset/matpes_train.extxyz
+  val_data: ../../../data/dataset/matpes_val.extxyz
+  test_data: ../../../data/dataset/matpes_test.extxyz
+  output_root: ../outputs/mace_fge_full_gpu_b64_lr1e-7_1e-6
+data: {format: extxyz, energy_key: energy, forces_key: forces, stress_key: stress, head_name: default}
+training:
+  mode: readout_only_official_mace
+  trainable_scope: readouts
+  expected_readout_parameter_count: 2192
+  seed: 2026
+  member_count: 8
+  epochs_per_cycle: 8
+  batch_size: 64
+  validation_batch_size: 64
+  weight_decay: 0.0
+  energy_weight: 1.0
+  forces_weight: 1.0
+  stress_weight: 10.0
+  huber_delta: 0.01
+  beta: 0.9
+  amsgrad: false
+  max_grad_norm: 10.0
+  device: cuda
+ema: {enabled: true, mode: global, decay: 0.99, main_member_source: raw}
+fge: {schedule: asymmetric_triangular, rise_fraction: 0.2, lr_min: 1.0e-7, lr_max: 1.0e-6}
+prediction: {split: test, member_source: raw, batch_size: 64, compute_stress: false}
+ensemble: {equal_weight: true, validation_error_weighted: true, eps_energy_ratio: 1.0e-3, eps_force_ratio: 1.0e-3}
+evaluation:
+  risk_coverages: [1.0, 0.95, 0.9, 0.8, 0.7, 0.5, 0.3, 0.1]
+  force_structure_quantile: 0.95
+quality: {weak_rmse_multiplier: 1.5, collapsed_rmse_multiplier: 3.0}
+wandb: {enabled: true, project: FGE_MACE_UQ, entity: "", mode: online}
+smoke:
+  enabled: false
+  allow_identical_splits: false
+  max_train_structures: 20
+  max_validation_structures: 20
+  max_test_structures: 20
+  max_train_batches: 3
+  max_validation_batches: 2
