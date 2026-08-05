@@ -6,7 +6,7 @@
 
 **Architecture:** 发布核心位于 `Uncertainty_Quantification/FGE/fge`，所有原生运行和迁移结果共用唯一的配置、artifact 写入器、数值计算和验证器。旧格式读取仅存在于 `internal_migration`；迁移器只复制成员模型、重封装既有 prediction，并从 prediction 重算评估产物。四组全量迁移与全部测试只在远端进行，本地仓库不保存 outputs。
 
-**Tech Stack:** Python 3.10、PyTorch、MACE、ASE/extxyz、PyYAML、NumPy、SciPy、torch-ema、pytest、W&B（可降级）。
+**Tech Stack:** Python 3.11、PyTorch、MACE、ASE/extxyz、PyYAML、NumPy、SciPy、torch-ema、pytest、W&B（可降级）。
 
 ## Global Constraints
 
@@ -123,12 +123,10 @@ if "$conda_exe" env list | awk '$1 == "mace_new" { found=1 } END { exit found ? 
   echo 'mace_new already exists before this task' >&2
   exit 2
 fi
-"$conda_exe" create -y -n mace_new python=3.10 pip
-eval "$("$conda_exe" shell.bash hook)"
-conda activate mace_new
+"$conda_exe" create -y -n mace_new --clone /HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace
 cd /HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/code/mace_new
-python -m pip install -e .
-python -m pip install pytest scipy wandb
+"$conda_exe" run -n mace_new python -m pip install -e .
+"$conda_exe" run -n mace_new python -c 'import pytest,scipy,wandb'
 ```
 
 Expected: `python -c 'import mace; print(mace.__file__)'` 指向远端 `mace_new` 工作树。
