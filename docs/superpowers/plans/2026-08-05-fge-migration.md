@@ -13,7 +13,7 @@
 - 只实现 FGE；不得修改或迁移 BootStrapping。
 - 在用户指定的当前 `FGE` 分支原地实施，不创建新分支；每次提交只精确暂存本任务文件。
 - 本地只开发和提交代码；所有测试、n20 运行和正式迁移都在远端执行。
-- 远端直接使用现有 `mace` Conda 环境，并在远端新仓库根目录执行 `python -m pip install -e .`；禁止克隆环境，只有现有环境不可用时才新建空 `mace_new`。
+- 远端直接使用现有 `mace` Conda 环境，并在远端新仓库根目录执行 `python -m pip install --no-build-isolation -e .`；禁止克隆环境，只有现有环境不可用时才新建空 `mace_new`。
 - 四组正式结果不得重新训练或重新预测；只允许从既有 prediction 重算 uncertainty、metrics、correlations、risk-coverage 和报告。
 - 迁移 raw 与 EMA 最终成员模型；正式 prediction 只有 raw，EMA prediction 状态为 `not_generated`。
 - 不迁移训练日志、旧 W&B、diagnostics、epoch/cycle/resume checkpoint 或图片；本轮不实现绘图。
@@ -118,8 +118,8 @@ Run remotely:
 
 ```bash
 cd /HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/code/mace_new
-/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace/bin/python -m pip install -e .
-/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace/bin/python -m pip install pytest
+/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace/bin/python -m pip install --no-build-isolation -e .
+/APP/u22/ai_x86/anaconda3/2023.09/bin/conda install -y --offline -n mace pytest=7.4.0
 /HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace/bin/python -m pip check
 ```
 
