@@ -117,7 +117,7 @@ ssh -i /mnt/c/Users/52657/.ssh/yt_hku_psmanyam_3.id -p 6688 \
 Run remotely:
 
 ```bash
-conda_exe=$(sed -n 's/^# cmd: \([^ ]*\/conda\) .*/\1/p' /HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace/conda-meta/history | head -1)
+conda_exe=/APP/u22/ai_x86/anaconda3/2023.09/bin/conda
 test -x "$conda_exe"
 if "$conda_exe" env list | awk '$1 == "mace_new" { found=1 } END { exit found ? 0 : 1 }'; then
   echo 'mace_new already exists before this task' >&2
