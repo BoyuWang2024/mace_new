@@ -19,6 +19,7 @@ from .artifacts import ExperimentLayout, atomic_write_json
 from .data import build_mace_loaders, load_extxyz
 from .errors import HardFailure
 from .manifests import build_training_manifest
+from .metric_views import rmse_only
 from .members import ReadoutGuard, commit_member_pair, freeze_readouts
 from .preflight import _load_model, run_preflight
 from .schedule import AsymmetricTriangularLR
@@ -247,7 +248,7 @@ def train_fge(config: Any) -> Path:
         project_name=config.project_name,
         k_requested=training["member_count"],
         base_model_path=base_path,
-        base_model_metrics=base_metrics,
+        base_model_metrics=rmse_only(base_metrics),
         members=members,
         warnings=warnings,
     )

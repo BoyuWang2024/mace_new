@@ -13,6 +13,7 @@ from mace.data import AtomicData, KeySpecification, load_from_xyz
 from mace.tools import AtomicNumberTable, torch_geometric
 
 from .errors import HardFailure
+from .extxyz_standard import read_energy, read_forces, read_stress
 
 
 _OBSERVABLES = frozenset({"energy", "forces", "stress"})
@@ -41,15 +42,15 @@ def load_extxyz(
         raise HardFailure("extxyz contains no structures")
     for index, atoms in enumerate(atoms_list):
         if "energy" in required:
-            value = atoms.info.get(keys["energy"])
+            value = read_energy(atoms, keys)
             if value is None or np.asarray(value).size != 1 or not np.isfinite(value).all():
                 raise HardFailure(f"structure {index} has invalid energy")
         if "forces" in required:
-            value = atoms.arrays.get(keys["forces"])
+            value = read_forces(atoms, keys)
             if value is None or np.asarray(value).shape != (len(atoms), 3) or not np.isfinite(value).all():
                 raise HardFailure(f"structure {index} has invalid forces")
         if "stress" in required:
-            value = atoms.info.get(keys["stress"])
+            value = read_stress(atoms, keys)
             if value is None or np.asarray(value).shape not in {(6,), (3, 3)} or not np.isfinite(value).all():
                 raise HardFailure(f"structure {index} has invalid stress")
     specification = KeySpecification(

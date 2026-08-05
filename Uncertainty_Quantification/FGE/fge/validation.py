@@ -20,10 +20,12 @@ from .artifacts import (
     sha256_file,
 )
 from .errors import HardFailure
+from .ensemble_branch_checks import assert_stored_weights
 from .evaluation import _comparison_pairs, _metric_summary, _uncertainty_payload
 from .manifests import build_result_manifest
 from .metrics import compute_correlations, compute_errors, compute_risk_coverage
 from .prediction import PredictionShape, validate_prediction_payload
+from .prediction_views import prediction_member_count
 
 
 _FORBIDDEN_KEYS = {
@@ -148,6 +150,7 @@ def _validate_branch(
     expected_energy = weighted_mean(prediction["energy_members"], energy_weights)
     expected_forces = weighted_mean(prediction["forces_members"], force_weights)
     _assert_tensor_equal(ensemble.get("energy"), expected_energy, f"{branch}.energy")
+    assert_stored_weights(ensemble, energy_weights, force_weights, prediction_member_count(prediction), branch)
     _assert_tensor_equal(ensemble.get("forces"), expected_forces, f"{branch}.forces")
     expected_uncertainty = _uncertainty_payload(prediction, energy_weights, force_weights)
     for name, expected in expected_uncertainty.items():
