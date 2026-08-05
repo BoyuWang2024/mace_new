@@ -13,7 +13,7 @@
 - 只实现 FGE；不得修改或迁移 BootStrapping。
 - 在用户指定的当前 `FGE` 分支原地实施，不创建新分支；每次提交只精确暂存本任务文件。
 - 本地只开发和提交代码；所有测试、n20 运行和正式迁移都在远端执行。
-- 远端必须创建全新的 `mace_new` Conda 环境，并在远端新仓库根目录执行 `python -m pip install -e .`。
+- 远端直接使用现有 `mace` Conda 环境，并在远端新仓库根目录执行 `python -m pip install -e .`；禁止克隆环境，只有现有环境不可用时才新建空 `mace_new`。
 - 四组正式结果不得重新训练或重新预测；只允许从既有 prediction 重算 uncertainty、metrics、correlations、risk-coverage 和报告。
 - 迁移 raw 与 EMA 最终成员模型；正式 prediction 只有 raw，EMA prediction 状态为 `not_generated`。
 - 不迁移训练日志、旧 W&B、diagnostics、epoch/cycle/resume checkpoint 或图片；本轮不实现绘图。
@@ -70,17 +70,17 @@ Uncertainty_Quantification/FGE/
 
 ---
 
-### Task 0: 远端代码副本与全新 `mace_new` Conda 环境
+### Task 0: 远端代码副本与现有 `mace` 环境配置
 
 **Files:**
 - No local source changes。
 - Create remotely: `/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/code/mace_new`。
-- Create remotely: Conda environment `mace_new`。
+- Reuse remotely: existing Conda environment `mace`；禁止克隆该环境。
 
 **Interfaces:**
 - Remote SSH endpoint: `yt_hku_psmanyam_3@121.46.19.6:6688`，使用用户指定私钥和 `StrictHostKeyChecking=yes`。
 - Remote repository is bootstrapped from a Git bundle of the local `FGE` branch；不复制本地 ignored 数据或远端旧结果。
-- Conda executable is resolved from the existing `mace` environment's `conda-meta/history`，随后创建独立的 `mace_new`。
+- Remote Python is `/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace/bin/python`。
 
 - [ ] **Step 1: 只接受已知主机密钥并确认目标尚不存在**
 
@@ -112,24 +112,18 @@ ssh -i /mnt/c/Users/52657/.ssh/yt_hku_psmanyam_3.id -p 6688 \
 
 删除本地临时 bundle 只针对 `mktemp` 返回的 `/tmp/mace_new-fge.*.bundle` 文件；远端 bundle 在 clone 验证后删除。
 
-- [ ] **Step 3: 从既有环境历史定位 Conda 并创建新环境**
+- [ ] **Step 3: 在现有 `mace` 环境执行 editable install**
 
 Run remotely:
 
 ```bash
-conda_exe=/APP/u22/ai_x86/anaconda3/2023.09/bin/conda
-test -x "$conda_exe"
-if "$conda_exe" env list | awk '$1 == "mace_new" { found=1 } END { exit found ? 0 : 1 }'; then
-  echo 'mace_new already exists before this task' >&2
-  exit 2
-fi
-"$conda_exe" create -y -n mace_new --clone /HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace
 cd /HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/code/mace_new
-"$conda_exe" run -n mace_new python -m pip install -e .
-"$conda_exe" run -n mace_new python -c 'import pytest,scipy,wandb'
+/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace/bin/python -m pip install -e .
+/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace/bin/python -m pip install pytest
+/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/.conda/envs/mace/bin/python -m pip check
 ```
 
-Expected: `python -c 'import mace; print(mace.__file__)'` 指向远端 `mace_new` 工作树。
+Expected: `python -m pip show mace-torch` 的 Editable project location 指向远端 `code/mace_new`，且 pytest 可导入。若现有 `mace` 环境出现不可修复的依赖冲突，才回到用户允许的备选方案：新建空 `mace_new`，绝不克隆环境。
 
 - [ ] **Step 4: 建立后续 TDD 同步约定**
 
@@ -142,10 +136,9 @@ rsync -az --relative --exclude '__pycache__/' --exclude '.pytest_cache/' \
   yt_hku_psmanyam_3@121.46.19.6:/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/code/mace_new/
 ```
 
-以下所有 `python -m pytest` 命令都在远端 `mace_new` 环境、远端仓库根目录执行，并设置 `PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1`。
+以下所有 `python -m pytest` 命令都使用远端 `mace` 环境的绝对 Python、在远端仓库根目录执行，并设置 `PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1`。
 
 ---
-
 ### Task 1: 包骨架、严格配置与发布边界
 
 **Files:**
@@ -799,12 +792,12 @@ git commit -m "feat(fge): add isolated legacy result converter"
 - Create remotely under outputs only: environment/version reports；these stay ignored and are not committed。
 
 **Interfaces:**
-- Consumes: Task 0 已创建的远端仓库和全新 `mace_new` 环境。
+- Consumes: Task 0 已创建的远端仓库和已配置为 editable install 的现有 `mace` 环境。
 - Produces: 发布核心与内部迁移测试全集的新鲜测试记录和环境版本清单。
 
 - [ ] **Step 1: 同步当前 FGE 源码并验证 editable install 指向**
 
-按 Task 0 的 rsync 约定上传 `Uncertainty_Quantification/FGE/` 与根 `.gitignore`。远端激活 `mace_new` 后运行：
+按 Task 0 的 rsync 约定上传 `Uncertainty_Quantification/FGE/` 与根 `.gitignore`。远端使用 `mace` 环境的绝对 Python 运行：
 
 ```bash
 python -c 'import pathlib,mace; expected=pathlib.Path("/HOME/yt_hku_psmanyam/yt_hku_psmanyam_3/code/mace_new/mace").resolve(); actual=pathlib.Path(mace.__file__).resolve(); assert expected in actual.parents, (expected,actual)'
@@ -850,7 +843,7 @@ Expected: 0 failed, 0 errors；warnings 必须逐条归类为预期或修复。
 - [ ] **Step 2: 执行原生 n20 五阶段**
 
 ```bash
-conda activate mace_new
+conda activate mace
 python Uncertainty_Quantification/FGE/scripts/preflight.py --config Uncertainty_Quantification/FGE/configs/mace_fge_n20_cpu.yaml --stage train
 python Uncertainty_Quantification/FGE/scripts/train.py --config Uncertainty_Quantification/FGE/configs/mace_fge_n20_cpu.yaml
 python Uncertainty_Quantification/FGE/scripts/preflight.py --config Uncertainty_Quantification/FGE/configs/mace_fge_n20_cpu.yaml --stage predict
@@ -919,7 +912,7 @@ mace_fge_full_gpu_b64_lr1e-5_1e-4
 
 - [ ] **Step 1: 运行远端最终测试全集**
 
-Run remotely with the fresh `mace_new` environment and thread limits:
+Run remotely with the configured `mace` environment and thread limits:
 
 ```bash
 python -m pytest -p no:cacheprovider Uncertainty_Quantification/FGE/tests Uncertainty_Quantification/FGE/internal_migration/tests -q
