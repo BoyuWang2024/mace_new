@@ -17,6 +17,7 @@ build/
 .idea/
 .vscode/
 *.txt
+!Uncertainty_Quantification/FGE/publication_files.txt
 *.log
 
 # Distribution

@@ -1,0 +1,7 @@
+README.md
+__init__.py
+publication_files.txt
+configs/
+fge/
+scripts/
+tests/
