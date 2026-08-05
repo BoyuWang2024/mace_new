@@ -47,3 +47,16 @@ def test_runtime_log_failure_also_falls_back(tmp_path: Path) -> None:
     logger.log({"loss": 2.0}, step=1)
     logger.finish()
     assert (tmp_path / "wandb" / "fallback_history.jsonl").is_file()
+
+
+def test_explicitly_disabled_wandb_is_silent(tmp_path: Path) -> None:
+    warnings: list[dict[str, str]] = []
+    logger = create_wandb_logger(
+        {"enabled": False, "mode": "disabled", "project": "case", "entity": ""},
+        tmp_path,
+        warnings=warnings,
+    )
+    logger.log({"loss": 1.0}, step=0)
+    logger.finish()
+    assert warnings == []
+    assert not (tmp_path / "wandb" / "fallback_history.jsonl").exists()

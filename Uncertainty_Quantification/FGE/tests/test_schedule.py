@@ -22,3 +22,10 @@ def test_schedule_rejects_invalid_configuration_or_step() -> None:
     schedule = AsymmetricTriangularLR(4, 1.0e-4, 1.0e-3, 0.5)
     with pytest.raises(HardFailure):
         schedule.value(-1)
+
+
+def test_two_step_cycle_is_min_then_max_and_restarts() -> None:
+    schedule = AsymmetricTriangularLR(2, 0.01, 0.1, 0.5)
+    assert [schedule.value(step) for step in range(3)] == pytest.approx(
+        [0.01, 0.1, 0.01]
+    )

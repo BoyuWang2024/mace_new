@@ -61,6 +61,14 @@ class WandbLogger:
             self._fallback({"event": "finish"}, exc)
 
 
+class _DisabledWandbLogger:
+    def log(self, metrics: Mapping[str, Any], step: int) -> None:
+        del metrics, step
+
+    def finish(self) -> None:
+        return
+
+
 def create_wandb_logger(
     config: Mapping[str, Any],
     work_dir: Path,
@@ -71,7 +79,7 @@ def create_wandb_logger(
     """Initialize W&B when requested and downgrade every failure to fallback logging."""
     fallback = Path(work_dir) / "wandb" / "fallback_history.jsonl"
     if not config.get("enabled") or config.get("mode") == "disabled":
-        return WandbLogger(None, fallback, warnings)
+        return _DisabledWandbLogger()
     try:
         module = wandb_module or importlib.import_module("wandb")
         run = module.init(

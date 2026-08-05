@@ -28,7 +28,7 @@ class AsymmetricTriangularLR:
     @property
     def peak_step(self) -> int:
         return min(
-            self.steps_per_cycle - 2,
+            self.steps_per_cycle - 1,
             max(1, round((self.steps_per_cycle - 1) * self.rise_fraction)),
         )
 
