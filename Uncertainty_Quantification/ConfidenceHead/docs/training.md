@@ -120,13 +120,12 @@ source YAML 用于人类复核，resolved JSON 用于显示路径解析和规范
 
 每个启用分支发布下列测试指标：
 
-- `mean_physical_error`：真实物理误差均值；
+- `mean_observed_error`：真实物理误差均值；
 - `mean_expected_error`：分类概率与分箱代表值的加权期望；
-- `mean_absolute_calibration_error`：逐样本 `|expected_error - physical_error|` 的均值；
-- `brier_score`：多分类 one-hot Brier score；
-- `pearson_expected_vs_error`：期望误差与真实误差的 Pearson 相关系数；
+- `mae_expected_vs_error`：逐样本 `|expected_error - observed_error|` 的均值；
+- `brier`：多分类 one-hot Brier score；
 - `spearman_expected_vs_error`：采用平均秩处理并列值的 Spearman 相关系数；
-- `classification_accuracy`、`count` 以及真实标签/预测标签计数。
+- `accuracy` 和 `sample_count`：分类准确率与样本数。
 
 单 run 的不可变发布产物为：
 
@@ -136,9 +135,10 @@ outputs/<name>/runs/<run-tag>-<id12>/
 │   ├── test_predictions.pt
 │   ├── test_metrics.json
 │   └── evaluation_manifest.json
-└── plots/
-    ├── force_argmax_bin_boxplot.csv/.png/.pdf
-    └── energy_argmax_bin_boxplot.csv/.png/.pdf
+└── plots/argmax_bin_boxplots/
+    ├── test_<branch>_argmax_bin_statistics.csv
+    ├── test_<branch>_argmax_bin_boxplot.png
+    └── test_<branch>_argmax_bin_boxplot.pdf
 ```
 
 `evaluation_manifest.json` 最后提交，并绑定训练验证、训练 manifest、最佳 checkpoint、binning、cache manifest、预测 tensor 与指标 JSON。缺任一支持文件、已有文件内容变化、只完成一部分或身份冲突都会非零退出；完整且哈希一致时可以安全复用。
@@ -160,12 +160,13 @@ CUDA_VISIBLE_DEVICES="" python scripts/plot_analysis_suite.py --config-dir confi
 outputs/<name>/
 ├── runs/<九个 run>/...
 └── comparisons/
-    ├── energy_order_correlations.csv
-    ├── energy_order_correlations.png
-    ├── energy_order_correlations.pdf
-    ├── energy_order_correlations.metadata.json
-    ├── force_argmax_bin_boxplots_combined.pdf
-    ├── energy_argmax_bin_boxplots_combined.pdf
+    ├── energy_correlations/
+    │   ├── linear_energy_correlations.csv
+    │   ├── linear_order_correlations_no_ci.png/.pdf
+    │   └── comparison_metadata.json
+    ├── argmax_bin_boxplots/
+    │   ├── combined_force_argmax_bin_boxplots.pdf
+    │   └── combined_energy_argmax_bin_boxplots.pdf
     └── plot_manifest.json
 ```
 
@@ -176,6 +177,6 @@ outputs/<name>/
 1. 九个 `evaluation_manifest.json` 均存在并通过全部内容哈希复核；
 2. Force 预测数量等于测试集原子数，八组 Energy 预测数量均等于测试集结构数；
 3. 九组单 run CSV/PNG/PDF、Energy 相关性四件套和两份合并 PDF 全部存在；
-4. `energy_order_correlations.csv` 恰有 order 1 至 8 八行且相关系数有限；
+4. `comparisons/energy_correlations/linear_energy_correlations.csv` 恰有 order 1 至 8 八行且相关系数有限；
 5. `comparisons/plot_manifest.json` 最后写入，绑定九个 run identity、共同 cache ID 和全部 60 个发布文件；
 6. 再次执行总控命令只复核并复用合法产物，不改写其内容。

@@ -28,7 +28,7 @@ python scripts/plot_energy_correlations.py --config-dir configs
 python scripts/plot_combined_argmax_bin_boxplots.py --config-dir configs
 ```
 
-单 run 的测试产物写入原 run 的 `run/` 子目录；单 run 图写入原 run 的 `plots/` 子目录；跨 order 图与最终 manifest 写入共享 `comparisons/`。已有完整产物会经过哈希复核后复用；部分完成、内容被修改或身份不一致时会停止，不会静默覆盖。
+单 run 的测试产物写入原 run 的 `run/` 子目录，单 run 图写入 `plots/argmax_bin_boxplots/`；跨 order 相关性写入 `comparisons/energy_correlations/`，合并 PDF 写入 `comparisons/argmax_bin_boxplots/`，最终 manifest 写入 `comparisons/plot_manifest.json`。已有完整产物会经过哈希复核后复用；部分完成、内容被修改或身份不一致时会停止，不会静默覆盖。
 
 ## 环境与最快验证
 
