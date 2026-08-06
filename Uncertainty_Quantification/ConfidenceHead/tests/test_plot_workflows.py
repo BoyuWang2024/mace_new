@@ -124,13 +124,13 @@ def _matrix_updates(*, order: int, branch: str) -> dict[str, object]:
 
 
 def _completed_matrix(tmp_path: Path):
-    base = write_valid_config(tmp_path)
-    force_path = tmp_path / "force.yaml"
+    base = write_valid_config(tmp_path, profile="production")
+    force_path = tmp_path / "mace_matpes_full_force_only.yaml"
     force_path.write_bytes(base.read_bytes())
     update_yaml(force_path, _matrix_updates(order=1, branch="force"))
     energy_paths: dict[int, Path] = {}
     for order in range(1, 9):
-        path = tmp_path / f"energy-order{order}.yaml"
+        path = tmp_path / f"mace_matpes_full_energy_only_order{order}.yaml"
         path.write_bytes(base.read_bytes())
         update_yaml(path, _matrix_updates(order=order, branch="energy"))
         energy_paths[order] = path
