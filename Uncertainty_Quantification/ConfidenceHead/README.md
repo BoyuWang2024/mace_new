@@ -1,6 +1,34 @@
-# MACE ConfidenceHead 训练模块
+# MACE ConfidenceHead 训练与发布模块
 
-本目录提供第一阶段可发布训练链：冻结 MACE、构建连续特征缓存、只用训练集拟合误差分箱、训练分类式 ConfidenceHead，并核验可恢复且身份闭合的训练产物。当前交付范围止于已验证的训练结果；测试集评估、绘图和 publication bundle 属于后续阶段。
+本目录提供完整的可发布流水线：冻结 MACE、构建连续特征缓存、只用训练集拟合误差分箱、训练分类式 ConfidenceHead，随后使用训练期间保存的最佳 checkpoint 在测试集上评估，并生成带内容哈希与来源身份的发布图表。
+
+## 已完成训练的 CPU 发布评估
+
+九组 production 训练全部完成并具有合法 `training_manifest.json` 后，在服务器上执行：
+
+```bash
+cd <仓库根目录>/Uncertainty_Quantification/ConfidenceHead
+CUDA_VISIBLE_DEVICES="" python scripts/plot_analysis_suite.py --config-dir configs
+```
+
+该命令固定按 Force-only、Energy order 1 到 8 的顺序运行，且：
+
+- 只读取共享缓存的 `test` split，不读取 train/validation 样本计算发布指标；
+- 只读取每个 run 的 `best.pt`，不使用 `last.pt`；
+- 不加载或调用 MACE 主干，不请求 GPU，不启动 Slurm，不连接 W&B；
+- 先验证训练时期保存的 config、identity、cache、binning 和 checkpoint 哈希，再写测试结果；
+- 最后写入 `outputs/<name>/comparisons/plot_manifest.json`。该 manifest 是九组发布图全部完成的唯一顶层标记。
+
+也可以独立运行单个阶段：
+
+```bash
+python scripts/evaluate.py --config configs/mace_matpes_full_force_only.yaml
+python scripts/plot_argmax_bin_boxplots.py --config configs/mace_matpes_full_force_only.yaml
+python scripts/plot_energy_correlations.py --config-dir configs
+python scripts/plot_combined_argmax_bin_boxplots.py --config-dir configs
+```
+
+单 run 的测试产物写入原 run 的 `run/` 子目录；单 run 图写入原 run 的 `plots/` 子目录；跨 order 图与最终 manifest 写入共享 `comparisons/`。已有完整产物会经过哈希复核后复用；部分完成、内容被修改或身份不一致时会停止，不会静默覆盖。
 
 ## 环境与最快验证
 

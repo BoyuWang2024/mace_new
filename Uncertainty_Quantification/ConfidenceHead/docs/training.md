@@ -110,4 +110,72 @@ source YAML 用于人类复核，resolved JSON 用于显示路径解析和规范
 9. 归档 source/resolved config、Git/environment 身份、binning manifest 和验证报告。
 10. 若 W&B 为 offline，可在联网后同步，但以本地 manifest 为发布判据。
 11. 不把 n20 的复用 split 指标当作科学结果；正式结论只来自隔离的 production 数据。
-12. 在进入测试集评估、绘图或公开 bundle 前使用独立阶段规范，不在训练目录内手工追加未校验结果。
+12. 运行第 13 节的 CPU 发布总控，并以 `comparisons/plot_manifest.json` 作为九组测试评估与绘图全部完成的最终标记；不得手工追加未校验结果。
+
+## 12. 测试集评估定义
+
+测试评估是训练完成后的只读阶段。评估器按配置中的可读 run tag 定位唯一目录，然后绑定训练时已提交的 `identity/run_identity.json` 和 source YAML 快照。部署新代码不会重算或替换旧实验身份；当前 source YAML 必须与训练快照逐字节一致，训练 manifest 及其支持文件、binning、cache manifest 和 `best.pt` 的 SHA-256 也必须全部通过验证。
+
+评估固定使用 CPU、共享缓存中的 `test` split 和 `best.pt`。它不加载 MACE checkpoint、不执行主干推理、不读取 `last.pt`、不启动 W&B。Force 每个原子的物理误差定义为三个笛卡尔分量绝对误差的均值；Energy 每个结构的物理误差定义为绝对总能量误差除以原子数。分类标签仍来自训练集拟合并冻结的分箱边界。
+
+每个启用分支发布下列测试指标：
+
+- `mean_physical_error`：真实物理误差均值；
+- `mean_expected_error`：分类概率与分箱代表值的加权期望；
+- `mean_absolute_calibration_error`：逐样本 `|expected_error - physical_error|` 的均值；
+- `brier_score`：多分类 one-hot Brier score；
+- `pearson_expected_vs_error`：期望误差与真实误差的 Pearson 相关系数；
+- `spearman_expected_vs_error`：采用平均秩处理并列值的 Spearman 相关系数；
+- `classification_accuracy`、`count` 以及真实标签/预测标签计数。
+
+单 run 的不可变发布产物为：
+
+```text
+outputs/<name>/runs/<run-tag>-<id12>/
+├── run/
+│   ├── test_predictions.pt
+│   ├── test_metrics.json
+│   └── evaluation_manifest.json
+└── plots/
+    ├── force_argmax_bin_boxplot.csv/.png/.pdf
+    └── energy_argmax_bin_boxplot.csv/.png/.pdf
+```
+
+`evaluation_manifest.json` 最后提交，并绑定训练验证、训练 manifest、最佳 checkpoint、binning、cache manifest、预测 tensor 与指标 JSON。缺任一支持文件、已有文件内容变化、只完成一部分或身份冲突都会非零退出；完整且哈希一致时可以安全复用。
+
+## 13. 九组发布图与验收
+
+服务器上的完整 CPU 命令为：
+
+```bash
+cd <仓库根目录>/Uncertainty_Quantification/ConfidenceHead
+CUDA_VISIBLE_DEVICES="" python scripts/plot_analysis_suite.py --config-dir configs
+```
+
+配置目录必须恰好提供 production Force-only 配置以及 Energy order 1 至 8 配置。九份配置必须共享数据、checkpoint、cache/output 根目录和分箱定义；启用分支的 coefficient 必须为 1，禁用分支必须为 0，Energy 使用 `fixed_linear_v1`。总控程序顺序执行九次测试评估与单 run 绘图，再生成 Energy order 对比和两份合并 PDF。
+
+发布结构为：
+
+```text
+outputs/<name>/
+├── runs/<九个 run>/...
+└── comparisons/
+    ├── energy_order_correlations.csv
+    ├── energy_order_correlations.png
+    ├── energy_order_correlations.pdf
+    ├── energy_order_correlations.metadata.json
+    ├── force_argmax_bin_boxplots_combined.pdf
+    ├── energy_argmax_bin_boxplots_combined.pdf
+    └── plot_manifest.json
+```
+
+单 run 箱线图以 argmax 预测 bin 分组，保留所有 bin；CSV 同时记录训练标签数量、测试预测数量、均值、四分位数、IQR、whisker、最小值和最大值。图中使用非负 symlog 纵轴并标出训练分箱代表值。Energy 相关性图比较 order 1 至 8 的 argmax 分箱代表值与真实每原子能量误差，报告 Pearson 和 tie-aware Spearman。Force 合并 PDF 为 1 页，Energy 合并 PDF 为 8 页。
+
+最终验收必须同时满足：
+
+1. 九个 `evaluation_manifest.json` 均存在并通过全部内容哈希复核；
+2. Force 预测数量等于测试集原子数，八组 Energy 预测数量均等于测试集结构数；
+3. 九组单 run CSV/PNG/PDF、Energy 相关性四件套和两份合并 PDF 全部存在；
+4. `energy_order_correlations.csv` 恰有 order 1 至 8 八行且相关系数有限；
+5. `comparisons/plot_manifest.json` 最后写入，绑定九个 run identity、共同 cache ID 和全部 60 个发布文件；
+6. 再次执行总控命令只复核并复用合法产物，不改写其内容。
