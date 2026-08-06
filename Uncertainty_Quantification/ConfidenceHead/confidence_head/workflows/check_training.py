@@ -27,6 +27,7 @@ from .train import (
     TRAINING_FORMULA_VERSION,
     TRAINING_SCHEMA_VERSION,
     RunConflictError,
+    _RUN_ENTRIES,
     RunInputs,
     _commit_or_validate_snapshots,
     _enabled,
@@ -336,9 +337,7 @@ def run_check_training(config: ConfidenceHeadConfig) -> Path:
         _commit_or_validate_snapshots(inputs)
         if not inputs.run_dir.is_dir():
             raise RunConflictError("training run directory is missing")
-        unknown = {item.name for item in inputs.run_dir.iterdir()} - (
-            _REQUIRED_RUN_FILES | {_VALIDATION_FILENAME, _MANIFEST_FILENAME, "wandb"}
-        )
+        unknown = {item.name for item in inputs.run_dir.iterdir()} - _RUN_ENTRIES
         if unknown:
             raise RunConflictError(
                 f"run directory contains unknown entries: {sorted(unknown)}"

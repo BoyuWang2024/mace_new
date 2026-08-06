@@ -212,6 +212,39 @@ def test_completed_run_refuses_retraining_and_check_reuses_exact_pair(
         (validation.parent / "training_manifest.json").read_bytes(),
     )
 
+def test_completed_training_accepts_committed_publication_artifacts(
+    tmp_path: Path,
+) -> None:
+    """Adding named evaluation outputs must not invalidate training evidence."""
+    config, bins = _ready_force_run(tmp_path)
+    run_train(config)
+    validation = run_check_training(config)
+    run_root = bins.parent
+    (run_root / "plots").mkdir()
+    for name in (
+        "test_predictions.pt",
+        "test_metrics.json",
+        "evaluation_manifest.json",
+    ):
+        (run_root / "run" / name).write_bytes(b"publication artifact")
+
+    assert run_check_training(config) == validation
+
+
+def test_completed_training_still_rejects_unknown_publication_entry(
+    tmp_path: Path,
+) -> None:
+    """Allowing publication outputs must not weaken unknown-entry rejection."""
+    config, bins = _ready_force_run(tmp_path)
+    run_train(config)
+    run_check_training(config)
+    marker = bins.parent / "unexpected-publication-file"
+    marker.write_text("evidence", encoding="utf-8")
+
+    with pytest.raises(RunConflictError, match="unknown entries"):
+        run_check_training(config)
+    assert marker.read_text(encoding="utf-8") == "evidence"
+
 
 @pytest.mark.parametrize("corruption", ["event", "nonfinite_best", "unknown_root"])
 def test_check_or_train_fails_closed_preserving_corrupt_evidence(

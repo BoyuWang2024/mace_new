@@ -34,7 +34,7 @@ from . import fit_bins as fit_bins_workflow
 TRAINING_SCHEMA_VERSION = 1
 TRAINING_FORMULA_VERSION = "confidence_head_training_v1"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
-_ROOT_ENTRIES = frozenset({"binning", "config", "identity", "run"})
+_ROOT_ENTRIES = frozenset({"binning", "config", "identity", "plots", "run"})
 _RUN_ENTRIES = frozenset(
     {
         "events.jsonl",
@@ -43,6 +43,9 @@ _RUN_ENTRIES = frozenset(
         "training_summary.json",
         "training_validation.json",
         "training_manifest.json",
+        "test_predictions.pt",
+        "test_metrics.json",
+        "evaluation_manifest.json",
         "wandb",
     }
 )
