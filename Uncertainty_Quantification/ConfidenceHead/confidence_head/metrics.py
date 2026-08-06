@@ -188,3 +188,7 @@ def validate_metric_payload(value: object) -> dict[str, int | float]:
     result: dict[str, int | float] = {"sample_count": sample_count}
     for name in sorted(expected_keys - {"sample_count"}):
         item: Any = value[name]
+        if type(item) is not float or not math.isfinite(item):
+            raise ValueError(f"{name} must be a finite float")
+        result[name] = item
+    return result
