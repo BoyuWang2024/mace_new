@@ -40,7 +40,7 @@ W&B 仅用于新训练遥测，在线初始化、记录或结束失败会降级�
 
 ```bash
 python -m Uncertainty_Quantification.FGE.scripts.plot \
-  --result baseline Uncertainty_Quantification/FGE/outputs/mace_fge_full_gpu_b64 \
+  --result lr_1e-8_1e-7 Uncertainty_Quantification/FGE/outputs/mace_fge_full_gpu_b64 \
   --result lr_1e-7_1e-6 Uncertainty_Quantification/FGE/outputs/mace_fge_full_gpu_b64_lr1e-7_1e-6 \
   --result lr_1e-6_1e-5 Uncertainty_Quantification/FGE/outputs/mace_fge_full_gpu_b64_lr1e-6_1e-5 \
   --result lr_1e-5_1e-4 Uncertainty_Quantification/FGE/outputs/mace_fge_full_gpu_b64_lr1e-5_1e-4 \
