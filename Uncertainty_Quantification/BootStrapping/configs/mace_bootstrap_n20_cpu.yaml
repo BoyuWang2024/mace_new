@@ -1,0 +1,43 @@
+schema_version: 1
+experiment:
+  name: mace-readout-bootstrap-n20
+  run_id: mace_readout_n20_cpu
+  output_root: ../outputs
+checkpoint:
+  base_path: ../../../data/checkpoint/MACE-matpes-r2scan-omat-ft.model
+data:
+  train: ../../../data/dataset/matpes_n20.extxyz
+  val: ../../../data/dataset/matpes_n20.extxyz
+  test: ../../../data/dataset/matpes_n20.extxyz
+  units: {energy: eV, forces: eV/Angstrom, stress: eV/Angstrom^3}
+bootstrap:
+  ensemble_size: 2
+  base_seed: 2026
+  sample_size: null
+  replacement: true
+  save_indices: true
+  save_oob: true
+training:
+  batch_size: 4
+  max_epochs: 1
+  trainable_head: mace_readouts
+  optimizer: {name: Adam, learning_rate: 1.0e-6, weight_decay: 0.0}
+  scheduler: none
+  gradient_clip: 1.0
+  ema_decay: 0.99
+  device: cpu
+  precision: float64
+  num_workers: 0
+prediction:
+  splits: [val, test]
+  parameter_modes: [raw, ema]
+  batch_size: 4
+  structure_chunk_size: 20
+  device: cpu
+  num_workers: 0
+uncertainty:
+  parameter_modes: [raw, ema]
+  ddof: 1
+  compute_std: true
+  compute_gmd: true
+  gmd_pairs: distinct_unordered

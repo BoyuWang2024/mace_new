@@ -1,0 +1,6 @@
+__init__.py
+README.md
+publication_files.txt
+bootstrap/
+scripts/
+configs/

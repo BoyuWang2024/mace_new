@@ -1,0 +1,3 @@
+/outputs/*
+!/outputs/.gitignore
+*.tar.gz
