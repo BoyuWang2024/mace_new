@@ -24,7 +24,7 @@ def _targets() -> TargetArrays:
         atom_offsets=np.asarray([0, 2, 3], dtype=np.int64),
         energy=np.asarray([1.0, 2.0]),
         forces=np.arange(9, dtype=float).reshape(3, 3),
-        stress=np.arange(12, dtype=float).reshape(2, 6),
+        stress=np.arange(18, dtype=float).reshape(2, 3, 3),
     )
 
 
@@ -48,6 +48,6 @@ def test_prediction_store_roundtrips_without_dtype_or_value_change(tmp_path: Pat
 
 
 def test_prediction_validation_rejects_force_shape_drift() -> None:
-    bad = PredictionArrays(np.zeros(2), np.zeros((2, 3)), np.zeros((2, 6)))
+    bad = PredictionArrays(np.zeros(2), np.zeros((2, 3)), np.zeros((2, 3, 3)))
     with pytest.raises(HardFailure, match="forces"):
         validate_predictions(bad, _targets())

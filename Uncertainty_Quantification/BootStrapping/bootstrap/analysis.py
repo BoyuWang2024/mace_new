@@ -30,7 +30,7 @@ def analyze_predictions(prediction: PredictionArrays, targets: TargetArrays, unc
         "uncertainty_semantics": {
             "energy": "structure_scalar_N",
             "force": "cartesian_component_3N",
-            "stress": "voigt_component_6N",
+            "stress": "matrix_component_9N",
             "std_ddof": 1,
             "gmd_pairs": "distinct_unordered",
         },

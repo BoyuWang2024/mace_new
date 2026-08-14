@@ -49,8 +49,8 @@ def validate_targets(targets: TargetArrays) -> None:
         raise HardFailure("target energy shape mismatch")
     if targets.forces.shape != (atoms, 3):
         raise HardFailure("target forces shape must be [total_atoms, 3]")
-    if targets.stress.shape != (structures, 6):
-        raise HardFailure("target stress shape must be [structures, 6]")
+    if targets.stress.shape != (structures, 3, 3):
+        raise HardFailure("target stress shape must be [structures, 3, 3]")
 
 
 def validate_predictions(prediction: PredictionArrays, targets: TargetArrays) -> None:

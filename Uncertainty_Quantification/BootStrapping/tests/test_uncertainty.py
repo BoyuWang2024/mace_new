@@ -11,7 +11,7 @@ def _member(offset: float) -> PredictionArrays:
     return PredictionArrays(
         energy=np.asarray([1.0, 2.0]) + offset,
         forces=np.asarray([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]) + offset,
-        stress=np.arange(12, dtype=float).reshape(2, 6) + offset,
+        stress=np.arange(18, dtype=float).reshape(2, 3, 3) + offset,
     )
 
 
