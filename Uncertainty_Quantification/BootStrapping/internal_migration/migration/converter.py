@@ -10,6 +10,7 @@ from ...bootstrap.errors import HardFailure
 from ...bootstrap.manifests import build_run_manifest
 from ...bootstrap.prediction import write_prediction_arrays, write_target_arrays
 from ...bootstrap.schema import ORIGIN_SCHEMA, RUN_SCHEMA
+from .analysis_normalization import normalize_legacy_document
 from .legacy_reader import LegacyRunAudit
 from .normalization import load_legacy_index, normalize_legacy_analysis, normalize_legacy_predictions
 from .validation import validate_migrated_run
@@ -88,9 +89,8 @@ def convert_legacy_run(audit: LegacyRunAudit, destination: str | Path, audit_roo
                 artifacts.append(atomic_write_npz(staging / "ensemble" / item.split / f"{item.mode}.npz", **ensemble))
                 artifacts.append(atomic_write_npz(staging / "uncertainty" / item.split / f"{item.mode}.npz", **uncertainty))
                 analysis_root = staging / "analysis" / item.split / item.mode
-                artifacts.append(copy_file_exact(item.metrics, analysis_root / "metrics.json"))
-                artifacts.append(copy_file_exact(item.correlation, analysis_root / "correlation.json"))
-                artifacts.append(copy_file_exact(item.risk_coverage, analysis_root / "risk_coverage.json"))
+                for source_document, filename in ((item.metrics, "metrics.json"), (item.correlation, "correlation.json"), (item.risk_coverage, "risk_coverage.json")):
+                    artifacts.append(atomic_write_json(analysis_root / filename, normalize_legacy_document(source_document)))
 
             origin = atomic_write_json(staging / "origin_manifest.json", {
                 "schema": ORIGIN_SCHEMA, "origin": "legacy_mace_bootstrap",

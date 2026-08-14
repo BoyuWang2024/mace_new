@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import numpy as np
 from ...bootstrap.artifacts import sha256_file
 from ...bootstrap.errors import HardFailure
 from ...bootstrap.prediction import load_prediction_arrays, load_target_arrays
+from .analysis_normalization import normalize_legacy_document
 from .legacy_reader import LegacyRunAudit
 from .normalization import load_legacy_index, normalize_legacy_analysis, normalize_legacy_predictions
 
@@ -61,5 +63,9 @@ def validate_migrated_run(audit: LegacyRunAudit, destination: str | Path) -> Mig
         with np.load(root / "uncertainty" / item.split / f"{item.mode}.npz", allow_pickle=False) as actual:
             for name, expected in uncertainty.items():
                 _equal(expected, actual[name], f"uncertainty/{item.mode}/{item.split}/{name}")
+        for source_document, filename in ((item.metrics, "metrics.json"), (item.correlation, "correlation.json"), (item.risk_coverage, "risk_coverage.json")):
+            actual_document = json.loads((root / "analysis" / item.split / item.mode / filename).read_text(encoding="utf-8"))
+            if actual_document != normalize_legacy_document(source_document):
+                raise HardFailure(f"migrated analysis document differs: {item.mode}/{item.split}/{filename}")
         analysis_count += 1
     return MigrationValidation(model_count, resume_count, prediction_count, analysis_count)

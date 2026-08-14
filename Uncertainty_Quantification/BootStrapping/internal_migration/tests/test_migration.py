@@ -85,7 +85,7 @@ def _legacy_run(root: Path) -> tuple[Path, dict[tuple[str, str], dict[str, objec
             uq_root.mkdir(parents=True)
             torch.save(uncertainty, uq_root / "uncertainty.pt")
             for name in ("metrics", "correlation", "risk_coverage"):
-                _write_json(source / "metrics" / mode / split / f"{name}.json", {"force_component": {"value": offset}, "legacy_force_vector": {"value": offset + 1}})
+                _write_json(source / "metrics" / mode / split / f"{name}.json", {"force_component": {"value": offset}, "force_vector": {"value": offset + 1}})
             payloads[(mode, split)] = payload
     _write_json(source / "manifest.json", {"schema_version": 1})
     _write_json(source / "member_registry.json", {"B": 2})
@@ -124,6 +124,9 @@ def test_inspection_and_conversion_preserve_every_result(tmp_path: Path) -> None
                 np.testing.assert_array_equal(uq["force_std"], np.ones((3, 3)))
                 np.testing.assert_array_equal(uq["legacy_force_vector_std"], np.ones(3) * 2)
                 assert "force_rms_std" not in uq.files
+            analysis = json.loads((destination / "analysis" / split / mode / "metrics.json").read_text(encoding="utf-8"))
+            assert "force_vector" not in analysis
+            assert analysis["legacy_force_vector"] == {"value": (0.1 if mode == "ema" else 0.0) + (1.0 if split == "test" else 0.0) + 1}
     validation = validate_migrated_run(audit, destination)
     assert validation.validated_models == 8
     assert validation.validated_predictions == 8
