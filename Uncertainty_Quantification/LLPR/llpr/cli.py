@@ -51,10 +51,10 @@ def _load_plot_config(path: Path) -> PlotConfig:
         expected_fields - {"style"},
     ):
         raise ValueError(
-            "plot config must contain exactly publication_root, output_dir, selected, style"
+            "plot config must contain exactly publication_root, output_dir, selected, and optional style"
         )
     style = document.get("style", "diagnostic_suite")
-    if style not in {"diagnostic_suite", "carnet_density"}:
+    if not isinstance(style, str) or style not in {"diagnostic_suite", "carnet_density"}:
         raise ValueError("plot config style is invalid")
     raw_selected = document["selected"]
     if not isinstance(raw_selected, list):
@@ -77,7 +77,7 @@ def _load_plot_config(path: Path) -> PlotConfig:
         ),
         output_dir=_plot_path(source_dir, document["output_dir"], "output_dir"),
         selected=tuple(selected),
-        style=str(style),
+        style=style,
     )
 
 

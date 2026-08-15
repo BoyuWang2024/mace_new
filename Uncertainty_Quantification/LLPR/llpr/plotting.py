@@ -153,6 +153,31 @@ def _load_plot_data(root: Path) -> dict[str, dict[str, _PanelData]]:
     return result
 
 
+def _load_carnet_panels(
+    root: Path,
+) -> dict[tuple[str, str], Any]:
+    """Load only the two numeric columns used by the four density panels."""
+    from .density_plotting import CARNET_SELECTED, DensityPanel
+
+    panels: dict[tuple[str, str], Any] = {}
+    for variant, target in CARNET_SELECTED:
+        filename = "energy.csv" if target == "energy" else "force_components.csv"
+        frame = pd.read_csv(
+            root / variant / filename,
+            usecols=("std", "residual"),
+        )
+        uncertainty = frame["std"].to_numpy(dtype=np.float64, copy=True)
+        residual = frame["residual"].to_numpy(dtype=np.float64, copy=True)
+        np.abs(residual, out=residual)
+        panels[(variant, target)] = DensityPanel(
+            uncertainty=uncertainty,
+            absolute_residual=residual,
+            target=target,
+            unit="eV/atom" if target == "energy" else "eV/\u00c5",
+        )
+    return panels
+
+
 def _shared_log_limits(panels: Mapping[str, _PanelData]) -> tuple[float, float]:
     positive: list[np.ndarray] = []
     for panel in panels.values():
@@ -861,6 +886,196 @@ def _validate_staging(staging: Path) -> None:
     )
 
 
+def _parse_carnet_statistics(path: Path) -> list[dict[str, Any]]:
+    from .density_plotting import CARNET_SELECTED, CARNET_STATISTICS_FIELDS
+
+    try:
+        with path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+    except (OSError, csv.Error) as error:
+        raise RuntimeError("carnet statistics cannot be parsed") from error
+    if reader.fieldnames != list(CARNET_STATISTICS_FIELDS) or len(rows) != 4:
+        raise RuntimeError("carnet statistics schema or row count mismatch")
+    integer_fields = {
+        "rows", "finite_rows", "nonfinite_rows", "nonpositive_std_rows",
+        "zero_absolute_residual_rows", "metric_rows", "log_plot_rows",
+        "excluded_from_log_rows", "correlation_rows", "correlation_degenerate",
+    }
+    nullable_fields = {"pearson_log", "spearman_log"}
+    parsed: list[dict[str, Any]] = []
+    for index, (raw, expected_path) in enumerate(zip(rows, CARNET_SELECTED)):
+        if (raw["variant"], raw["target"]) != expected_path:
+            raise RuntimeError("carnet statistics panel order mismatch")
+        row: dict[str, Any] = {}
+        for field in CARNET_STATISTICS_FIELDS:
+            value = raw[field]
+            if field in integer_fields:
+                try:
+                    numeric = int(value)
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError(
+                        f"carnet statistics row {index} field {field} must be an integer"
+                    ) from error
+                if str(numeric) != value or numeric < 0:
+                    raise RuntimeError(
+                        f"carnet statistics row {index} field {field} is invalid"
+                    )
+                row[field] = numeric
+            elif field in nullable_fields and value == "":
+                row[field] = None
+            elif field in nullable_fields or field in {"axis_min", "axis_max"}:
+                try:
+                    numeric_float = float(value)
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError(
+                        f"carnet statistics row {index} field {field} must be numeric"
+                    ) from error
+                if not math.isfinite(numeric_float):
+                    raise RuntimeError(
+                        f"carnet statistics row {index} field {field} must be finite"
+                    )
+                row[field] = numeric_float
+            else:
+                if not isinstance(value, str) or not value:
+                    raise RuntimeError(
+                        f"carnet statistics row {index} field {field} is invalid"
+                    )
+                row[field] = value
+        if row["finite_rows"] + row["nonfinite_rows"] != row["rows"]:
+            raise RuntimeError("carnet statistics finite counts are inconsistent")
+        if row["log_plot_rows"] + row["excluded_from_log_rows"] != row["rows"]:
+            raise RuntimeError("carnet statistics exclusion counts are inconsistent")
+        if row["correlation_rows"] != row["log_plot_rows"]:
+            raise RuntimeError("carnet statistics correlation count is inconsistent")
+        if not (0.0 < row["axis_min"] < row["axis_max"]):
+            raise RuntimeError("carnet statistics axis bounds are invalid")
+        defined = row["pearson_log"] is not None and row["spearman_log"] is not None
+        if row["correlation_status"] == "ok":
+            if row["correlation_degenerate"] != 0 or not defined:
+                raise RuntimeError("carnet statistics correlation status is inconsistent")
+        elif (
+            not row["correlation_status"].startswith("undefined_")
+            or row["correlation_degenerate"] != 1
+            or defined
+        ):
+            raise RuntimeError("carnet statistics correlation status is inconsistent")
+        parsed.append(row)
+    return parsed
+
+
+def _validate_carnet_staging(staging: Path) -> None:
+    from .density_plotting import (
+        CARNET_DENSITY_CONFIG,
+        CARNET_FIGURE_STEMS,
+        CARNET_SELECTED,
+    )
+
+    expected = {
+        *(
+            f"{stem}.{suffix}"
+            for stem in CARNET_FIGURE_STEMS.values()
+            for suffix in ("png", "pdf")
+        ),
+        "plotting_statistics.csv",
+        "plotting_manifest.json",
+    }
+    actual = {path.name for path in staging.iterdir()}
+    if actual != expected:
+        raise RuntimeError(
+            f"carnet staging files mismatch: expected={sorted(expected)}, actual={sorted(actual)}"
+        )
+    for path in staging.iterdir():
+        mode = path.lstat().st_mode
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"carnet staging output is not a regular file: {path.name}")
+        if path.stat().st_size == 0:
+            raise RuntimeError(f"carnet staging output is empty: {path.name}")
+    for stem in CARNET_FIGURE_STEMS.values():
+        png = (staging / f"{stem}.png").read_bytes()
+        if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise RuntimeError(f"invalid PNG output: {stem}.png")
+        pdf = (staging / f"{stem}.pdf").read_bytes()
+        if not pdf.startswith(b"%PDF-") or not pdf.rstrip().endswith(b"%%EOF"):
+            raise RuntimeError(f"invalid PDF output: {stem}.pdf")
+
+    rows = _parse_carnet_statistics(staging / "plotting_statistics.csv")
+    try:
+        manifest = json.loads(
+            (staging / "plotting_manifest.json").read_text(encoding="utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("carnet manifest is not strict JSON") from error
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema_version", "formula_version", "status", "style", "inputs",
+        "outputs", "config", "selected", "shared_axes", "statistics",
+    }:
+        raise RuntimeError("carnet manifest fields mismatch")
+    if manifest["status"] != "complete" or manifest["style"] != "carnet_density":
+        raise RuntimeError("carnet manifest status or style mismatch")
+    if manifest["selected"] != [list(item) for item in CARNET_SELECTED]:
+        raise RuntimeError("carnet manifest selection mismatch")
+    if not isinstance(manifest["inputs"], dict) or set(manifest["inputs"]) != set(_INPUT_NAMES):
+        raise RuntimeError("carnet manifest inputs mismatch")
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in manifest["inputs"].values()
+    ):
+        raise RuntimeError("carnet manifest input SHA256 is invalid")
+
+    config = manifest["config"]
+    if not isinstance(config, dict):
+        raise RuntimeError("carnet manifest config is invalid")
+    expected_config = {
+        **CARNET_DENSITY_CONFIG,
+        "figure_size": list(CARNET_DENSITY_CONFIG["figure_size"]),
+        "contour_masses": list(CARNET_DENSITY_CONFIG["contour_masses"]),
+        "formats": ["png", "pdf"],
+        "dpi": config.get("dpi"),
+    }
+    if (
+        isinstance(config.get("dpi"), bool)
+        or not isinstance(config.get("dpi"), int)
+        or config["dpi"] <= 0
+        or config != expected_config
+    ):
+        raise RuntimeError("carnet manifest config mismatch")
+
+    expected_statistics = {
+        f"{row['variant']}/{row['target']}": row for row in rows
+    }
+    if manifest["statistics"] != expected_statistics:
+        raise RuntimeError("carnet manifest statistics mismatch")
+    axes = manifest["shared_axes"]
+    if not isinstance(axes, dict) or set(axes) != set(expected_statistics):
+        raise RuntimeError("carnet manifest shared axes mismatch")
+    for key, row in expected_statistics.items():
+        if axes[key] != {
+            "minimum": row["axis_min"],
+            "maximum": row["axis_max"],
+        }:
+            raise RuntimeError("carnet manifest shared axes disagree with statistics")
+
+    expected_outputs = expected - {"plotting_manifest.json"}
+    outputs = manifest["outputs"]
+    if not isinstance(outputs, dict) or set(outputs) != expected_outputs:
+        raise RuntimeError("carnet manifest outputs mismatch")
+    for name, record in outputs.items():
+        path = staging / name
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"size", "sha256"}
+            or isinstance(record["size"], bool)
+            or not isinstance(record["size"], int)
+            or record["size"] != path.stat().st_size
+            or record["sha256"] != sha256_file(path)
+        ):
+            raise RuntimeError(f"carnet manifest size or SHA256 mismatch: {name}")
+
+
 @contextmanager
 def _output_lock(destination: Path) -> Iterator[None]:
     lock_path = destination.parent / f".{destination.name}.lock"
@@ -1066,61 +1281,86 @@ def run_plot(
     if style != "carnet_density":
         raise ValueError("plot style is invalid")
     if tuple(selected) != DEFAULT_SELECTED:
-        raise ValueError("carnet_density selected paths must exactly match the four required paths")
+        raise ValueError(
+            "carnet_density selected paths must exactly match the four required paths"
+        )
     from .density_plotting import (
         CARNET_DENSITY_CONFIG,
-        CARNET_FIGURE_STEMS,
         CARNET_SELECTED,
         render_carnet_density,
         write_carnet_statistics,
     )
 
     root, destination = _safe_paths(publication_root, output_dir)
-    render_dpi = int(CARNET_DENSITY_CONFIG["dpi"]) if dpi is None else dpi
+    render_dpi = CARNET_DENSITY_CONFIG["dpi"] if dpi is None else dpi
+    if isinstance(render_dpi, bool) or not isinstance(render_dpi, int) or render_dpi <= 0:
+        raise ValueError("plot dpi must be a positive integer")
     destination.parent.mkdir(parents=True, exist_ok=True)
+    _reject_existing_symlink_components(destination)
     with _output_lock(destination):
-        snapshot = _create_input_snapshot(root, destination)
-        staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.stale-", dir=destination.parent))
+        _cleanup_stale_directories(destination)
+        snapshot: Path | None = None
+        staging: Path | None = None
         try:
-            data = _load_plot_data(snapshot)
-            panels = {
-                (variant, target): data[_selected_level(target)][variant]
-                for variant, target in CARNET_SELECTED
-            }
-            statistics, limits = render_carnet_density(panels, staging, dpi=render_dpi)
-            write_carnet_statistics(staging / "plotting_statistics.csv", statistics)
+            snapshot = _create_input_snapshot(root, destination)
+            snapshot_source_hashes = _snapshot_source_hashes(snapshot)
+            input_hashes = _input_hashes(snapshot)
+            panels = _load_carnet_panels(snapshot)
+            staging = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{destination.name}.stale-",
+                    dir=destination.parent,
+                )
+            )
+            statistics, limits = render_carnet_density(
+                panels, staging, dpi=render_dpi
+            )
+            write_carnet_statistics(
+                staging / "plotting_statistics.csv", statistics
+            )
             outputs = {
-                path.name: sha256_file(path)
+                path.name: {
+                    "size": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
                 for path in sorted(staging.iterdir(), key=lambda item: item.name)
+            }
+            config = {
+                **CARNET_DENSITY_CONFIG,
+                "figure_size": list(CARNET_DENSITY_CONFIG["figure_size"]),
+                "contour_masses": list(CARNET_DENSITY_CONFIG["contour_masses"]),
+                "formats": ["png", "pdf"],
+                "dpi": render_dpi,
             }
             manifest = {
                 "schema_version": SCHEMA_VERSION,
                 "formula_version": FORMULA_VERSION,
                 "status": "complete",
                 "style": "carnet_density",
-                "inputs": _input_hashes(snapshot),
+                "inputs": input_hashes,
                 "outputs": outputs,
-                "config": {
-                    **CARNET_DENSITY_CONFIG,
-                    "contour_masses": list(CARNET_DENSITY_CONFIG["contour_masses"]),
-                    "formats": ["png", "pdf"],
-                    "dpi": render_dpi,
-                },
+                "config": config,
                 "selected": [list(item) for item in CARNET_SELECTED],
                 "shared_axes": {
-                    f"{variant}/{target}": {"minimum": bound[0], "maximum": bound[1]}
+                    f"{variant}/{target}": {
+                        "minimum": bound[0],
+                        "maximum": bound[1],
+                    }
                     for (variant, target), bound in limits.items()
+                },
+                "statistics": {
+                    f"{row['variant']}/{row['target']}": row
+                    for row in statistics
                 },
             }
             _strict_json_dump(staging / "plotting_manifest.json", manifest)
-            expected = {
-                *(f"{stem}.{suffix}" for stem in CARNET_FIGURE_STEMS.values() for suffix in ("png", "pdf")),
-                "plotting_statistics.csv", "plotting_manifest.json",
-            }
-            if {path.name for path in staging.iterdir()} != expected:
-                raise RuntimeError("carnet plot staging files mismatch")
+            _validate_carnet_staging(staging)
+            if _snapshot_source_hashes(root) != snapshot_source_hashes:
+                raise ValueError("publication input changed during plotting")
             _promote_directory(staging, destination)
             return destination
         finally:
-            _best_effort_remove(snapshot)
-            _best_effort_remove(staging)
+            if snapshot is not None:
+                _best_effort_remove(snapshot)
+            if staging is not None:
+                _best_effort_remove(staging)

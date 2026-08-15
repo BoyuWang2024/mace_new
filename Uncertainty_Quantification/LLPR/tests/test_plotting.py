@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing as mp
 import shutil
+import stat
 import time
 from pathlib import Path
 
@@ -817,3 +818,159 @@ def test_mixed_snapshot_validation_failure_preserves_old_output(
     assert after == before
     assert not list(tmp_path.glob(".plots.snapshot-*"))
     assert not list(tmp_path.glob(".plots.stale-*"))
+
+
+def _density_panels(std: list[float], residual: list[float]) -> dict[tuple[str, str], _PanelData]:
+    return {key: _density_panel(std, residual, target=key[1]) for key in density_plotting.CARNET_SELECTED}
+
+
+@pytest.mark.parametrize("style", [[], {}, 1, None, True])
+def test_plot_config_rejects_non_string_style(tmp_path: Path, style: object) -> None:
+    with pytest.raises(ValueError, match="style"):
+        _load_plot_config(_write_plot_config(tmp_path / "plot.yaml", extra={"style": style}))
+
+
+def test_density_limits_use_paired_valid_mask() -> None:
+    panels = _density_panels([1.0, -1.0], [2.0, 1.0e30])
+    assert carnet_shared_limits(panels, margin=0.05)[("he", "energy")][1] < 10.0
+
+
+def test_density_correlations_are_tie_aware_and_undefined_is_null() -> None:
+    panels = _density_panels([1.0, 1.0, 2.0], [1.0, 2.0, 3.0])
+    row = density_plotting.carnet_statistics(panels, carnet_shared_limits(panels, margin=0.05))[0]
+    assert row["spearman_log"] == pytest.approx(0.8660254037844387)
+    assert row["correlation_status"] == "ok"
+    for std, residual, count in (
+        ([1.0, 1.0], [1.0, 2.0], 2), ([1.0], [1.0], 1),
+        ([1.0, 2.0], [0.0, 2.0], 1), ([-1.0, 2.0], [3.0, 2.0], 1),
+    ):
+        panels = _density_panels(std, residual)
+        row = density_plotting.carnet_statistics(panels, carnet_shared_limits(panels, margin=0.05))[0]
+        assert row["pearson_log"] is None and row["spearman_log"] is None
+        assert row["correlation_rows"] == count
+        assert row["correlation_status"].startswith("undefined_")
+
+
+def test_density_typography_config_is_complete() -> None:
+    assert {key: CARNET_DENSITY_CONFIG[key] for key in (
+        "title_font_size", "axis_label_font_size", "tick_label_font_size",
+        "annotation_font_size", "line_width", "spine_width", "constrained_layout",
+    )} == {
+        "title_font_size": 26.0, "axis_label_font_size": 22.0,
+        "tick_label_font_size": 18.0, "annotation_font_size": 16.0,
+        "line_width": 1.5, "spine_width": 1.5, "constrained_layout": True,
+    }
+
+
+def test_density_grid_sigma_rc_and_artists_follow_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panels = _density_panels([1.0, 2.0], [1.0, 2.0])
+    seen: dict[str, object] = {}
+    real_hist = np.histogram2d
+    def hist(*args: object, **kwargs: object) -> object:
+        seen["bins"] = kwargs["bins"]; return real_hist(*args, **kwargs)
+    def smooth(values: np.ndarray, *, sigma: float) -> np.ndarray:
+        seen["shape"], seen["sigma"] = values.shape, sigma; return values
+    def save(fig: object, *args: object, **kwargs: object) -> None:
+        axis = fig.axes[0]
+        ref = next(line for line in axis.lines if line.get_label() == "1:1 reference")
+        seen.setdefault("artist", (axis.get_title(), axis.title.get_fontsize(),
+            axis.xaxis.label.get_fontsize(), axis.xaxis.get_ticklabels()[0].get_fontsize(),
+            axis.texts[0].get_fontsize(), ref.get_linestyle(), ref.get_linewidth(),
+            {spine.get_linewidth() for spine in axis.spines.values()},
+            type(fig.get_layout_engine()).__name__))
+    monkeypatch.setattr(density_plotting.np, "histogram2d", hist)
+    monkeypatch.setattr(density_plotting, "gaussian_filter", smooth)
+    monkeypatch.setattr("matplotlib.figure.Figure.savefig", save)
+    old = matplotlib.rcParams["font.size"]; matplotlib.rcParams["font.size"] = 13.0
+    try:
+        density_plotting.render_carnet_density(panels, tmp_path, dpi=72)
+        assert matplotlib.rcParams["font.size"] == 13.0
+    finally:
+        matplotlib.rcParams["font.size"] = old
+    assert len(seen["bins"][0]) == CARNET_DENSITY_CONFIG["grid_size"] + 1
+    assert seen["shape"] == (160, 160) and seen["sigma"] == CARNET_DENSITY_CONFIG["gaussian_sigma"]
+    assert seen["artist"] == ("He energy", 26.0, 22.0, 18.0, 16.0, "--", 1.5, {1.5}, "ConstrainedLayoutEngine")
+
+
+def test_density_loader_reads_only_four_panels_two_columns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+    expected = {"he/energy.csv", "hf/force_components.csv", "hef/energy.csv", "hef/force_components.csv"}
+    for relative in expected:
+        path = tmp_path / relative; path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"std": [1.0], "residual": [-2.0], "unused": ["x"]}).to_csv(path, index=False)
+    calls: list[tuple[str, tuple[str, ...]]] = []; real_read = pd.read_csv
+    def read(path: Path, **kwargs: object) -> pd.DataFrame:
+        calls.append((str(Path(path).relative_to(tmp_path)), tuple(kwargs.get("usecols", ())))); return real_read(path, **kwargs)
+    monkeypatch.setattr(plotting.pd, "read_csv", read)
+    panels = plotting._load_carnet_panels(tmp_path)
+    assert {name for name, _ in calls} == expected
+    assert all(columns == ("std", "residual") for _, columns in calls)
+    assert all(not hasattr(panel, "signed_residual") for panel in panels.values())
+
+
+def test_density_analysis_computed_once_per_panel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    panels = _density_panels([1.0, 2.0], [1.0, 2.0])
+    real = density_plotting._analyze_panel; calls: list[tuple[str, str]] = []
+    def analyze(*args: object, **kwargs: object) -> object:
+        calls.append(args[1]); return real(*args, **kwargs)
+    monkeypatch.setattr(density_plotting, "_analyze_panel", analyze)
+    monkeypatch.setattr("matplotlib.figure.Figure.savefig", lambda *args, **kwargs: None)
+    density_plotting.render_carnet_density(panels, tmp_path, dpi=72)
+    assert calls == list(density_plotting.CARNET_SELECTED)
+
+
+def test_density_manifest_has_stats_and_output_size_sha(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    result = run_plot(root, output_dir=tmp_path / "plots", style="carnet_density")
+    rows = pd.read_csv(result / "plotting_statistics.csv")
+    manifest = _strict_json(result / "plotting_manifest.json")
+    for csv_row in rows.to_dict(orient="records"):
+        key = f"{csv_row['variant']}/{csv_row['target']}"
+        manifest_row = manifest["statistics"][key]
+        assert set(manifest_row) == set(csv_row)
+        for field, csv_value in csv_row.items():
+            manifest_value = manifest_row[field]
+            if isinstance(csv_value, float) and not pd.isna(csv_value):
+                assert manifest_value == pytest.approx(csv_value)
+            else:
+                assert manifest_value == csv_value or (
+                    manifest_value is None and pd.isna(csv_value)
+                )
+    expected = {path.name for path in result.iterdir()} - {"plotting_manifest.json"}
+    assert set(manifest["outputs"]) == expected
+    for name, record in manifest["outputs"].items():
+        assert record == {"size": (result / name).stat().st_size, "sha256": _sha256(result / name)}
+
+
+@pytest.mark.parametrize("corruption", ["empty_png", "manifest_size", "symlink"])
+def test_density_staging_validation_rejects_corruption(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    result = run_plot(root, output_dir=tmp_path / "plots", style="carnet_density")
+    if corruption == "empty_png":
+        next(result.glob("*.png")).write_bytes(b"")
+    elif corruption == "manifest_size":
+        path = result / "plotting_manifest.json"; manifest = _strict_json(path)
+        name = next(iter(manifest["outputs"])); manifest["outputs"][name]["size"] += 1
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        png = next(result.glob("*.png")); target = tmp_path / "outside.png"
+        target.write_bytes(png.read_bytes()); png.unlink(); png.symlink_to(target)
+        assert stat.S_ISLNK(png.lstat().st_mode)
+    with pytest.raises(RuntimeError, match="empty|size|regular|PNG|manifest"):
+        plotting._validate_carnet_staging(result)
+
+
+def test_density_live_change_preserves_existing_output_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    output = run_plot(root, output_dir=tmp_path / "plots", style="carnet_density")
+    (output / "old-only.txt").write_text("old", encoding="utf-8")
+    before = {path.relative_to(output): path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    real = density_plotting.render_carnet_density
+    def render(*args: object, **kwargs: object) -> object:
+        result = real(*args, **kwargs); path = root / "he" / "energy.csv"
+        path.write_bytes(path.read_bytes() + b"\n"); return result
+    monkeypatch.setattr(density_plotting, "render_carnet_density", render)
+    with pytest.raises(ValueError, match="input.*changed"):
+        run_plot(root, output_dir=output, style="carnet_density")
+    assert {path.relative_to(output): path.read_bytes() for path in output.rglob("*") if path.is_file()} == before

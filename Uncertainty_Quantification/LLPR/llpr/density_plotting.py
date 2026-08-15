@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import csv
 import math
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
+from scipy.stats import pearsonr, spearmanr
 
 
 CARNET_SELECTED = (
@@ -27,6 +31,20 @@ CARNET_DENSITY_CONFIG = {
     "scatter_size": 12.0,
     "scatter_alpha": 0.04,
     "dpi": 300,
+    "font_family": "DejaVu Sans",
+    "title_font_size": 26.0,
+    "axis_label_font_size": 22.0,
+    "tick_label_font_size": 18.0,
+    "annotation_font_size": 16.0,
+    "line_width": 1.5,
+    "spine_width": 1.5,
+    "constrained_layout": True,
+    "titles": {
+        "he/energy": "He energy",
+        "hf/forces": "Hf forces",
+        "hef/energy": "Hef energy",
+        "hef/forces": "Hef forces",
+    },
 }
 
 CARNET_FIGURE_STEMS = {
@@ -52,14 +70,37 @@ CARNET_STATISTICS_FIELDS = (
     "spearman_log",
     "correlation_rows",
     "correlation_degenerate",
+    "correlation_status",
     "axis_min",
     "axis_max",
 )
 
 
+@dataclass(frozen=True, slots=True)
+class DensityPanel:
+    """The only two numeric arrays needed by one density panel."""
+
+    uncertainty: np.ndarray
+    absolute_residual: np.ndarray
+    target: str
+    unit: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PanelAnalysis:
+    panel: Any
+    path: tuple[str, str]
+    log_mask: np.ndarray
+    candidate_indices: np.ndarray
+    statistics: dict[str, Any]
+
+
 def deterministic_sample_indices(total: int, maximum: int, seed: int) -> np.ndarray:
     """Return reproducible duplicate-free sample indices."""
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in (total, maximum, seed)):
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (total, maximum, seed)
+    ):
         raise ValueError("sampling arguments must be integers")
     if total < 0 or maximum <= 0:
         raise ValueError("sampling total must be non-negative and maximum positive")
@@ -68,24 +109,50 @@ def deterministic_sample_indices(total: int, maximum: int, seed: int) -> np.ndar
     return np.random.default_rng(seed).choice(total, size=maximum, replace=False)
 
 
+def _panel_arrays(panel: Any) -> tuple[np.ndarray, np.ndarray]:
+    uncertainty = np.asarray(panel.uncertainty, dtype=np.float64)
+    residual = np.asarray(panel.absolute_residual, dtype=np.float64)
+    if uncertainty.ndim != 1 or residual.ndim != 1 or uncertainty.shape != residual.shape:
+        raise ValueError("density panel arrays must be aligned one-dimensional arrays")
+    return uncertainty, residual
+
+
+def _log_mask(panel: Any) -> np.ndarray:
+    uncertainty, residual = _panel_arrays(panel)
+    return (
+        np.isfinite(uncertainty)
+        & np.isfinite(residual)
+        & (uncertainty > 0.0)
+        & (residual > 0.0)
+    )
+
+
 def _pair_limits(
     panels: Mapping[tuple[str, str], Any],
     paths: tuple[tuple[str, str], ...],
     margin: float,
 ) -> tuple[float, float]:
-    values: list[np.ndarray] = []
+    minimum = math.inf
+    maximum = -math.inf
     for path in paths:
         panel = panels[path]
-        for source in (panel.uncertainty, panel.absolute_residual):
-            array = np.asarray(source, dtype=np.float64)
-            positive = array[np.isfinite(array) & (array > 0.0)]
-            if positive.size:
-                values.append(positive)
-    if not values:
+        uncertainty, residual = _panel_arrays(panel)
+        valid = _log_mask(panel)
+        if np.any(valid):
+            minimum = min(
+                minimum,
+                float(np.min(uncertainty, where=valid, initial=math.inf)),
+                float(np.min(residual, where=valid, initial=math.inf)),
+            )
+            maximum = max(
+                maximum,
+                float(np.max(uncertainty, where=valid, initial=-math.inf)),
+                float(np.max(residual, where=valid, initial=-math.inf)),
+            )
+    if not math.isfinite(minimum) or not math.isfinite(maximum):
         return (1.0e-12, 1.0)
-    pooled = np.concatenate(values)
-    low = float(np.log10(np.min(pooled)))
-    high = float(np.log10(np.max(pooled)))
+    low = math.log10(minimum)
+    high = math.log10(maximum)
     padding = max(margin * (high - low), margin)
     return (10.0 ** (low - padding), 10.0 ** (high + padding))
 
@@ -111,88 +178,255 @@ def carnet_shared_limits(
     }
 
 
-def _log_mask(panel: Any) -> np.ndarray:
-    std = np.asarray(panel.uncertainty, dtype=np.float64)
-    residual = np.asarray(panel.absolute_residual, dtype=np.float64)
-    return np.isfinite(std) & np.isfinite(residual) & (std > 0.0) & (residual > 0.0)
-
-
-def _correlations(panel: Any, mask: np.ndarray) -> tuple[float, float, int, int]:
+def _correlations(
+    panel: Any, mask: np.ndarray
+) -> tuple[float | None, float | None, int, int, str]:
     count = int(np.count_nonzero(mask))
     if count < 2:
-        return (0.0, 0.0, count, 1)
-    x_values = np.log10(np.asarray(panel.uncertainty, dtype=np.float64)[mask])
-    y_values = np.log10(np.asarray(panel.absolute_residual, dtype=np.float64)[mask])
+        return (None, None, count, 1, "undefined_insufficient_rows")
+    uncertainty, residual = _panel_arrays(panel)
+    x_values = np.log10(uncertainty[mask])
+    y_values = np.log10(residual[mask])
     if np.ptp(x_values) == 0.0 or np.ptp(y_values) == 0.0:
-        return (0.0, 0.0, count, 1)
-    pearson = float(np.corrcoef(x_values, y_values)[0, 1])
-    rank_x = np.argsort(np.argsort(x_values, kind="stable"), kind="stable")
-    rank_y = np.argsort(np.argsort(y_values, kind="stable"), kind="stable")
-    spearman = float(np.corrcoef(rank_x, rank_y)[0, 1])
-    return (pearson, spearman, count, int(not (math.isfinite(pearson) and math.isfinite(spearman))))
+        return (None, None, count, 1, "undefined_constant")
+    pearson = float(pearsonr(x_values, y_values).statistic)
+    spearman = float(spearmanr(x_values, y_values).statistic)
+    if not (math.isfinite(pearson) and math.isfinite(spearman)):
+        return (None, None, count, 1, "undefined_nonfinite")
+    return (pearson, spearman, count, 0, "ok")
 
 
-def carnet_statistics(panels: Mapping[tuple[str, str], Any], limits: Mapping[tuple[str, str], tuple[float, float]]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for variant, target in CARNET_SELECTED:
-        panel = panels[(variant, target)]
-        std = np.asarray(panel.uncertainty, dtype=np.float64)
-        residual = np.asarray(panel.absolute_residual, dtype=np.float64)
-        finite = np.isfinite(std) & np.isfinite(residual)
-        metric = finite & (std > 0.0)
-        mask = metric & (residual > 0.0)
-        pearson, spearman, correlation_rows, degenerate = _correlations(panel, mask)
-        lower, upper = limits[(variant, target)]
-        rows.append({"variant": variant, "target": target, "unit": str(panel.unit), "rows": int(std.size), "finite_rows": int(np.count_nonzero(finite)), "nonfinite_rows": int(np.count_nonzero(~finite)), "nonpositive_std_rows": int(np.count_nonzero(finite & (std <= 0.0))), "zero_absolute_residual_rows": int(np.count_nonzero(finite & (residual == 0.0))), "metric_rows": int(np.count_nonzero(metric)), "log_plot_rows": int(np.count_nonzero(mask)), "excluded_from_log_rows": int(std.size - np.count_nonzero(mask)), "pearson_log": pearson, "spearman_log": spearman, "correlation_rows": correlation_rows, "correlation_degenerate": degenerate, "axis_min": lower, "axis_max": upper})
-    return rows
+def _analyze_panel(
+    panel: Any,
+    path: tuple[str, str],
+    limits: tuple[float, float],
+) -> _PanelAnalysis:
+    uncertainty, residual = _panel_arrays(panel)
+    finite = np.isfinite(uncertainty) & np.isfinite(residual)
+    metric = finite & (uncertainty > 0.0)
+    log_mask = metric & (residual > 0.0)
+    pearson, spearman, correlation_rows, degenerate, status = _correlations(
+        panel, log_mask
+    )
+    lower, upper = limits
+    row = {
+        "variant": path[0],
+        "target": path[1],
+        "unit": str(panel.unit),
+        "rows": int(uncertainty.size),
+        "finite_rows": int(np.count_nonzero(finite)),
+        "nonfinite_rows": int(np.count_nonzero(~finite)),
+        "nonpositive_std_rows": int(
+            np.count_nonzero(finite & (uncertainty <= 0.0))
+        ),
+        "zero_absolute_residual_rows": int(
+            np.count_nonzero(finite & (residual == 0.0))
+        ),
+        "metric_rows": int(np.count_nonzero(metric)),
+        "log_plot_rows": int(np.count_nonzero(log_mask)),
+        "excluded_from_log_rows": int(
+            uncertainty.size - np.count_nonzero(log_mask)
+        ),
+        "pearson_log": pearson,
+        "spearman_log": spearman,
+        "correlation_rows": correlation_rows,
+        "correlation_degenerate": degenerate,
+        "correlation_status": status,
+        "axis_min": float(lower),
+        "axis_max": float(upper),
+    }
+    return _PanelAnalysis(
+        panel=panel,
+        path=path,
+        log_mask=log_mask,
+        candidate_indices=np.flatnonzero(log_mask),
+        statistics=row,
+    )
+
+
+def carnet_statistics(
+    panels: Mapping[tuple[str, str], Any],
+    limits: Mapping[tuple[str, str], tuple[float, float]],
+) -> list[dict[str, Any]]:
+    return [
+        _analyze_panel(panels[path], path, limits[path]).statistics
+        for path in CARNET_SELECTED
+    ]
 
 
 def write_carnet_statistics(path: Any, rows: list[dict[str, Any]]) -> None:
-    import csv
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(CARNET_STATISTICS_FIELDS), lineterminator="\n", extrasaction="raise")
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=list(CARNET_STATISTICS_FIELDS),
+            lineterminator="\n",
+            extrasaction="raise",
+        )
         writer.writeheader()
         writer.writerows(rows)
 
 
-def _render_panel(panel: Any, path: tuple[str, str], limits: tuple[float, float], staging: Any, dpi: int) -> None:
+def _render_panel(
+    analysis: _PanelAnalysis,
+    staging: Any,
+    dpi: int,
+) -> None:
     import matplotlib.pyplot as plt
-    from scipy.ndimage import gaussian_filter
-    figure, axis = plt.subplots(figsize=CARNET_DENSITY_CONFIG["figure_size"])
-    try:
-        lower, upper = limits
-        diagonal = np.geomspace(lower, upper, 256)
-        axis.fill_between(diagonal, lower, diagonal, color="0.90")
-        mask = _log_mask(panel)
-        candidates = np.flatnonzero(mask)
-        sample = candidates[deterministic_sample_indices(int(candidates.size), int(CARNET_DENSITY_CONFIG["scatter_max_points"]), int(CARNET_DENSITY_CONFIG["random_seed"]))]
-        axis.scatter(np.asarray(panel.uncertainty)[sample], np.asarray(panel.absolute_residual)[sample], color=CARNET_DENSITY_CONFIG["color"], s=CARNET_DENSITY_CONFIG["scatter_size"], alpha=CARNET_DENSITY_CONFIG["scatter_alpha"], edgecolors="none", rasterized=True)
-        edges = np.linspace(math.log10(lower), math.log10(upper), 161)
-        if candidates.size:
-            histogram, _, _ = np.histogram2d(np.log10(np.asarray(panel.uncertainty)[mask]), np.log10(np.asarray(panel.absolute_residual)[mask]), bins=(edges, edges))
-            density = gaussian_filter(histogram.T, sigma=1.2)
-            total = density.sum()
-            if total > 0:
-                sorted_density = np.sort(density.ravel())[::-1]
-                cumulative = np.cumsum(sorted_density) / total
-                levels = np.unique([sorted_density[min(int(np.searchsorted(cumulative, mass)), sorted_density.size - 1)] for mass in CARNET_DENSITY_CONFIG["contour_masses"]])
-                if levels.size:
-                    centers = (edges[:-1] + edges[1:]) / 2.0
-                    axis.contour(10.0 ** centers, 10.0 ** centers, density, levels=levels, colors=CARNET_DENSITY_CONFIG["color"])
-        axis.plot(diagonal, diagonal, color="black")
-        pearson, spearman, _, _ = _correlations(panel, mask)
-        axis.text(0.04, 0.96, f"Pearson={pearson:.3f}\nSpearman={spearman:.3f}", transform=axis.transAxes, va="top")
-        axis.set_xscale("log"); axis.set_yscale("log"); axis.set_xlim(lower, upper); axis.set_ylim(lower, upper); axis.set_box_aspect(1)
-        axis.set_xlabel(f"LLPR uncertainty ({panel.unit})"); axis.set_ylabel(f"Absolute residual ({panel.unit})"); axis.grid(False)
-        stem = CARNET_FIGURE_STEMS[path]
-        figure.savefig(staging / f"{stem}.png", dpi=dpi, facecolor="white")
-        figure.savefig(staging / f"{stem}.pdf", dpi=dpi, facecolor="white", metadata={"CreationDate": None, "ModDate": None})
-    finally:
-        plt.close(figure)
+
+    config = CARNET_DENSITY_CONFIG
+    rc = {
+        "font.family": config["font_family"],
+        "font.size": config["tick_label_font_size"],
+        "axes.titlesize": config["title_font_size"],
+        "axes.labelsize": config["axis_label_font_size"],
+        "xtick.labelsize": config["tick_label_font_size"],
+        "ytick.labelsize": config["tick_label_font_size"],
+        "savefig.bbox": None,
+        "pdf.compression": 6,
+    }
+    with plt.rc_context(rc):
+        figure, axis = plt.subplots(
+            figsize=config["figure_size"],
+            constrained_layout=bool(config["constrained_layout"]),
+        )
+        try:
+            panel = analysis.panel
+            path = analysis.path
+            lower = float(analysis.statistics["axis_min"])
+            upper = float(analysis.statistics["axis_max"])
+            diagonal = np.geomspace(lower, upper, 256)
+            axis.fill_between(diagonal, lower, diagonal, color="0.90")
+            sample = analysis.candidate_indices[
+                deterministic_sample_indices(
+                    int(analysis.candidate_indices.size),
+                    int(config["scatter_max_points"]),
+                    int(config["random_seed"]),
+                )
+            ]
+            uncertainty, residual = _panel_arrays(panel)
+            axis.scatter(
+                uncertainty[sample],
+                residual[sample],
+                color=config["color"],
+                s=config["scatter_size"],
+                alpha=config["scatter_alpha"],
+                edgecolors="none",
+                rasterized=True,
+            )
+            edges = np.linspace(
+                math.log10(lower),
+                math.log10(upper),
+                int(config["grid_size"]) + 1,
+            )
+            if analysis.candidate_indices.size:
+                histogram, _, _ = np.histogram2d(
+                    np.log10(uncertainty[analysis.log_mask]),
+                    np.log10(residual[analysis.log_mask]),
+                    bins=(edges, edges),
+                )
+                density = gaussian_filter(
+                    histogram.T, sigma=float(config["gaussian_sigma"])
+                )
+                total = float(density.sum())
+                if total > 0.0:
+                    sorted_density = np.sort(density.ravel())[::-1]
+                    cumulative = np.cumsum(sorted_density) / total
+                    levels = np.unique(
+                        [
+                            sorted_density[
+                                min(
+                                    int(np.searchsorted(cumulative, mass)),
+                                    sorted_density.size - 1,
+                                )
+                            ]
+                            for mass in config["contour_masses"]
+                        ]
+                    )
+                    levels = levels[levels > 0.0]
+                    if levels.size:
+                        centers = (edges[:-1] + edges[1:]) / 2.0
+                        axis.contour(
+                            10.0 ** centers,
+                            10.0 ** centers,
+                            density,
+                            levels=levels,
+                            colors=config["color"],
+                            linewidths=config["line_width"],
+                        )
+            axis.plot(
+                diagonal,
+                diagonal,
+                color="black",
+                linestyle="--",
+                linewidth=config["line_width"],
+                label="1:1 reference",
+            )
+            pearson = analysis.statistics["pearson_log"]
+            spearman = analysis.statistics["spearman_log"]
+            pearson_text = "n/a" if pearson is None else f"{pearson:.3f}"
+            spearman_text = "n/a" if spearman is None else f"{spearman:.3f}"
+            axis.text(
+                0.04,
+                0.96,
+                f"Pearson={pearson_text}\nSpearman={spearman_text}",
+                transform=axis.transAxes,
+                va="top",
+                fontsize=config["annotation_font_size"],
+            )
+            axis.set_title(
+                config["titles"][f"{path[0]}/{path[1]}"],
+                fontsize=config["title_font_size"],
+            )
+            axis.set_xscale("log")
+            axis.set_yscale("log")
+            axis.set_xlim(lower, upper)
+            axis.set_ylim(lower, upper)
+            axis.set_box_aspect(1)
+            axis.set_xlabel(
+                f"LLPR uncertainty ({panel.unit})",
+                fontsize=config["axis_label_font_size"],
+            )
+            axis.set_ylabel(
+                f"Absolute residual ({panel.unit})",
+                fontsize=config["axis_label_font_size"],
+            )
+            axis.tick_params(
+                axis="both",
+                labelsize=config["tick_label_font_size"],
+                width=config["line_width"],
+            )
+            for spine in axis.spines.values():
+                spine.set_linewidth(config["spine_width"])
+            axis.grid(False)
+            stem = CARNET_FIGURE_STEMS[path]
+            figure.savefig(
+                staging / f"{stem}.png",
+                dpi=dpi,
+                facecolor="white",
+            )
+            figure.savefig(
+                staging / f"{stem}.pdf",
+                dpi=dpi,
+                facecolor="white",
+                metadata={"CreationDate": None, "ModDate": None},
+            )
+        finally:
+            plt.close(figure)
 
 
-def render_carnet_density(panels: Mapping[tuple[str, str], Any], staging: Any, *, dpi: int) -> tuple[list[dict[str, Any]], dict[tuple[str, str], tuple[float, float]]]:
-    limits = carnet_shared_limits(panels, margin=float(CARNET_DENSITY_CONFIG["log_margin"]))
-    for path in CARNET_SELECTED:
-        _render_panel(panels[path], path, limits[path], staging, dpi)
-    return carnet_statistics(panels, limits), limits
+def render_carnet_density(
+    panels: Mapping[tuple[str, str], Any],
+    staging: Any,
+    *,
+    dpi: int,
+) -> tuple[list[dict[str, Any]], dict[tuple[str, str], tuple[float, float]]]:
+    limits = carnet_shared_limits(
+        panels, margin=float(CARNET_DENSITY_CONFIG["log_margin"])
+    )
+    analyses = [
+        _analyze_panel(panels[path], path, limits[path])
+        for path in CARNET_SELECTED
+    ]
+    for analysis in analyses:
+        _render_panel(analysis, staging, dpi)
+    return [analysis.statistics for analysis in analyses], limits
