@@ -149,10 +149,14 @@ def _replace_stage_functions(monkeypatch: pytest.MonkeyPatch, called: list[str])
             f"run_{stage}",
             lambda config, stage=stage: called.append(stage),
         )
+    def plot(publication_root, *, output_dir, selected, style):
+        assert style == "diagnostic_suite"
+        called.append("plot")
+
     monkeypatch.setattr(
         cli,
         "run_plot",
-        lambda publication_root, *, output_dir, selected: called.append("plot"),
+        plot,
     )
 
 
@@ -324,8 +328,8 @@ def test_plot_uses_only_its_fixed_relative_configuration(
     monkeypatch.setattr(
         cli,
         "run_plot",
-        lambda publication_root, *, output_dir, selected: received.append(
-            (publication_root, output_dir, selected)
+        lambda publication_root, *, output_dir, selected, style: received.append(
+            (publication_root, output_dir, selected, style)
         ),
     )
     monkeypatch.chdir(outside)
@@ -342,6 +346,7 @@ def test_plot_uses_only_its_fixed_relative_configuration(
                 ("hef", "energy"),
                 ("hef", "forces"),
             ),
+            "diagnostic_suite",
         )
     ]
 
@@ -469,6 +474,89 @@ def test_plot_config_matches_cpu_n20_run_root_from_clean_working_directory(
     assert not Path(document["publication_root"]).is_absolute()
     assert not Path(document["output_dir"]).is_absolute()
 
+
+@pytest.mark.full_chain
+def test_n20_shared_curvature_is_built_once_and_consumed_by_a_second_experiment(
+    tmp_path: Path,
+) -> None:
+    """A consumer must reuse the published curvature without rebuilding it."""
+    builder_path = CONFIG_ROOT / "cpu_n20_shared_curvature.yaml"
+    builder = load_config(builder_path)
+    checkpoint_sha256 = sha256_file(builder.checkpoint.path)
+    artifact = (
+        run_root(builder, checkpoint_sha256) / "curvature" / "base_curvature.pt"
+    )
+
+    curvature.run_build(builder)
+    assert artifact.is_file()
+
+    consumer_path = tmp_path / "consumer.yaml"
+    consumer_path.write_text(
+        yaml.safe_dump(
+            {
+                "checkpoint": {
+                    "path": str(builder.checkpoint.path),
+                    "expected_sha256": checkpoint_sha256,
+                    "selected_head": builder.selected_head,
+                    "expected_readout_size": builder.expected_readout_size,
+                },
+                "data": {
+                    stage: {
+                        "path": str(getattr(builder, stage).path),
+                        "expected_sha256": getattr(builder, stage).expected_sha256,
+                    }
+                    for stage in ("build", "calibration", "test")
+                },
+                "curvature": {
+                    "variants": ["he", "hf", "hef"],
+                    "min_q": 1.0e-30,
+                },
+                "ridge": {"mode": "fixed", "value": 1.0e-12},
+                "runtime": {
+                    "device": "cpu",
+                    "force_component_chunk_size": 1,
+                    "save_every_structures": 1,
+                    "resume": True,
+                },
+                "artifacts": {
+                    "curvature": {
+                        "path": str(artifact),
+                        "expected_sha256": sha256_file(artifact),
+                    }
+                },
+                "output": {"root": "outputs", "experiment": "consumer"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    consumer = load_config(consumer_path)
+
+    calibration.run_calibrate(consumer)
+    inference.run_evaluate(consumer)
+    cli.main(["validate", "--config", str(consumer_path)])
+
+    publication_root = (
+        run_root(consumer, checkpoint_sha256) / "evaluation" / "deterministic"
+    )
+    plots = tmp_path / "plots"
+    cli.run_plot(
+        publication_root,
+        output_dir=plots,
+        selected=(
+            ("he", "energy"),
+            ("hf", "forces"),
+            ("hef", "energy"),
+            ("hef", "forces"),
+        ),
+        style="carnet_density",
+    )
+
+    validation = json.loads((publication_root / "validation.json").read_text())
+    assert validation["status"] == "valid"
+    assert not (run_root(consumer, checkpoint_sha256) / "curvature").exists()
+    assert len(list(plots.glob("*.png"))) == 4
+    assert len(list(plots.glob("*.pdf"))) == 4
 
 def test_readme_is_a_chinese_complete_operating_contract() -> None:
     text = (LLPR_ROOT / "README.md").read_text(encoding="utf-8")

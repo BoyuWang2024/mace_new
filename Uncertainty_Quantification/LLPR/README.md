@@ -115,3 +115,18 @@ outputs/<experiment>/<checkpoint_sha256前12位>/
 当前评估流程对同一结构只执行一次模型预测，因此新计算的三个 variant 会自然共享 prediction；验证器允许科学上合法的 variant-specific prediction，不改变新计算的这一确定性行为。覆盖率、相关性和标准化残差是完整报告指标，不作为隐藏的质量门槛。
 
 只有 `validate` 成功并生成确定性的 `manifest.json`、`validation.json` 后，结果才满足可发表结果包的结构与数值完整性要求。绘图再次验证输入快照，只从正式 CSV、摘要和清单生成图形及统计，不做后验尺度修正，也不重新计算任何不确定度。
+
+## 共享曲率与远程阶段
+
+`cpu_n20_shared_curvature.yaml` 仅用于发布 n20 曲率：先单独执行一次 `build`，其产物为 `base_curvature.pt`。消费方必须在自己的计算配置中显式填写该文件的路径及对实际文件重新计算得到的 SHA256；不得填写占位或伪造的 SHA256。消费方只执行 `calibrate`、`evaluate`、`validate`，不会创建自己的 `curvature/` 目录。
+
+远程执行器只公开非 build 阶段：
+
+```bash
+bash Uncertainty_Quantification/LLPR/scripts/run_remote_stage.sh calibrate Uncertainty_Quantification/LLPR/configs/cpu_n20_shared_curvature.yaml
+sbatch Uncertainty_Quantification/LLPR/scripts/submit_remote_stage.slurm evaluate Uncertainty_Quantification/LLPR/configs/cpu_n20_shared_curvature.yaml
+```
+
+两个脚本都使用 `conda run -n mace_new`、`set -euo pipefail`，只接受 `calibrate`、`evaluate`、`validate` 和 `plot`。它们不会隐式计算或重建曲率。
+
+`plot_carnet_matpes_test.yaml`、`plot_carnet_matpes_train.yaml`、`plot_carnet_mad_test.yaml` 是四面板密度图的 plot-only 入口：使用已验证的 canonical n20 结果、固定 `carnet_density` 风格和明确输出目录。它们没有 checkpoint 或 SHA256 字段，运行 `plot` 不会触发模型计算。

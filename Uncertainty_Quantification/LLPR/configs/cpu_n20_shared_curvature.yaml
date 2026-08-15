@@ -1,0 +1,32 @@
+checkpoint:
+  path: ../../../data/checkpoint/MACE-matpes-r2scan-omat-ft.model
+  expected_sha256: 8f147ecffa1d06a696e5648b13b81abda9c96fda9d0fb3faba3cd3fb27d9bba9
+  selected_head: default
+  expected_readout_size: 2192
+data:
+  build:
+    path: ../../../data/dataset/matpes_n20.extxyz
+    expected_sha256: c92161329aab539064a2c2438a395cb01e38bfc91211c558aebbc1ff94702e3d
+  calibration:
+    path: ../../../data/dataset/matpes_n20.extxyz
+    expected_sha256: c92161329aab539064a2c2438a395cb01e38bfc91211c558aebbc1ff94702e3d
+  test:
+    path: ../../../data/dataset/matpes_n20.extxyz
+    expected_sha256: c92161329aab539064a2c2438a395cb01e38bfc91211c558aebbc1ff94702e3d
+curvature:
+  variants: [he, hf, hef]
+  min_q: 1.0e-30
+ridge:
+  mode: fixed
+  value: 1.0e-12
+  max_condition_number: 1.0e12
+runtime:
+  device: cpu
+  force_component_chunk_size: 1
+  save_every_structures: 1
+  resume: true
+  max_structures:
+  max_force_components_per_structure:
+output:
+  root: ../outputs
+  experiment: cpu_n20_shared_curvature

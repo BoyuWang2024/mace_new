@@ -1,0 +1,8 @@
+publication_root: ../outputs/cpu_n20_full/8f147ecffa1d/evaluation/deterministic
+output_dir: ../outputs/cpu_n20_full/8f147ecffa1d/plots/carnet_matpes_test
+selected:
+  - [he, energy]
+  - [hf, forces]
+  - [hef, energy]
+  - [hef, forces]
+style: carnet_density

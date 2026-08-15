@@ -42,3 +42,7 @@ dist/
 /scripts
 *.cube
 /data/
+
+# LLPR Slurm stage logs
+/Uncertainty_Quantification/LLPR/llpr-stage-*.out
+/Uncertainty_Quantification/LLPR/llpr-stage-*.err
