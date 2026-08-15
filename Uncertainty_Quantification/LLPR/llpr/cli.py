@@ -25,6 +25,7 @@ class PlotConfig:
     publication_root: Path
     output_dir: Path
     selected: tuple[tuple[str, str], ...]
+    style: str
 
 
 def _mapping(value: Any, field: str) -> Mapping[str, Any]:
@@ -44,11 +45,17 @@ def _load_plot_config(path: Path) -> PlotConfig:
     source_path = Path(path).resolve()
     with source_path.open(encoding="utf-8") as handle:
         document = _mapping(yaml.safe_load(handle), "plot config")
-    expected_fields = {"publication_root", "output_dir", "selected"}
-    if set(document) != expected_fields:
+    expected_fields = {"publication_root", "output_dir", "selected", "style"}
+    if set(document) not in (
+        expected_fields,
+        expected_fields - {"style"},
+    ):
         raise ValueError(
-            "plot config must contain exactly publication_root, output_dir, selected"
+            "plot config must contain exactly publication_root, output_dir, selected, style"
         )
+    style = document.get("style", "diagnostic_suite")
+    if style not in {"diagnostic_suite", "carnet_density"}:
+        raise ValueError("plot config style is invalid")
     raw_selected = document["selected"]
     if not isinstance(raw_selected, list):
         raise ValueError("plot config selected must be a list")
@@ -70,6 +77,7 @@ def _load_plot_config(path: Path) -> PlotConfig:
         ),
         output_dir=_plot_path(source_dir, document["output_dir"], "output_dir"),
         selected=tuple(selected),
+        style=str(style),
     )
 
 
@@ -108,6 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config.publication_root,
             output_dir=config.output_dir,
             selected=config.selected,
+            style=config.style,
         )
     elif arguments.command == "run":
         config = load_config(arguments.config)

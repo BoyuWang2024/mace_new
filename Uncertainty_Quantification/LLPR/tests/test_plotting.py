@@ -14,11 +14,20 @@ import pytest
 from PIL import Image
 
 from Uncertainty_Quantification.LLPR.llpr.artifacts import atomic_json_dump
+from Uncertainty_Quantification.LLPR.llpr import density_plotting
+from Uncertainty_Quantification.LLPR.llpr.cli import _load_plot_config
+from Uncertainty_Quantification.LLPR.llpr.density_plotting import (
+    CARNET_DENSITY_CONFIG,
+    CARNET_STATISTICS_FIELDS,
+    carnet_shared_limits,
+    deterministic_sample_indices,
+)
 from Uncertainty_Quantification.LLPR.llpr.inference import summarize_variant
 from Uncertainty_Quantification.LLPR.llpr.plotting import (
     DEFAULT_SELECTED,
     FIGURE_STEMS,
     PLOTTING_STATISTICS_FIELDS,
+    _PanelData,
     run_plot,
 )
 from Uncertainty_Quantification.LLPR.llpr.validation import validate_publication_root
@@ -131,6 +140,41 @@ def _fallback_snapshot_copy(source: Path, snapshot: Path, name: str) -> None:
     shutil.copyfile(source / name, target)
 
 
+def _write_plot_config(
+    path: Path,
+    *,
+    style: str | None = None,
+    extra: dict[str, object] | None = None,
+) -> Path:
+    document: dict[str, object] = {
+        "publication_root": "publication",
+        "output_dir": "plots",
+        "selected": [list(item) for item in DEFAULT_SELECTED],
+    }
+    if style is not None:
+        document["style"] = style
+    if extra is not None:
+        document.update(extra)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def _density_panel(
+    uncertainty: list[float], absolute_residual: list[float], *, target: str
+) -> _PanelData:
+    values = np.asarray(absolute_residual, dtype=np.float64)
+    return _PanelData(
+        uncertainty=np.asarray(uncertainty, dtype=np.float64),
+        absolute_residual=values,
+        signed_residual=values,
+        mae_values=values,
+        squared_error_values=values**2,
+        target=target,
+        data_level="energy" if target == "energy" else "force_component",
+        unit="eV/atom" if target == "energy" else "force_component",
+    )
+
+
 def _lock_worker(output: str, events: object) -> None:
     from Uncertainty_Quantification.LLPR.llpr import plotting
 
@@ -153,6 +197,98 @@ def test_fixed_statistics_and_figure_contracts() -> None:
     assert PLOTTING_STATISTICS_FIELDS == EXPECTED_STATISTICS_FIELDS
     assert FIGURE_STEMS == EXPECTED_FIGURE_STEMS
 
+
+def test_plot_style_defaults_to_existing_suite(tmp_path: Path) -> None:
+    config = _load_plot_config(_write_plot_config(tmp_path / "plot.yaml"))
+    assert config.style == "diagnostic_suite"
+
+
+@pytest.mark.parametrize("style", ["unknown", "diagnostic-suite"])
+def test_plot_config_rejects_unknown_style(tmp_path: Path, style: str) -> None:
+    with pytest.raises(ValueError, match="style"):
+        _load_plot_config(_write_plot_config(tmp_path / "plot.yaml", style=style))
+
+
+def test_plot_config_rejects_extra_fields(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="exactly"):
+        _load_plot_config(
+            _write_plot_config(tmp_path / "plot.yaml", extra={"unexpected": True})
+        )
+
+
+def test_mace_plotting_has_no_carnet_runtime_dependency() -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    sources = [Path(plotting.__file__), Path(density_plotting.__file__)]
+    assert all("carnet_new" not in path.read_text(encoding="utf-8") for path in sources)
+
+
+def test_pair_limits_are_dataset_local() -> None:
+    panels = {
+        ("he", "energy"): _density_panel([1.0, 2.0], [2.0, 4.0], target="energy"),
+        ("hf", "forces"): _density_panel([10.0, 20.0], [20.0, 40.0], target="forces"),
+        ("hef", "energy"): _density_panel([0.5, 4.0], [1.0, 8.0], target="energy"),
+        ("hef", "forces"): _density_panel([5.0, 40.0], [10.0, 80.0], target="forces"),
+    }
+    limits = carnet_shared_limits(panels, margin=0.05)
+    assert limits[("he", "energy")] == limits[("hef", "energy")]
+    assert limits[("hf", "forces")] == limits[("hef", "forces")]
+    assert limits[("he", "energy")] != limits[("hf", "forces")]
+
+
+def test_sampling_is_deterministic_and_without_replacement() -> None:
+    first = deterministic_sample_indices(50_000, 20_000, 20260714)
+    second = deterministic_sample_indices(50_000, 20_000, 20260714)
+    assert np.array_equal(first, second)
+    assert first.size == 20_000
+    assert np.unique(first).size == 20_000
+
+
+def test_carnet_density_configuration_is_fixed() -> None:
+    assert CARNET_DENSITY_CONFIG["grid_size"] == 160
+    assert CARNET_DENSITY_CONFIG["gaussian_sigma"] == 1.2
+    assert CARNET_DENSITY_CONFIG["contour_masses"] == (0.5, 0.7, 0.85, 0.95, 0.99)
+
+def test_carnet_density_requires_exact_selected_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _publication_root(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="exactly"):
+        run_plot(
+            root,
+            output_dir=tmp_path / "plots",
+            style="carnet_density",
+            selected=(
+                ("he", "energy"),
+                ("hf", "forces"),
+                ("hef", "energy"),
+                ("hf", "energy"),
+            ),
+        )
+
+
+def test_carnet_density_generates_four_figures_and_style_aware_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _publication_root(tmp_path, monkeypatch)
+    result = run_plot(root, output_dir=tmp_path / "plots", style="carnet_density")
+
+    expected_stems = {
+        "llpr_he_energy_uncertainty_vs_residual",
+        "llpr_hf_force_uncertainty_vs_residual",
+        "llpr_hef_energy_uncertainty_vs_residual",
+        "llpr_hef_force_uncertainty_vs_residual",
+    }
+    assert {path.stem for path in result.glob("*.png")} == expected_stems
+    assert {path.stem for path in result.glob("*.pdf")} == expected_stems
+    statistics = pd.read_csv(result / "plotting_statistics.csv")
+    assert tuple(statistics.columns) == CARNET_STATISTICS_FIELDS
+    assert len(statistics) == 4
+    manifest = _strict_json(result / "plotting_manifest.json")
+    assert manifest["style"] == "carnet_density"
+    assert manifest["config"]["grid_size"] == 160
+    assert manifest["config"]["gaussian_sigma"] == 1.2
+    assert manifest["config"]["contour_masses"] == [0.5, 0.7, 0.85, 0.95, 0.99]
 
 def test_energy_plot_uses_per_atom_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

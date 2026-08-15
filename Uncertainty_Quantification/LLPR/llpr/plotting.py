@@ -1042,3 +1042,85 @@ def run_plot(
         finally:
             if snapshot is not None:
                 _best_effort_remove(snapshot)
+
+
+_run_plot_diagnostic_suite = run_plot
+
+
+def run_plot(
+    publication_root: Path,
+    *,
+    output_dir: Path,
+    selected: Sequence[tuple[str, str]] = DEFAULT_SELECTED,
+    style: str = "diagnostic_suite",
+    dpi: int | None = None,
+) -> Path:
+    """Render validated CSV snapshots with either supported publication style."""
+    if style == "diagnostic_suite":
+        return _run_plot_diagnostic_suite(
+            publication_root,
+            output_dir=output_dir,
+            selected=selected,
+            dpi=_DEFAULT_DPI if dpi is None else dpi,
+        )
+    if style != "carnet_density":
+        raise ValueError("plot style is invalid")
+    if tuple(selected) != DEFAULT_SELECTED:
+        raise ValueError("carnet_density selected paths must exactly match the four required paths")
+    from .density_plotting import (
+        CARNET_DENSITY_CONFIG,
+        CARNET_FIGURE_STEMS,
+        CARNET_SELECTED,
+        render_carnet_density,
+        write_carnet_statistics,
+    )
+
+    root, destination = _safe_paths(publication_root, output_dir)
+    render_dpi = int(CARNET_DENSITY_CONFIG["dpi"]) if dpi is None else dpi
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with _output_lock(destination):
+        snapshot = _create_input_snapshot(root, destination)
+        staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.stale-", dir=destination.parent))
+        try:
+            data = _load_plot_data(snapshot)
+            panels = {
+                (variant, target): data[_selected_level(target)][variant]
+                for variant, target in CARNET_SELECTED
+            }
+            statistics, limits = render_carnet_density(panels, staging, dpi=render_dpi)
+            write_carnet_statistics(staging / "plotting_statistics.csv", statistics)
+            outputs = {
+                path.name: sha256_file(path)
+                for path in sorted(staging.iterdir(), key=lambda item: item.name)
+            }
+            manifest = {
+                "schema_version": SCHEMA_VERSION,
+                "formula_version": FORMULA_VERSION,
+                "status": "complete",
+                "style": "carnet_density",
+                "inputs": _input_hashes(snapshot),
+                "outputs": outputs,
+                "config": {
+                    **CARNET_DENSITY_CONFIG,
+                    "contour_masses": list(CARNET_DENSITY_CONFIG["contour_masses"]),
+                    "formats": ["png", "pdf"],
+                    "dpi": render_dpi,
+                },
+                "selected": [list(item) for item in CARNET_SELECTED],
+                "shared_axes": {
+                    f"{variant}/{target}": {"minimum": bound[0], "maximum": bound[1]}
+                    for (variant, target), bound in limits.items()
+                },
+            }
+            _strict_json_dump(staging / "plotting_manifest.json", manifest)
+            expected = {
+                *(f"{stem}.{suffix}" for stem in CARNET_FIGURE_STEMS.values() for suffix in ("png", "pdf")),
+                "plotting_statistics.csv", "plotting_manifest.json",
+            }
+            if {path.name for path in staging.iterdir()} != expected:
+                raise RuntimeError("carnet plot staging files mismatch")
+            _promote_directory(staging, destination)
+            return destination
+        finally:
+            _best_effort_remove(snapshot)
+            _best_effort_remove(staging)
