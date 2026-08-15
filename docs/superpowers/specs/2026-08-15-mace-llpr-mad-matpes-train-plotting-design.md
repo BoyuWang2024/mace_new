@@ -434,6 +434,7 @@ limits、checkpoint、readout、公式和 artifact SHA。smoke consumer 不得�
 6. Slurm 作业全部以该目录为 workdir；
 7. 当前有未提交内容的 `ConfidenceHead` checkout 保持不变；
 8. 若远端 `Plots` 工作目录已存在且不干净，停止并报告，不 reset、不覆盖。
+
 提交前使用只打印、不提交的 `print_task7_slurm_plan.sh` 审阅 exact commands。
 计划必须包含远端 worktree 的 `--chdir`、实测共享 conda 的
 `LLPR_CONDA_EXE` export、绝对 stdout/stderr、`gpu` partition、明确的
@@ -441,6 +442,9 @@ CPU/内存/时间，以及 calibrate/evaluate 的 `--gres=gpu:1`。四阶段以
 `afterok` 串联，plot 必须使用对应的独立 plot YAML。准备与复审阶段禁止调用
 `sbatch`。
 
+formal calibrate/evaluate 使用 `14-00:00:00`：直接可比的 full MATPES LLPR
+作业 11586 已运行超过 1 天 4 小时且仍在运行，正式 evaluation 包含 348,780
+个结构。smoke compute 保持 30 分钟，validate/plot 保持 2 小时。
 
 ### 12.2 大文件忽略范围
 

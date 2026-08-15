@@ -162,6 +162,11 @@ CPU/内存/时间；calibrate/evaluate 请求 `--gres=gpu:1`。作业 ID 通过
 `afterok` 串成 `calibrate → evaluate → validate → plot`，最后一级使用独立
 plot-only YAML，而不是计算 YAML。
 
+smoke calibrate/evaluate 固定 30 分钟；formal calibrate/evaluate 固定
+`14-00:00:00`。14 天上限来自直接可比的 full MATPES LLPR 作业 11586：该作业
+在复审时已运行超过 1 天 4 小时且仍在运行，而正式 evaluation 包含 348,780 个
+结构。validate/plot 固定 2 小时。
+
 三个 `plot_carnet_*.yaml` 是彼此独立的四面板密度图 plot-only 入口，而不是 n20 结果的三个别名：
 
 - `plot_carnet_matpes_test.yaml` 读取现有已验证的 MATPES test canonical 结果，镜像到 `Uncertainty_Quantification/Plots/LLPR/matpes_test`；

@@ -190,16 +190,20 @@ def test_remote_stage_scripts_reject_invalid_invocations_without_dispatch(
         assert f"unsupported stage: {arguments[0]}" in result.stderr
 
 @pytest.mark.parametrize(
-    ("profile", "dataset", "compute_name", "plot_name"),
+    ("profile", "dataset", "compute_name", "plot_name", "compute_time"),
     [
-        ("smoke", "mad", "gpu_mad_shared_curvature_smoke.yaml", "plot_carnet_mad_test_smoke.yaml"),
-        ("smoke", "matpes-train", "gpu_matpes_train_shared_curvature_smoke.yaml", "plot_carnet_matpes_train_smoke.yaml"),
-        ("formal", "mad", "gpu_mad_shared_curvature.yaml", "plot_carnet_mad_test.yaml"),
-        ("formal", "matpes-train", "gpu_matpes_train_shared_curvature.yaml", "plot_carnet_matpes_train.yaml"),
+        ("smoke", "mad", "gpu_mad_shared_curvature_smoke.yaml", "plot_carnet_mad_test_smoke.yaml", "00:30:00"),
+        ("smoke", "matpes-train", "gpu_matpes_train_shared_curvature_smoke.yaml", "plot_carnet_matpes_train_smoke.yaml", "00:30:00"),
+        ("formal", "mad", "gpu_mad_shared_curvature.yaml", "plot_carnet_mad_test.yaml", "14-00:00:00"),
+        ("formal", "matpes-train", "gpu_matpes_train_shared_curvature.yaml", "plot_carnet_matpes_train.yaml", "14-00:00:00"),
     ],
 )
 def test_task7_slurm_plan_prints_exact_safe_afterok_chain(
-    profile: str, dataset: str, compute_name: str, plot_name: str
+    profile: str,
+    dataset: str,
+    compute_name: str,
+    plot_name: str,
+    compute_time: str,
 ) -> None:
     result = subprocess.run(
         ["bash", str(PLAN_SCRIPT), profile, dataset],
@@ -231,6 +235,8 @@ def test_task7_slurm_plan_prints_exact_safe_afterok_chain(
     )
     assert "--gres=gpu:1" in lines[0]
     assert "--gres=gpu:1" in lines[1]
+    assert all(f"--time={compute_time}" in line for line in lines[:2])
+    assert all("--time=02:00:00" in line for line in lines[2:])
     assert "--dependency=" not in lines[0]
     assert "--dependency=afterok:${calibrate_job_id}" in lines[1]
     assert "--dependency=afterok:${evaluate_job_id}" in lines[2]

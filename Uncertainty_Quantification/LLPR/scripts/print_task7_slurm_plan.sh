@@ -44,7 +44,7 @@ if [ "$profile" = "smoke" ]; then
 else
   compute_cpus=8
   compute_mem=64G
-  compute_time=24:00:00
+  compute_time=14-00:00:00
 fi
 
 print_stage() {

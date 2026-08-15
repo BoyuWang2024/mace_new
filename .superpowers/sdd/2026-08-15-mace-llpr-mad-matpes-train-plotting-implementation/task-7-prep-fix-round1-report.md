@@ -66,7 +66,7 @@ Read-only preflight on `bywang@121.48.164.204:55801` established:
 The printed plans use:
 
 - smoke calibrate/evaluate: 4 CPUs, 16 GB, 30 minutes, one GPU;
-- formal calibrate/evaluate: 8 CPUs, 64 GB, 24 hours, one GPU;
+- formal calibrate/evaluate: 8 CPUs, 64 GB, 14 days, one GPU;
 - validate/plot: 4 CPUs, 16 GB, 2 hours, no GPU;
 - all stages: `--partition=gpu`, absolute `--chdir`, stdout/stderr, wrapper,
   config, and `--export=ALL,LLPR_CONDA_EXE=...`.
@@ -98,6 +98,18 @@ GREEN verification:
   283.58 seconds;
 - shell syntax checks passed for all three launch/plan scripts;
 - `git diff --check` passed.
+
+## Re-review round 1 correction
+
+The re-review found that a 24-hour formal compute limit was shorter than measured
+comparable runtime. Full MATPES LLPR job 11586 had already run for more than
+1 day 4 hours and was still running under its 14-day limit; the formal evaluation
+contains 348,780 structures.
+
+The plan test was strengthened first. It produced the expected RED result:
+both smoke cases passed and both formal cases failed. The plan now emits exactly
+`14-00:00:00` for formal calibrate/evaluate, while smoke stays `00:30:00`
+and validate/plot stay `02:00:00`. All four plan cases pass.
 
 ## Safety and next checkpoint
 
