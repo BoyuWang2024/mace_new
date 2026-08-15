@@ -475,73 +475,132 @@ def test_plot_config_matches_cpu_n20_run_root_from_clean_working_directory(
     assert not Path(document["output_dir"]).is_absolute()
 
 
+def _write_isolated_n20_config(
+    path: Path,
+    *,
+    output_root: Path,
+    experiment: str,
+    curvature_artifact: Path | None = None,
+) -> None:
+    template_path = CONFIG_ROOT / "cpu_n20_shared_curvature.yaml"
+    source = load_config(template_path)
+    document = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+    document["checkpoint"]["path"] = str(source.checkpoint.path)
+    for stage in ("build", "calibration", "test"):
+        document["data"][stage]["path"] = str(getattr(source, stage).path)
+    document["output"] = {
+        "root": str(output_root),
+        "experiment": experiment,
+    }
+    if curvature_artifact is not None:
+        document["artifacts"] = {
+            "curvature": {
+                "path": str(curvature_artifact),
+                "expected_sha256": sha256_file(curvature_artifact),
+            }
+        }
+    path.write_text(
+        yaml.safe_dump(document, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def _normalized_manifest(publication_root: Path) -> dict[str, object]:
+    manifest = json.loads(
+        (publication_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    config_identity = manifest["identities"]["config"]
+    curvature_source = config_identity["curvature"]
+    calibration = config_identity["calibration"]
+    calibration_source = calibration["identity"]["curvature_artifact"]
+    assert curvature_source["path"] == calibration_source["path"]
+    assert curvature_source["sha256"] == calibration_source["sha256"]
+    curvature_source["path"] = "<curvature-source-path>"
+    calibration_source["path"] = "<curvature-source-path>"
+    calibration["sha256"] = "<calibration-artifact-provenance-sha256>"
+    calibration["diagnostics_sha256"] = (
+        "<calibration-diagnostics-provenance-sha256>"
+    )
+    return manifest
+
+
+def _normalized_validation(publication_root: Path) -> dict[str, object]:
+    validation = json.loads(
+        (publication_root / "validation.json").read_text(encoding="utf-8")
+    )
+    validation["manifest_sha256"] = "<normalized-manifest-sha256>"
+    return validation
+
+
+def _sha_snapshot(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): sha256_file(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
 @pytest.mark.full_chain
 def test_n20_shared_curvature_is_built_once_and_consumed_by_a_second_experiment(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A consumer must reuse the published curvature without rebuilding it."""
-    builder_path = CONFIG_ROOT / "cpu_n20_shared_curvature.yaml"
-    builder = load_config(builder_path)
-    checkpoint_sha256 = sha256_file(builder.checkpoint.path)
-    artifact = (
-        run_root(builder, checkpoint_sha256) / "curvature" / "base_curvature.pt"
+    """An isolated consumer must equal a run-local baseline without rebuilding."""
+    output_root = tmp_path / "outputs"
+    baseline_path = tmp_path / "baseline.yaml"
+    _write_isolated_n20_config(
+        baseline_path,
+        output_root=output_root,
+        experiment="run_local_baseline",
+    )
+    baseline = load_config(baseline_path)
+    checkpoint_sha256 = sha256_file(baseline.checkpoint.path)
+    baseline_root = run_root(baseline, checkpoint_sha256)
+    artifact = baseline_root / "curvature" / "base_curvature.pt"
+    assert not output_root.exists()
+    assert not artifact.exists()
+
+    real_jacobians = curvature.compute_structure_jacobians
+    build_structure_calls = 0
+
+    def counted_jacobians(*args, **kwargs):
+        nonlocal build_structure_calls
+        build_structure_calls += 1
+        return real_jacobians(*args, **kwargs)
+
+    monkeypatch.setattr(
+        curvature,
+        "compute_structure_jacobians",
+        counted_jacobians,
     )
 
-    curvature.run_build(builder)
+    assert curvature.run_build(baseline) == artifact
     assert artifact.is_file()
+    assert build_structure_calls == 20
+    calibration.run_calibrate(baseline)
+    inference.run_evaluate(baseline)
+    assert cli.main(["validate", "--config", str(baseline_path)]) == 0
+    baseline_publication = baseline_root / "evaluation" / "deterministic"
 
     consumer_path = tmp_path / "consumer.yaml"
-    consumer_path.write_text(
-        yaml.safe_dump(
-            {
-                "checkpoint": {
-                    "path": str(builder.checkpoint.path),
-                    "expected_sha256": checkpoint_sha256,
-                    "selected_head": builder.selected_head,
-                    "expected_readout_size": builder.expected_readout_size,
-                },
-                "data": {
-                    stage: {
-                        "path": str(getattr(builder, stage).path),
-                        "expected_sha256": getattr(builder, stage).expected_sha256,
-                    }
-                    for stage in ("build", "calibration", "test")
-                },
-                "curvature": {
-                    "variants": ["he", "hf", "hef"],
-                    "min_q": 1.0e-30,
-                },
-                "ridge": {"mode": "fixed", "value": 1.0e-12},
-                "runtime": {
-                    "device": "cpu",
-                    "force_component_chunk_size": 1,
-                    "save_every_structures": 1,
-                    "resume": True,
-                },
-                "artifacts": {
-                    "curvature": {
-                        "path": str(artifact),
-                        "expected_sha256": sha256_file(artifact),
-                    }
-                },
-                "output": {"root": "outputs", "experiment": "consumer"},
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
+    _write_isolated_n20_config(
+        consumer_path,
+        output_root=output_root,
+        experiment="explicit_consumer",
+        curvature_artifact=artifact,
     )
     consumer = load_config(consumer_path)
+    consumer_root = run_root(consumer, checkpoint_sha256)
+    consumer_curvature = consumer_root / "curvature"
+    assert not consumer_root.exists()
 
     calibration.run_calibrate(consumer)
     inference.run_evaluate(consumer)
-    cli.main(["validate", "--config", str(consumer_path)])
-
-    publication_root = (
-        run_root(consumer, checkpoint_sha256) / "evaluation" / "deterministic"
-    )
-    plots = tmp_path / "plots"
+    assert cli.main(["validate", "--config", str(consumer_path)]) == 0
+    consumer_publication = consumer_root / "evaluation" / "deterministic"
+    plots = consumer_root / "plots"
     cli.run_plot(
-        publication_root,
+        consumer_publication,
         output_dir=plots,
         selected=(
             ("he", "energy"),
@@ -552,11 +611,67 @@ def test_n20_shared_curvature_is_built_once_and_consumed_by_a_second_experiment(
         style="carnet_density",
     )
 
-    validation = json.loads((publication_root / "validation.json").read_text())
-    assert validation["status"] == "valid"
-    assert not (run_root(consumer, checkpoint_sha256) / "curvature").exists()
-    assert len(list(plots.glob("*.png"))) == 4
-    assert len(list(plots.glob("*.pdf"))) == 4
+    assert build_structure_calls == 20
+    assert not consumer_curvature.exists()
+    for variant in VARIANTS:
+        for filename in (
+            "energy.csv",
+            "force_components.csv",
+            "force_structure.csv",
+        ):
+            pd.testing.assert_frame_equal(
+                pd.read_csv(baseline_publication / variant / filename),
+                pd.read_csv(consumer_publication / variant / filename),
+                check_exact=True,
+            )
+        assert json.loads(
+            (baseline_publication / variant / "summary.json").read_text(
+                encoding="utf-8"
+            )
+        ) == json.loads(
+            (consumer_publication / variant / "summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    assert _normalized_manifest(baseline_publication) == _normalized_manifest(
+        consumer_publication
+    )
+    assert _normalized_validation(baseline_publication) == _normalized_validation(
+        consumer_publication
+    )
+    assert _normalized_validation(consumer_publication)["status"] == "valid"
+
+    figure_stems = (
+        "llpr_he_energy_uncertainty_vs_residual",
+        "llpr_hf_force_uncertainty_vs_residual",
+        "llpr_hef_energy_uncertainty_vs_residual",
+        "llpr_hef_force_uncertainty_vs_residual",
+    )
+    expected_plot_names = {
+        *(f"{stem}.{suffix}" for stem in figure_stems for suffix in ("png", "pdf")),
+        "plotting_statistics.csv",
+        "plotting_manifest.json",
+    }
+    assert {path.name for path in plots.iterdir()} == expected_plot_names
+
+    before_rerun = _sha_snapshot(consumer_root)
+    calibration.run_calibrate(consumer)
+    inference.run_evaluate(consumer)
+    assert cli.main(["validate", "--config", str(consumer_path)]) == 0
+    cli.run_plot(
+        consumer_publication,
+        output_dir=plots,
+        selected=(
+            ("he", "energy"),
+            ("hf", "forces"),
+            ("hef", "energy"),
+            ("hef", "forces"),
+        ),
+        style="carnet_density",
+    )
+    assert build_structure_calls == 20
+    assert not consumer_curvature.exists()
+    assert _sha_snapshot(consumer_root) == before_rerun
 
 def test_readme_is_a_chinese_complete_operating_contract() -> None:
     text = (LLPR_ROOT / "README.md").read_text(encoding="utf-8")

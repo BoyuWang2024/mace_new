@@ -118,15 +118,29 @@ outputs/<experiment>/<checkpoint_sha256前12位>/
 
 ## 共享曲率与远程阶段
 
-`cpu_n20_shared_curvature.yaml` 仅用于发布 n20 曲率：先单独执行一次 `build`，其产物为 `base_curvature.pt`。消费方必须在自己的计算配置中显式填写该文件的路径及对实际文件重新计算得到的 SHA256；不得填写占位或伪造的 SHA256。消费方只执行 `calibrate`、`evaluate`、`validate`，不会创建自己的 `curvature/` 目录。
+`cpu_n20_shared_curvature.yaml` 仅是 n20 曲率 builder。它只能用于下面这一条显式 build 命令，产物为该 builder 运行目录中的 `base_curvature.pt`：
+
+```bash
+python -m Uncertainty_Quantification.LLPR.llpr build --config Uncertainty_Quantification/LLPR/configs/cpu_n20_shared_curvature.yaml
+```
+
+随后必须对实际产物计算 SHA256，并创建另一个专用 consumer 配置，在其 `artifacts.curvature.path` 和 `artifacts.curvature.expected_sha256` 中分别填写实际路径和实测 SHA256。不得填写占位或伪造 SHA256，也不得把 builder 配置直接用于消费阶段。consumer 只执行 `calibrate`、`evaluate`、`validate`，不会创建自己的 `curvature/` 目录。
 
 远程执行器只公开非 build 阶段：
 
 ```bash
-bash Uncertainty_Quantification/LLPR/scripts/run_remote_stage.sh calibrate Uncertainty_Quantification/LLPR/configs/cpu_n20_shared_curvature.yaml
-sbatch Uncertainty_Quantification/LLPR/scripts/submit_remote_stage.slurm evaluate Uncertainty_Quantification/LLPR/configs/cpu_n20_shared_curvature.yaml
+consumer_config=/path/to/config-with-measured-curvature-sha.yaml
+bash Uncertainty_Quantification/LLPR/scripts/run_remote_stage.sh calibrate "$consumer_config"
+sbatch Uncertainty_Quantification/LLPR/scripts/submit_remote_stage.slurm evaluate "$consumer_config"
+sbatch Uncertainty_Quantification/LLPR/scripts/submit_remote_stage.slurm validate "$consumer_config"
 ```
 
 两个脚本都使用 `conda run -n mace_new`、`set -euo pipefail`，只接受 `calibrate`、`evaluate`、`validate` 和 `plot`。它们不会隐式计算或重建曲率。
 
-`plot_carnet_matpes_test.yaml`、`plot_carnet_matpes_train.yaml`、`plot_carnet_mad_test.yaml` 是四面板密度图的 plot-only 入口：使用已验证的 canonical n20 结果、固定 `carnet_density` 风格和明确输出目录。它们没有 checkpoint 或 SHA256 字段，运行 `plot` 不会触发模型计算。
+三个 `plot_carnet_*.yaml` 是彼此独立的四面板密度图 plot-only 入口，而不是 n20 结果的三个别名：
+
+- `plot_carnet_matpes_test.yaml` 读取现有已验证的 MATPES test canonical 结果，镜像到 `Uncertainty_Quantification/Plots/LLPR/matpes_test`；
+- `plot_carnet_mad_test.yaml` 读取正式 `mad_test_madval_alpha_r2scan` 结果，镜像到 `Uncertainty_Quantification/Plots/LLPR/mad_test`；
+- `plot_carnet_matpes_train.yaml` 读取正式 `matpes_train_matpesval_alpha_r2scan` 结果，镜像到 `Uncertainty_Quantification/Plots/LLPR/matpes_train`。
+
+它们统一使用固定 `carnet_density` 风格，没有 checkpoint 或 SHA256 字段；运行 `plot` 不会触发模型计算。MAD test 和 MATPES train 的正式 canonical 结果尚未生成时，相应 plot 命令会封闭失败，不能改指向 n20 结果来代替。

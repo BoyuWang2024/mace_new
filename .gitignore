@@ -45,4 +45,10 @@ dist/
 
 # LLPR Slurm stage logs
 /Uncertainty_Quantification/LLPR/llpr-stage-*.out
+/llpr-stage-*.out
+/llpr-stage-*.err
+
+# LLPR publication mirrors contain generated plot packages.
+/Uncertainty_Quantification/Plots/LLPR/**
+!/Uncertainty_Quantification/Plots/LLPR/.gitignore
 /Uncertainty_Quantification/LLPR/llpr-stage-*.err

@@ -1,5 +1,5 @@
-publication_root: ../outputs/cpu_n20_full/8f147ecffa1d/evaluation/deterministic
-output_dir: ../outputs/cpu_n20_full/8f147ecffa1d/plots/carnet_mad_test
+publication_root: ../outputs/mad_test_madval_alpha_r2scan/8f147ecffa1d/evaluation/deterministic
+output_dir: ../../Plots/LLPR/mad_test
 selected:
   - [he, energy]
   - [hf, forces]

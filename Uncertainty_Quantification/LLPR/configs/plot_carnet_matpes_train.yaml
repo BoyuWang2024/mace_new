@@ -1,5 +1,5 @@
-publication_root: ../outputs/cpu_n20_full/8f147ecffa1d/evaluation/deterministic
-output_dir: ../outputs/cpu_n20_full/8f147ecffa1d/plots/carnet_matpes_train
+publication_root: ../outputs/matpes_train_matpesval_alpha_r2scan/8f147ecffa1d/evaluation/deterministic
+output_dir: ../../Plots/LLPR/matpes_train
 selected:
   - [he, energy]
   - [hf, forces]
