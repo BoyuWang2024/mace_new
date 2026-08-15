@@ -50,6 +50,11 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class ArtifactsConfig:
+    curvature: PathIdentity | None = None
+
+
+@dataclass(frozen=True)
 class OutputConfig:
     root: Path
     experiment: str
@@ -69,6 +74,7 @@ class LLPRConfig:
     curvature: CurvatureConfig
     selected_head: str = "default"
     expected_readout_size: int = 2192
+    artifacts: ArtifactsConfig = ArtifactsConfig()
 
     @property
     def data(self) -> DataConfig:
@@ -230,6 +236,30 @@ def load_config(path: Path) -> LLPRConfig:
         min_q=min_q,
     )
 
+    artifacts_value = document.get("artifacts")
+    if artifacts_value is None:
+        artifacts = ArtifactsConfig()
+    else:
+        artifacts_data = _mapping(artifacts_value, "artifacts")
+        if set(artifacts_data) != {"curvature"}:
+            raise ValueError("artifacts must contain exactly curvature")
+        curvature_value = _mapping(
+            _required(artifacts_data, "curvature", "artifacts"),
+            "artifacts.curvature",
+        )
+        if "expected_sha256" not in curvature_value:
+            raise ValueError("artifacts.curvature.expected_sha256 must not be null")
+        if set(curvature_value) != {"path", "expected_sha256"}:
+            raise ValueError(
+                "artifacts.curvature must contain exactly path, expected_sha256"
+            )
+        curvature_artifact = _path_identity(
+            source_dir, curvature_value, "artifacts.curvature"
+        )
+        if curvature_artifact.expected_sha256 is None:
+            raise ValueError("artifacts.curvature.expected_sha256 must not be null")
+        artifacts = ArtifactsConfig(curvature=curvature_artifact)
+
     return LLPRConfig(
         source_path=source_path,
         checkpoint=checkpoint,
@@ -243,4 +273,5 @@ def load_config(path: Path) -> LLPRConfig:
         curvature=curvature,
         selected_head=selected_head,
         expected_readout_size=expected_readout_size,
+        artifacts=artifacts,
     )

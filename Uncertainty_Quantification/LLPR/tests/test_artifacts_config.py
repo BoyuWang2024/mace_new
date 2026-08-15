@@ -75,6 +75,93 @@ def test_load_config_resolves_relative_paths_and_preserves_fixed_ridge(
     assert config.runtime.resume is True
 
 
+def test_load_config_resolves_optional_curvature_artifact(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    text = config_path.read_text(encoding="utf-8")
+    config_path.write_text(
+        text.replace(
+            "curvature:\n",
+            "artifacts:\n"
+            "  curvature:\n"
+            "    path: shared/base_curvature.pt\n"
+            f"    expected_sha256: {'5' * 64}\n"
+            "curvature:\n",
+        ),
+        encoding="utf-8",
+    )
+
+    artifact = load_config(config_path).artifacts.curvature
+
+    assert artifact is not None
+    assert artifact.path == (tmp_path / "shared/base_curvature.pt").resolve()
+    assert artifact.expected_sha256 == "5" * 64
+
+
+def test_load_config_rejects_curvature_artifact_without_sha(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    text = config_path.read_text(encoding="utf-8")
+    config_path.write_text(
+        text.replace(
+            "curvature:\n",
+            "artifacts:\n"
+            "  curvature:\n"
+            "    path: shared/base_curvature.pt\n"
+            "curvature:\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="artifacts.curvature.expected_sha256"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_unknown_artifacts_field(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    text = config_path.read_text(encoding="utf-8")
+    config_path.write_text(
+        text.replace(
+            "curvature:\n",
+            "artifacts:\n"
+            "  curvature:\n"
+            "    path: shared/base_curvature.pt\n"
+            f"    expected_sha256: {'5' * 64}\n"
+            "  unexpected: true\n"
+            "curvature:\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="artifacts must contain exactly curvature"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_unknown_curvature_artifact_field(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    text = config_path.read_text(encoding="utf-8")
+    config_path.write_text(
+        text.replace(
+            "curvature:\n",
+            "artifacts:\n"
+            "  curvature:\n"
+            "    path: shared/base_curvature.pt\n"
+            f"    expected_sha256: {'5' * 64}\n"
+            "    unexpected: true\n"
+            "curvature:\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="artifacts.curvature must contain exactly path, expected_sha256",
+    ):
+        load_config(config_path)
+
+
 def test_load_config_rejects_unknown_ridge_mode(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     _write_config(config_path, ridge_mode="guess")
