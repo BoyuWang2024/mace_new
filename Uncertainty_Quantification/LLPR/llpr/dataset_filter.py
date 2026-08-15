@@ -57,26 +57,30 @@ def _publish_pair(
 ) -> None:
     output_backup = _backup_path(output_path) if output_path.exists() else None
     audit_backup = _backup_path(audit_path) if audit_path.exists() else None
+    output_backup_staged = False
+    audit_backup_staged = False
     output_published = False
     audit_published = False
 
     try:
         if output_backup is not None:
             _replace_file(output_path, output_backup)
+            output_backup_staged = True
         if audit_backup is not None:
             _replace_file(audit_path, audit_backup)
+            audit_backup_staged = True
         _replace_file(temporary_output, output_path)
         output_published = True
         _replace_file(temporary_audit, audit_path)
         audit_published = True
     except Exception:
-        _restore_file(audit_path, audit_backup, audit_published)
-        _restore_file(output_path, output_backup, output_published)
+        _restore_file(audit_path, audit_backup if audit_backup_staged else None, audit_published)
+        _restore_file(output_path, output_backup if output_backup_staged else None, output_published)
         raise
     finally:
-        if output_backup is not None:
+        if output_backup_staged:
             output_backup.unlink(missing_ok=True)
-        if audit_backup is not None:
+        if audit_backup_staged:
             audit_backup.unlink(missing_ok=True)
 
 

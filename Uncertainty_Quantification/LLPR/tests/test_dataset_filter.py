@@ -155,3 +155,61 @@ def test_filter_restores_both_previous_artifacts_when_audit_publish_fails(
     assert list(tmp_path.glob(".audit.json.*.tmp")) == []
     assert list(tmp_path.glob(".filtered.extxyz.*.bak")) == []
     assert list(tmp_path.glob(".audit.json.*.bak")) == []
+
+
+def test_filter_preserves_previous_artifacts_when_output_backup_staging_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    _write_source(source)
+    output.write_text("old output", encoding="utf-8")
+    audit.write_text("old audit", encoding="utf-8")
+
+    def fail_output_backup(source_path: Path, destination: Path) -> Path:
+        if source_path == output and destination.name.endswith(".bak"):
+            raise OSError("simulated output backup failure")
+        return source_path.replace(destination)
+
+    monkeypatch.setattr(
+        "Uncertainty_Quantification.LLPR.llpr.dataset_filter._replace_file",
+        fail_output_backup,
+    )
+
+    with pytest.raises(OSError, match="simulated output backup failure"):
+        filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert output.read_text(encoding="utf-8") == "old output"
+    assert audit.read_text(encoding="utf-8") == "old audit"
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert list(tmp_path.glob("*.bak")) == []
+
+
+def test_filter_preserves_previous_artifacts_when_audit_backup_staging_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    _write_source(source)
+    output.write_text("old output", encoding="utf-8")
+    audit.write_text("old audit", encoding="utf-8")
+
+    def fail_audit_backup(source_path: Path, destination: Path) -> Path:
+        if source_path == audit and destination.name.endswith(".bak"):
+            raise OSError("simulated audit backup failure")
+        return source_path.replace(destination)
+
+    monkeypatch.setattr(
+        "Uncertainty_Quantification.LLPR.llpr.dataset_filter._replace_file",
+        fail_audit_backup,
+    )
+
+    with pytest.raises(OSError, match="simulated audit backup failure"):
+        filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert output.read_text(encoding="utf-8") == "old output"
+    assert audit.read_text(encoding="utf-8") == "old audit"
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert list(tmp_path.glob("*.bak")) == []
