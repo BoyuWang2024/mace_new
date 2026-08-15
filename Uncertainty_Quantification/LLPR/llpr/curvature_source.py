@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from tempfile import TemporaryFile
+from typing import Any, BinaryIO, Mapping
 
 import torch
 from torch import Tensor
@@ -13,9 +16,7 @@ from torch import Tensor
 from .artifacts import (
     FORMULA_VERSION,
     SCHEMA_VERSION,
-    load_torch_artifact,
     require_identity,
-    sha256_file,
 )
 from .checkpoint import CheckpointIdentity
 from .config import LLPRConfig
@@ -155,6 +156,65 @@ def curvature_source_path(config: LLPRConfig, checkpoint_sha256: str) -> Path:
     return run_root(config, checkpoint_sha256) / "curvature" / "base_curvature.pt"
 
 
+def _load_torch_snapshot(snapshot: BinaryIO) -> Any:
+    """Deserialize a verified snapshot on CPU, including older PyTorch versions."""
+    try:
+        return torch.load(snapshot, map_location="cpu", weights_only=True)
+    except TypeError:
+        snapshot.seek(0)
+        return torch.load(snapshot, map_location="cpu")
+
+
+def _load_verified_snapshot(path: Path, expected_sha256: str | None) -> tuple[Any, str]:
+    """Hash and deserialize exactly one private snapshot of a regular file."""
+    try:
+        file_status = path.lstat()
+    except OSError as error:
+        raise ValueError(f"curvature artifact must be a regular file: {path}") from error
+    if not stat.S_ISREG(file_status.st_mode):
+        raise ValueError(f"curvature artifact must be a regular file: {path}")
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"curvature artifact must be a regular file: {path}") from error
+    try:
+        source = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+    with source, TemporaryFile(mode="w+b") as snapshot:
+        opened_status = os.fstat(source.fileno())
+        if not stat.S_ISREG(opened_status.st_mode):
+            raise ValueError(f"curvature artifact must be a regular file: {path}")
+        if opened_status.st_size <= 0:
+            raise ValueError(f"curvature artifact must be non-empty: {path}")
+
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+            snapshot.write(chunk)
+        actual_sha256 = digest.hexdigest()
+        if (
+            expected_sha256 is not None
+            and actual_sha256.lower() != expected_sha256.lower()
+        ):
+            raise ValueError(
+                "curvature artifact SHA256 mismatch: "
+                f"expected {expected_sha256}, actual {actual_sha256}"
+            )
+
+        snapshot.flush()
+        snapshot.seek(0)
+        artifact = _load_torch_snapshot(snapshot)
+    return artifact, actual_sha256
+
+
 def load_curvature_source(
     config: LLPRConfig,
     checkpoint: CheckpointIdentity,
@@ -162,29 +222,9 @@ def load_curvature_source(
 ) -> LoadedCurvature:
     """Load a selected artifact only after its file identity is verified."""
     path = curvature_source_path(config, checkpoint.sha256)
-    try:
-        file_status = path.lstat()
-    except OSError as error:
-        raise ValueError(f"curvature artifact must be a regular file: {path}") from error
-    if not stat.S_ISREG(file_status.st_mode):
-        raise ValueError(f"curvature artifact must be a regular file: {path}")
-    if file_status.st_size <= 0:
-        raise ValueError(f"curvature artifact must be non-empty: {path}")
-    actual_sha256 = sha256_file(path)
     external = config.artifacts.curvature
     expected_sha256 = None if external is None else external.expected_sha256
-    if (
-        expected_sha256 is not None
-        and actual_sha256.lower() != expected_sha256.lower()
-    ):
-        raise ValueError(
-            "curvature artifact SHA256 mismatch: "
-            f"expected {expected_sha256}, actual {actual_sha256}"
-        )
-
-    artifact = load_torch_artifact(path)
-    if sha256_file(path) != actual_sha256:
-        raise ValueError("curvature artifact changed while it was being loaded")
+    artifact, actual_sha256 = _load_verified_snapshot(path, expected_sha256)
     if not isinstance(artifact, Mapping):
         raise ValueError("curvature artifact must be a mapping")
     artifact_fields = {"identity", "status", "structures", "components", "variants"}

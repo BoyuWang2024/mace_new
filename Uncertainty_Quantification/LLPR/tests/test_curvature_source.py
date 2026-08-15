@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -104,10 +106,9 @@ def test_external_sha_is_checked_before_deserialization(
     external.write_bytes(b"not a torch artifact")
     config = _config(tmp_path, PathIdentity(external, "0" * 64))
     monkeypatch.setattr(
-        curvature_source_module,
-        "load_torch_artifact",
-        lambda path: pytest.fail(f"deserialized {path}"),
-        raising=False,
+        torch,
+        "load",
+        lambda *args, **kwargs: pytest.fail("deserialized before SHA verification"),
     )
 
     with pytest.raises(ValueError, match="curvature artifact SHA256 mismatch"):
@@ -174,6 +175,213 @@ def test_load_curvature_source_returns_validated_canonical_artifact(tmp_path: Pa
     assert loaded.identity == payload["identity"]
     assert set(loaded.variants) == {"he", "hf", "hef"}
     assert torch.equal(loaded.variants["hef"], loaded.variants["he"] + loaded.variants["hf"])
+
+
+def test_path_replacement_cannot_change_verified_deserialization_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _checkpoint()
+    layout = _layout()
+    external = tmp_path / "shared" / "base_curvature.pt"
+    original = _write_curvature(external, checkpoint, layout)
+    digest = sha256_file(external)
+    replacement = tmp_path / "replacement.pt"
+    replacement_payload = _write_curvature(replacement, checkpoint, layout)
+    replacement_variants = replacement_payload["variants"]
+    assert isinstance(replacement_variants, dict)
+    replacement_he = 7.0 * torch.eye(layout.size, dtype=torch.float64)
+    replacement_hf = 11.0 * torch.eye(layout.size, dtype=torch.float64)
+    replacement_variants.update(
+        {"he": replacement_he, "hf": replacement_hf, "hef": replacement_he + replacement_hf}
+    )
+    atomic_torch_save(replacement, replacement_payload)
+    config = _config(tmp_path, PathIdentity(external, digest))
+    real_torch_load = torch.load
+    replaced = False
+
+    def replace_path_during_deserialization(
+        source: object, *args: object, **kwargs: object
+    ) -> object:
+        nonlocal replaced
+        if not replaced:
+            os.replace(replacement, external)
+            replaced = True
+        return real_torch_load(source, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", replace_path_during_deserialization)
+
+    loaded = curvature_source_module.load_curvature_source(config, checkpoint, layout)
+
+    original_variants = original["variants"]
+    assert isinstance(original_variants, dict)
+    assert replaced
+    assert torch.equal(loaded.variants["he"], original_variants["he"])
+
+
+@pytest.mark.parametrize("source_kind", ["directory", "symlink"])
+def test_load_curvature_source_rejects_non_regular_source(
+    tmp_path: Path, source_kind: str
+) -> None:
+    external = tmp_path / "shared" / "base_curvature.pt"
+    external.parent.mkdir()
+    if source_kind == "directory":
+        external.mkdir()
+    else:
+        target = tmp_path / "target.pt"
+        target.write_bytes(b"target")
+        external.symlink_to(target)
+    config = _config(tmp_path, PathIdentity(external, "0" * 64))
+
+    with pytest.raises(ValueError, match="must be a regular file"):
+        curvature_source_module.load_curvature_source(config, _checkpoint(), _layout())
+
+
+def test_load_curvature_source_rejects_empty_source(tmp_path: Path) -> None:
+    external = tmp_path / "shared" / "base_curvature.pt"
+    external.parent.mkdir()
+    external.touch()
+    config = _config(tmp_path, PathIdentity(external, sha256_file(external)))
+
+    with pytest.raises(ValueError, match="must be non-empty"):
+        curvature_source_module.load_curvature_source(config, _checkpoint(), _layout())
+
+
+@pytest.mark.parametrize(
+    ("identity_section", "identity_field", "bad_value", "message"),
+    [
+        ("checkpoint", "sha256", "c" * 64, "artifact identity mismatch"),
+        ("build", "atomic_numbers", [8], "build model identity mismatch"),
+    ],
+)
+def test_load_curvature_source_rejects_checkpoint_or_build_identity_mismatch(
+    tmp_path: Path,
+    identity_section: str,
+    identity_field: str,
+    bad_value: object,
+    message: str,
+) -> None:
+    checkpoint = _checkpoint()
+    layout = _layout()
+    external = tmp_path / "shared" / "base_curvature.pt"
+    payload = _write_curvature(external, checkpoint, layout)
+    identity = payload["identity"]
+    assert isinstance(identity, dict)
+    section = identity[identity_section]
+    assert isinstance(section, dict)
+    section[identity_field] = bad_value
+    atomic_torch_save(external, payload)
+    config = _config(tmp_path, PathIdentity(external, sha256_file(external)))
+
+    with pytest.raises(ValueError, match=message):
+        curvature_source_module.load_curvature_source(config, checkpoint, layout)
+
+
+def test_load_curvature_source_rejects_build_sha_mismatch(tmp_path: Path) -> None:
+    checkpoint = _checkpoint()
+    layout = _layout()
+    external = tmp_path / "shared" / "base_curvature.pt"
+    _write_curvature(external, checkpoint, layout)
+    config = _config(tmp_path, PathIdentity(external, sha256_file(external)))
+    config = replace(config, build=PathIdentity(config.build.path, "c" * 64))
+
+    with pytest.raises(ValueError, match="build SHA256 mismatch"):
+        curvature_source_module.load_curvature_source(config, checkpoint, layout)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "device"),
+    [(torch.float32, "cpu"), (torch.float64, "meta")],
+)
+def test_load_curvature_source_rejects_non_cpu_or_non_float64_matrix(
+    tmp_path: Path, dtype: torch.dtype, device: str
+) -> None:
+    checkpoint = _checkpoint()
+    layout = _layout()
+    external = tmp_path / "shared" / "base_curvature.pt"
+    payload = _write_curvature(external, checkpoint, layout)
+    variants = payload["variants"]
+    assert isinstance(variants, dict)
+    he = torch.eye(layout.size, dtype=dtype, device=device)
+    hf = 2.0 * torch.eye(layout.size, dtype=dtype, device=device)
+    variants.update({"he": he, "hf": hf, "hef": he + hf})
+    atomic_torch_save(external, payload)
+    config = _config(tmp_path, PathIdentity(external, sha256_file(external)))
+
+    with pytest.raises(ValueError, match="he matrix is invalid"):
+        curvature_source_module.load_curvature_source(config, checkpoint, layout)
+
+
+def test_load_curvature_source_rejects_wrong_matrix_shape(tmp_path: Path) -> None:
+    checkpoint = _checkpoint()
+    layout = _layout()
+    external = tmp_path / "shared" / "base_curvature.pt"
+    payload = _write_curvature(external, checkpoint, layout)
+    variants = payload["variants"]
+    assert isinstance(variants, dict)
+    he = torch.eye(layout.size + 1, dtype=torch.float64)
+    hf = 2.0 * torch.eye(layout.size + 1, dtype=torch.float64)
+    variants.update({"he": he, "hf": hf, "hef": he + hf})
+    atomic_torch_save(external, payload)
+    config = _config(tmp_path, PathIdentity(external, sha256_file(external)))
+
+    with pytest.raises(ValueError, match="he matrix is invalid"):
+        curvature_source_module.load_curvature_source(config, checkpoint, layout)
+
+
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf")])
+def test_load_curvature_source_rejects_non_finite_matrix(
+    tmp_path: Path, non_finite: float
+) -> None:
+    checkpoint = _checkpoint()
+    layout = _layout()
+    external = tmp_path / "shared" / "base_curvature.pt"
+    payload = _write_curvature(external, checkpoint, layout)
+    variants = payload["variants"]
+    assert isinstance(variants, dict)
+    he = torch.eye(layout.size, dtype=torch.float64)
+    he[0, 0] = non_finite
+    hf = 2.0 * torch.eye(layout.size, dtype=torch.float64)
+    variants.update({"he": he, "hf": hf, "hef": he + hf})
+    atomic_torch_save(external, payload)
+    config = _config(tmp_path, PathIdentity(external, sha256_file(external)))
+
+    with pytest.raises(ValueError, match="he matrix is invalid"):
+        curvature_source_module.load_curvature_source(config, checkpoint, layout)
+
+
+def test_load_curvature_source_rejects_scale_aware_asymmetry(tmp_path: Path) -> None:
+    checkpoint = _checkpoint()
+    layout = _layout()
+    external = tmp_path / "shared" / "base_curvature.pt"
+    payload = _write_curvature(external, checkpoint, layout)
+    variants = payload["variants"]
+    assert isinstance(variants, dict)
+    he = torch.eye(layout.size, dtype=torch.float64)
+    he[0, 1] = 1.0e-10
+    hf = 2.0 * torch.eye(layout.size, dtype=torch.float64)
+    variants.update({"he": he, "hf": hf, "hef": he + hf})
+    atomic_torch_save(external, payload)
+    config = _config(tmp_path, PathIdentity(external, sha256_file(external)))
+
+    with pytest.raises(ValueError, match="he matrix must be symmetric"):
+        curvature_source_module.load_curvature_source(config, checkpoint, layout)
+
+
+def test_load_curvature_source_rejects_inexact_hef(tmp_path: Path) -> None:
+    checkpoint = _checkpoint()
+    layout = _layout()
+    external = tmp_path / "shared" / "base_curvature.pt"
+    payload = _write_curvature(external, checkpoint, layout)
+    variants = payload["variants"]
+    assert isinstance(variants, dict)
+    hef = variants["hef"]
+    assert isinstance(hef, torch.Tensor)
+    variants["hef"] = hef + torch.eye(layout.size, dtype=torch.float64) * 1.0e-12
+    atomic_torch_save(external, payload)
+    config = _config(tmp_path, PathIdentity(external, sha256_file(external)))
+
+    with pytest.raises(ValueError, match="hef must equal he plus hf"):
+        curvature_source_module.load_curvature_source(config, checkpoint, layout)
 
 
 
