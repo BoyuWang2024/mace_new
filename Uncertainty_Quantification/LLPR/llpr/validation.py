@@ -884,20 +884,39 @@ def _validate_curvature_source_identity(
 def _validate_calibration_source_identity(
     value: Any, source: str
 ) -> Mapping[str, Any]:
-    identity = _identity_mapping(
-        value,
-        {
-            "schema_version",
-            "formula_version",
-            "checkpoint",
-            "curvature",
-            "calibration",
-            "ridge",
-            "min_q",
-            "limits",
-        },
-        source,
-    )
+    fields = {
+        "schema_version",
+        "formula_version",
+        "checkpoint",
+        "curvature",
+        "calibration",
+        "ridge",
+        "min_q",
+        "limits",
+    }
+    if not isinstance(value, Mapping) or set(value) not in (
+        fields,
+        fields | {"curvature_artifact"},
+    ):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    identity = value
+    if "curvature_artifact" in identity:
+        artifact = _identity_mapping(
+            identity["curvature_artifact"],
+            {"path", "sha256"},
+            f"{source}.curvature_artifact",
+        )
+        artifact_path = _identity_string(
+            artifact["path"], f"{source}.curvature_artifact.path"
+        )
+        if not Path(artifact_path).is_absolute():
+            raise ValueError(
+                f"trusted evaluation progress identity "
+                f"{source}.curvature_artifact.path is invalid"
+            )
+        _identity_sha256(
+            artifact["sha256"], f"{source}.curvature_artifact.sha256"
+        )
     _validate_versions(identity, source)
     _validate_checkpoint_identity(identity["checkpoint"], f"{source}.checkpoint")
     _validate_curvature_source_identity(identity["curvature"], f"{source}.curvature")
@@ -990,9 +1009,19 @@ def _trusted_progress_identity(
     checkpoint = _validate_checkpoint_identity(identity["checkpoint"], "checkpoint")
     readout = _validate_readout_identity(identity["readout"], "readout")
 
-    curvature = _identity_mapping(
-        identity["curvature"], {"sha256", "identity"}, "curvature"
-    )
+    curvature_value = identity["curvature"]
+    if not isinstance(curvature_value, Mapping) or set(curvature_value) not in (
+        {"sha256", "identity"},
+        {"path", "sha256", "identity"},
+    ):
+        raise ValueError("trusted evaluation progress identity curvature is invalid")
+    curvature = curvature_value
+    if "path" in curvature:
+        curvature_path = _identity_string(curvature["path"], "curvature.path")
+        if not Path(curvature_path).is_absolute():
+            raise ValueError(
+                "trusted evaluation progress identity curvature.path is invalid"
+            )
     _identity_sha256(curvature["sha256"], "curvature.sha256")
     curvature_identity = _validate_curvature_source_identity(
         curvature["identity"], "curvature.identity"
@@ -1046,6 +1075,20 @@ def _trusted_progress_identity(
         if _strict_json_bytes(expected) != _strict_json_bytes(actual):
             raise ValueError(
                 f"trusted evaluation progress identity {source} mismatch"
+            )
+
+    calibration_curvature_artifact = calibration_identity.get(
+        "curvature_artifact"
+    )
+    if calibration_curvature_artifact is not None:
+        evaluation_curvature_artifact = {
+            key: curvature[key] for key in ("path", "sha256") if key in curvature
+        }
+        if _strict_json_bytes(calibration_curvature_artifact) != _strict_json_bytes(
+            evaluation_curvature_artifact
+        ):
+            raise ValueError(
+                "trusted evaluation progress identity curvature artifact mismatch"
             )
     _validate_dataset_checkpoint_compatibility(
         curvature_identity["build"], checkpoint, "build dataset"

@@ -25,10 +25,11 @@ from .artifacts import (
 )
 from .checkpoint import CheckpointIdentity, load_checkpoint
 from .config import LLPRConfig
+from .curvature_source import load_curvature_source
 from .curvature import run_root
 from .data import DatasetHandle, build_dataset, iter_samples
 from .observables import compute_structure_jacobians
-from .readout import ReadoutLayout, discover_readout_layout
+from .readout import discover_readout_layout
 from .ridge import RidgeRecord, condition_number_ridge
 
 
@@ -155,6 +156,7 @@ def _calibration_identity(
     dataset: DatasetHandle,
     curvature_identity: Mapping[str, Any],
     ridges: Mapping[str, RidgeRecord],
+    curvature_artifact: Mapping[str, str],
 ) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -163,6 +165,7 @@ def _calibration_identity(
         "curvature": dict(curvature_identity),
         "calibration": _dataset_metadata(dataset),
         "ridge": _ridge_identity(config, ridges),
+        "curvature_artifact": dict(curvature_artifact),
         "min_q": config.curvature.min_q,
         "limits": {
             "max_structures": config.runtime.max_structures,
@@ -173,50 +176,6 @@ def _calibration_identity(
     }
 
 
-def _load_curvature(
-    path: Path,
-    checkpoint: CheckpointIdentity,
-    layout: ReadoutLayout,
-) -> tuple[Mapping[str, Any], dict[str, Tensor]]:
-    if not path.exists():
-        raise ValueError("completed curvature artifact is missing")
-    artifact = load_torch_artifact(path)
-    if not isinstance(artifact, Mapping):
-        raise ValueError("curvature artifact must be a mapping")
-    if artifact.get("status") != "complete":
-        raise ValueError("curvature artifact is not complete")
-    identity = artifact.get("identity")
-    if not isinstance(identity, Mapping):
-        raise ValueError("curvature artifact identity must be a mapping")
-    checkpoint_identity = identity.get("checkpoint")
-    if not isinstance(checkpoint_identity, Mapping) or (
-        checkpoint_identity.get("sha256") != checkpoint.sha256
-    ):
-        raise ValueError("curvature checkpoint identity mismatch")
-    readout_identity = identity.get("readout")
-    if not isinstance(readout_identity, Mapping):
-        raise ValueError("curvature readout identity must be a mapping")
-    require_identity(readout_identity, layout.metadata())
-
-    source_variants = artifact.get("variants")
-    if not isinstance(source_variants, Mapping) or set(source_variants) != set(_VARIANTS):
-        raise ValueError("curvature artifact must contain he, hf, and hef")
-    variants: dict[str, Tensor] = {}
-    for variant in _VARIANTS:
-        matrix = source_variants[variant]
-        if (
-            not isinstance(matrix, Tensor)
-            or matrix.device.type != "cpu"
-            or matrix.dtype != torch.float64
-            or matrix.shape != (layout.size, layout.size)
-            or not torch.isfinite(matrix).all()
-        ):
-            raise ValueError(
-                f"curvature {variant} must be finite CPU float64 with shape "
-                f"({layout.size}, {layout.size})"
-            )
-        variants[variant] = matrix
-    return identity, variants
 
 
 def _empty_accumulators() -> dict[str, dict[str, dict[str, float | int]]]:
@@ -627,15 +586,15 @@ def run_calibrate(config: LLPRConfig) -> Path:
         loaded.identity.r_max,
         loaded.identity.selected_head,
     )
-    curvature_path = (
-        run_root(config, loaded.identity.sha256) / "curvature" / "base_curvature.pt"
-    )
-    curvature_identity, variants = _load_curvature(
-        curvature_path, loaded.identity, layout
-    )
-    ridges, spectra = _select_ridges(config, variants)
+    curvature = load_curvature_source(config, loaded.identity, layout)
+    ridges, spectra = _select_ridges(config, curvature.variants)
     identity = _calibration_identity(
-        config, loaded.identity, dataset, curvature_identity, ridges
+        config,
+        loaded.identity,
+        dataset,
+        curvature.identity,
+        ridges,
+        {"path": str(curvature.path.resolve()), "sha256": curvature.sha256},
     )
 
     calibration_dir = (
@@ -681,7 +640,7 @@ def run_calibrate(config: LLPRConfig) -> Path:
 
     solvers = {
         variant: CholeskyQuadraticForm(
-            variants[variant], ridge=ridges[variant].value
+            curvature.variants[variant], ridge=ridges[variant].value
         )
         for variant in _VARIANTS
     }
@@ -768,7 +727,7 @@ def run_calibrate(config: LLPRConfig) -> Path:
     atomic_torch_save(artifact_path, artifact)
     _atomic_csv_dump(csv_path, records)
     if not spectra:
-        spectra = _compute_spectra(variants)
+        spectra = _compute_spectra(curvature.variants)
     atomic_json_dump(
         diagnostics_path,
         _ridge_diagnostics(identity, spectra, ridges),

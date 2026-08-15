@@ -14,6 +14,7 @@ from Uncertainty_Quantification.LLPR.llpr.artifacts import (
     SCHEMA_VERSION,
     atomic_torch_save,
     load_torch_artifact,
+    sha256_file,
 )
 from Uncertainty_Quantification.LLPR.llpr.calibration import (
     CholeskyQuadraticForm,
@@ -25,6 +26,7 @@ from Uncertainty_Quantification.LLPR.llpr.checkpoint import (
     LoadedCheckpoint,
 )
 from Uncertainty_Quantification.LLPR.llpr.config import (
+    ArtifactsConfig,
     CurvatureConfig,
     LLPRConfig,
     PathIdentity,
@@ -99,8 +101,23 @@ def _curvature_identity(layout: ReadoutLayout) -> dict[str, object]:
     return {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
-        "checkpoint": {"sha256": "a" * 64},
-        "build": {"sha256": "b" * 64, "identity": "build-identity"},
+        "checkpoint": {
+            "sha256": "a" * 64,
+            "model_class": "ScaleShiftMACE",
+            "heads": ["default"],
+            "selected_head": "default",
+            "r_max": 6.0,
+            "atomic_numbers": [1],
+            "dtype": "torch.float32",
+        },
+        "build": {
+            "sha256": "b" * 64,
+            "identity": "1" * 16,
+            "size": 1,
+            "atomic_numbers": [1],
+            "r_max": 6.0,
+            "head": "default",
+        },
         "readout": layout.metadata(),
         "curvature": {
             "energy": "outer(d(E/N)/dtheta, d(E/N)/dtheta)",
@@ -212,7 +229,37 @@ def _install_fake_pipeline(
     )
     monkeypatch.setattr(calibration, "iter_samples", fake_iter_samples)
     monkeypatch.setattr(calibration, "compute_structure_jacobians", fake_compute)
-    _write_curvature(config, layout)
+    curvature_path = run_root(config, "a" * 64) / "curvature" / "base_curvature.pt"
+    if not curvature_path.exists():
+        _write_curvature(config, layout)
+
+
+def test_run_calibrate_uses_explicit_shared_curvature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    layout = _layout()
+    run_local = _write_curvature(config, layout)
+    external = tmp_path / "shared" / "base_curvature.pt"
+    external.parent.mkdir()
+    external.write_bytes(run_local.read_bytes())
+    config = replace(
+        config,
+        artifacts=ArtifactsConfig(
+            curvature=PathIdentity(external, sha256_file(external))
+        ),
+    )
+    _install_fake_pipeline(monkeypatch, config)
+
+    run_local.unlink()
+    artifact_path = run_calibrate(config)
+
+    assert artifact_path.is_file()
+    progress = load_torch_artifact(artifact_path.parent / "progress.pt")
+    assert progress["identity"]["curvature_artifact"] == {
+        "path": str(external),
+        "sha256": sha256_file(external),
+    }
 
 
 def test_quadratic_form_matches_solve() -> None:

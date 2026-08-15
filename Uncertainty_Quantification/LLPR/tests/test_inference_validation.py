@@ -23,6 +23,7 @@ from Uncertainty_Quantification.LLPR.llpr.checkpoint import (
     LoadedCheckpoint,
 )
 from Uncertainty_Quantification.LLPR.llpr.config import (
+    ArtifactsConfig,
     CurvatureConfig,
     LLPRConfig,
     PathIdentity,
@@ -387,6 +388,34 @@ def _install_fake_pipeline(
     monkeypatch.setattr(inference, "compute_structure_jacobians", fake_compute)
     _write_upstream_artifacts(config, layout)
     return checkpoint
+
+
+def test_run_evaluate_uses_explicit_shared_curvature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    run_local = (
+        run_root(config, "a" * 64) / "curvature" / "base_curvature.pt"
+    )
+    external = tmp_path / "shared" / "base_curvature.pt"
+    external.parent.mkdir()
+    external.write_bytes(run_local.read_bytes())
+    config = replace(
+        config,
+        artifacts=ArtifactsConfig(
+            curvature=PathIdentity(external, sha256_file(external))
+        ),
+    )
+    run_local.unlink()
+
+    evaluation_dir = run_evaluate(config)
+
+    progress = load_torch_artifact(evaluation_dir / "progress.pt")
+    assert progress["identity"]["curvature"]["path"] == str(external)
+    assert progress["identity"]["curvature"]["sha256"] == sha256_file(
+        external
+    )
 
 
 def test_publication_field_contracts() -> None:

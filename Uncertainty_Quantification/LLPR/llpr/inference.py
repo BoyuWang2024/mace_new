@@ -25,6 +25,7 @@ from .artifacts import (
 from .calibration import CholeskyQuadraticForm
 from .checkpoint import CheckpointIdentity, load_checkpoint
 from .config import LLPRConfig
+from .curvature_source import load_curvature_source
 from .curvature import run_root
 from .data import DatasetHandle, build_dataset, iter_samples
 from .observables import compute_structure_jacobians
@@ -214,44 +215,6 @@ def _dataset_metadata(dataset: DatasetHandle) -> dict[str, Any]:
     }
 
 
-def _load_curvature(
-    path: Path,
-    checkpoint: CheckpointIdentity,
-    layout: ReadoutLayout,
-) -> tuple[Mapping[str, Any], dict[str, Tensor]]:
-    if not path.exists():
-        raise ValueError("completed curvature artifact is missing")
-    artifact = load_torch_artifact(path)
-    if not isinstance(artifact, Mapping) or artifact.get("status") != "complete":
-        raise ValueError("curvature artifact must be a complete mapping")
-    identity = artifact.get("identity")
-    if not isinstance(identity, Mapping):
-        raise ValueError("curvature artifact identity must be a mapping")
-    checkpoint_identity = identity.get("checkpoint")
-    if not isinstance(checkpoint_identity, Mapping) or (
-        checkpoint_identity.get("sha256") != checkpoint.sha256
-    ):
-        raise ValueError("curvature checkpoint identity mismatch")
-    require_identity(identity.get("readout", {}), layout.metadata())
-    source_variants = artifact.get("variants")
-    if not isinstance(source_variants, Mapping) or set(source_variants) != set(_VARIANTS):
-        raise ValueError("curvature artifact must contain he, hf, and hef")
-    variants: dict[str, Tensor] = {}
-    for variant in _VARIANTS:
-        matrix = source_variants[variant]
-        if (
-            not isinstance(matrix, Tensor)
-            or matrix.shape != (layout.size, layout.size)
-            or matrix.dtype != torch.float64
-            or matrix.device.type != "cpu"
-            or not torch.isfinite(matrix).all()
-        ):
-            raise ValueError(
-                f"curvature {variant} must be finite CPU float64 with shape "
-                f"({layout.size}, {layout.size})"
-            )
-        variants[variant] = matrix
-    return identity, variants
 
 
 def _load_calibrations(
@@ -259,6 +222,7 @@ def _load_calibrations(
     checkpoint: CheckpointIdentity,
     curvature_identity: Mapping[str, Any],
     config: LLPRConfig,
+    curvature_artifact: Mapping[str, str],
 ) -> tuple[Mapping[str, Any], dict[str, dict[str, Any]]]:
     if not path.exists():
         raise ValueError("completed calibration artifact is missing")
@@ -274,6 +238,11 @@ def _load_calibrations(
     ):
         raise ValueError("calibration checkpoint identity mismatch")
     require_identity(identity.get("curvature", {}), curvature_identity)
+    source_artifact = identity.get("curvature_artifact")
+    if source_artifact is not None:
+        if not isinstance(source_artifact, Mapping):
+            raise ValueError("calibration curvature artifact identity is invalid")
+        require_identity(source_artifact, curvature_artifact)
     if identity.get("min_q") != config.curvature.min_q:
         raise ValueError("calibration min_q does not match evaluation configuration")
 
@@ -350,6 +319,7 @@ def _evaluation_identity(
     checkpoint: CheckpointIdentity,
     layout: ReadoutLayout,
     curvature_path: Path,
+    curvature_sha256: str,
     curvature_identity: Mapping[str, Any],
     calibration_path: Path,
     diagnostics_path: Path,
@@ -368,7 +338,8 @@ def _evaluation_identity(
         "checkpoint": _checkpoint_metadata(checkpoint),
         "readout": layout.metadata(),
         "curvature": {
-            "sha256": sha256_file(curvature_path),
+            "path": str(curvature_path.resolve()),
+            "sha256": curvature_sha256,
             "identity": dict(curvature_identity),
         },
         "calibration": {
@@ -880,18 +851,20 @@ def run_evaluate(config: LLPRConfig) -> Path:
         loaded.identity.selected_head,
     )
     root = run_root(config, loaded.identity.sha256)
-    curvature_path = root / "curvature" / "base_curvature.pt"
-    curvature_identity, variants = _load_curvature(
-        curvature_path, loaded.identity, layout
-    )
+    curvature = load_curvature_source(config, loaded.identity, layout)
+    curvature_artifact = {
+        "path": str(curvature.path.resolve()),
+        "sha256": curvature.sha256,
+    }
     calibration_dir = root / "calibration" / "deterministic"
     calibration_path = calibration_dir / "calibrations.pt"
     diagnostics_path = calibration_dir / "ridge_diagnostics.json"
     calibration_identity, calibrations = _load_calibrations(
         calibration_path,
         loaded.identity,
-        curvature_identity,
+        curvature.identity,
         config,
+        curvature_artifact,
     )
     diagnostics = _load_cholesky_diagnostics(
         diagnostics_path, calibration_identity
@@ -900,8 +873,9 @@ def run_evaluate(config: LLPRConfig) -> Path:
         config,
         loaded.identity,
         layout,
-        curvature_path,
-        curvature_identity,
+        curvature.path,
+        curvature.sha256,
+        curvature.identity,
         calibration_path,
         diagnostics_path,
         calibration_identity,
@@ -958,10 +932,9 @@ def run_evaluate(config: LLPRConfig) -> Path:
         else:
             _restore_writers(writers, progress["csv_offsets"])
 
-
         solvers = {
             variant: CholeskyQuadraticForm(
-                variants[variant],
+                curvature.variants[variant],
                 ridge=float(calibrations[variant]["energy"]["ridge"]),
             )
             for variant in _VARIANTS
