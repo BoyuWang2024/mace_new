@@ -271,9 +271,9 @@ output_dir: /path/to/Uncertainty_Quantification/Plots/LLPR/matpes_test
 style: carnet_density
 selected:
   - [he, energy]
-  - [hf, force]
+  - [hf, forces]
   - [hef, energy]
-  - [hef, force]
+  - [hef, forces]
 ```
 
 兼容规则如下：
