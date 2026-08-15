@@ -177,6 +177,31 @@ def test_load_curvature_source_returns_validated_canonical_artifact(tmp_path: Pa
     assert torch.equal(loaded.variants["hef"], loaded.variants["he"] + loaded.variants["hf"])
 
 
+def test_full_curvature_artifact_loads_with_smaller_consumer_caps(
+    tmp_path: Path,
+) -> None:
+    checkpoint = _checkpoint()
+    layout = _layout()
+    external = tmp_path / "shared" / "base_curvature.pt"
+    payload = _write_curvature(external, checkpoint, layout)
+    identity = payload["identity"]
+    assert isinstance(identity, dict)
+    build = identity["build"]
+    assert isinstance(build, dict)
+    build["size"] = 4
+    payload["structures"] = 4
+    atomic_torch_save(external, payload)
+    config = _config(tmp_path, PathIdentity(external, sha256_file(external)))
+    config = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            consumer_max_structures=2,
+            consumer_max_force_components_per_structure=3,
+        ),
+    )
+
+    assert curvature_source_module.load_curvature_source(config, checkpoint, layout).identity == identity
 def test_path_replacement_cannot_change_verified_deserialization_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

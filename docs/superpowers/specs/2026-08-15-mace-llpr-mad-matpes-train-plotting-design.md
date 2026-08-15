@@ -413,6 +413,14 @@ MATPES/MAD 中确定性截取的小集合完成：
 - 缓存重跑。
 
 小数据结果使用独立 experiment，不得与正式目录共用 progress 或输出。
+`runtime.consumer_max_structures` 与
+`runtime.consumer_max_force_components_per_structure` 只限制 calibration 和
+evaluation 的消费量；它们单独进入 consumer progress identity。原有
+`runtime.max_structures` 与 `runtime.max_force_components_per_structure`
+继续定义 curvature build 身份，外部完整曲率仍严格绑定完整 build dataset、build
+limits、checkpoint、readout、公式和 artifact SHA。smoke consumer 不得把自己的
+2/3 上限伪装成 curvature build 上限。
+
 
 ## 12. 远端正式执行
 
@@ -426,6 +434,13 @@ MATPES/MAD 中确定性截取的小集合完成：
 6. Slurm 作业全部以该目录为 workdir；
 7. 当前有未提交内容的 `ConfidenceHead` checkout 保持不变；
 8. 若远端 `Plots` 工作目录已存在且不干净，停止并报告，不 reset、不覆盖。
+提交前使用只打印、不提交的 `print_task7_slurm_plan.sh` 审阅 exact commands。
+计划必须包含远端 worktree 的 `--chdir`、实测共享 conda 的
+`LLPR_CONDA_EXE` export、绝对 stdout/stderr、`gpu` partition、明确的
+CPU/内存/时间，以及 calibrate/evaluate 的 `--gres=gpu:1`。四阶段以
+`afterok` 串联，plot 必须使用对应的独立 plot YAML。准备与复审阶段禁止调用
+`sbatch`。
+
 
 ### 12.2 大文件忽略范围
 

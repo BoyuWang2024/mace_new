@@ -158,7 +158,7 @@ def _calibration_identity(
     ridges: Mapping[str, RidgeRecord],
     curvature_artifact: Mapping[str, str],
 ) -> dict[str, Any]:
-    return {
+    identity = {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
         "checkpoint": _checkpoint_metadata(checkpoint),
@@ -174,6 +174,14 @@ def _calibration_identity(
             ),
         },
     }
+    if config.runtime.has_explicit_consumer_limits:
+        identity["consumer_limits"] = {
+            "max_structures": config.runtime.effective_consumer_max_structures,
+            "max_force_components_per_structure": (
+                config.runtime.effective_consumer_max_force_components_per_structure
+            ),
+        }
+    return identity
 
 
 
@@ -607,8 +615,9 @@ def run_calibrate(config: LLPRConfig) -> Path:
     csv_path = calibration_dir / "calibrations.csv"
     diagnostics_path = calibration_dir / "ridge_diagnostics.json"
     target_structures = dataset.size
-    if config.runtime.max_structures is not None:
-        target_structures = min(target_structures, config.runtime.max_structures)
+    consumer_max_structures = config.runtime.effective_consumer_max_structures
+    if consumer_max_structures is not None:
+        target_structures = min(target_structures, consumer_max_structures)
 
     internal_artifacts = (artifact_path, csv_path, diagnostics_path)
     progress: dict[str, Any] | None = None
@@ -669,7 +678,7 @@ def run_calibrate(config: LLPRConfig) -> Path:
                 layout=layout,
                 force_component_chunk_size=config.runtime.force_component_chunk_size,
                 max_force_components=(
-                    config.runtime.max_force_components_per_structure
+                    config.runtime.effective_consumer_max_force_components_per_structure
                 ),
             )
             energy_residual = torch.tensor(

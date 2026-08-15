@@ -73,6 +73,59 @@ def test_load_config_resolves_relative_paths_and_preserves_fixed_ridge(
     assert config.ridge.value == 1.0e-12
     assert config.curvature.variants == ("he", "hf", "hef")
     assert config.runtime.resume is True
+    assert config.runtime.consumer_max_structures is None
+    assert config.runtime.consumer_max_force_components_per_structure is None
+
+
+def test_load_config_parses_explicit_consumer_only_caps(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "  max_structures:\n  max_force_components_per_structure:\n",
+            "  max_structures:\n"
+            "  max_force_components_per_structure:\n"
+            "  consumer_max_structures: 2\n"
+            "  consumer_max_force_components_per_structure: 3\n",
+        ),
+        encoding="utf-8",
+    )
+
+    runtime = load_config(config_path).runtime
+
+    assert runtime.max_structures is None
+    assert runtime.max_force_components_per_structure is None
+    assert runtime.consumer_max_structures == 2
+    assert runtime.consumer_max_force_components_per_structure == 3
+
+
+@pytest.mark.parametrize(
+    ("legacy_field", "consumer_field"),
+    [
+        ("max_structures", "consumer_max_structures"),
+        (
+            "max_force_components_per_structure",
+            "consumer_max_force_components_per_structure",
+        ),
+    ],
+)
+def test_load_config_rejects_ambiguous_legacy_and_consumer_caps(
+    tmp_path: Path,
+    legacy_field: str,
+    consumer_field: str,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            f"  {legacy_field}:\n",
+            f"  {legacy_field}: 2\n  {consumer_field}: 2\n",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=rf"{consumer_field}.*{legacy_field}"):
+        load_config(config_path)
 
 
 def test_load_config_resolves_optional_curvature_artifact(tmp_path: Path) -> None:

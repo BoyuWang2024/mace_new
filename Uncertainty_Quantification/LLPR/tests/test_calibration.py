@@ -262,6 +262,63 @@ def test_run_calibrate_uses_explicit_shared_curvature(
     }
 
 
+def test_run_calibrate_uses_consumer_caps_without_changing_curvature_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import calibration
+
+    config = _config(tmp_path)
+    config = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            consumer_max_structures=1,
+            consumer_max_force_components_per_structure=3,
+        ),
+    )
+    _install_fake_pipeline(monkeypatch, config)
+    original_build_dataset = calibration.build_dataset
+    original_iter_samples = calibration.iter_samples
+    original_compute = calibration.compute_structure_jacobians
+    structure_caps: list[int | None] = []
+    force_caps: list[int | None] = []
+
+    def larger_dataset(*args: object, **kwargs: object) -> DatasetHandle:
+        return replace(original_build_dataset(*args, **kwargs), size=5)
+
+    def capped_samples(*args: object, **kwargs: object):
+        structure_caps.append(kwargs.get("max_structures"))
+        yield from original_iter_samples(*args, **kwargs)
+
+    def capped_jacobians(**kwargs: object) -> StructureJacobians:
+        value = kwargs.get("max_force_components")
+        assert value is None or isinstance(value, int)
+        force_caps.append(value)
+        return original_compute(**kwargs)
+
+    monkeypatch.setattr(calibration, "build_dataset", larger_dataset)
+    monkeypatch.setattr(calibration, "iter_samples", capped_samples)
+    monkeypatch.setattr(calibration, "compute_structure_jacobians", capped_jacobians)
+
+    artifact_path = run_calibrate(config)
+
+    identity = load_torch_artifact(artifact_path)["identity"]
+    assert structure_caps == [1]
+    assert force_caps == [3]
+    assert identity["curvature"]["limits"] == {
+        "max_structures": None,
+        "max_force_components_per_structure": None,
+    }
+    assert identity["limits"] == {
+        "max_structures": None,
+        "max_force_components_per_structure": None,
+    }
+    assert identity["consumer_limits"] == {
+        "max_structures": 1,
+        "max_force_components_per_structure": 3,
+    }
+
+
 def test_quadratic_form_matches_solve() -> None:
     h = torch.tensor([[2.0, 0.2], [0.2, 1.0]], dtype=torch.float64)
     g = torch.tensor([[1.0, 3.0]], dtype=torch.float64)

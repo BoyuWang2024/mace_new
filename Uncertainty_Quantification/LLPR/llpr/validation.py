@@ -271,6 +271,7 @@ def _validate_forces(
     root: Path,
     variant: str,
     energy: Sequence[tuple[str, int, float, float, float]],
+    max_force_components_per_structure: int | None = None,
 ) -> tuple[
     list[tuple[str, int, int, int, float, float, float]],
     list[float],
@@ -279,12 +280,14 @@ def _validate_forces(
 ]:
     source = f"{variant}/force_components.csv"
     rows = _read_csv(root / source, FORCE_FIELDS)
-    expected_keys = [
-        (structure_id, num_atoms, atom_index, direction)
-        for structure_id, num_atoms, _, _, _ in energy
-        for atom_index in range(num_atoms)
-        for direction in range(3)
-    ]
+    expected_keys = []
+    for structure_id, num_atoms, _, _, _ in energy:
+        structure_keys = [
+            (structure_id, num_atoms, atom_index, direction)
+            for atom_index in range(num_atoms)
+            for direction in range(3)
+        ]
+        expected_keys.extend(structure_keys[:max_force_components_per_structure])
     actual_keys = []
     observations = []
     residuals = []
@@ -390,6 +393,7 @@ def _validate_force_structures(
     variant: str,
     energy: Sequence[tuple[str, int, float, float, float]],
     force_rows: Sequence[Mapping[str, str]],
+    max_force_components_per_structure: int | None = None,
 ) -> dict[str, Any]:
     source = f"{variant}/force_structure.csv"
     rows = _read_csv(root / source, FORCE_STRUCTURE_FIELDS)
@@ -412,7 +416,10 @@ def _validate_force_structures(
         ):
             raise ValueError(f"{variant} energy/force-structure alignment mismatch")
         components = _integer(row, "components", row_source)
-        if components != num_atoms * 3:
+        expected_components = num_atoms * 3
+        if max_force_components_per_structure is not None:
+            expected_components = min(expected_components, max_force_components_per_structure)
+        if components != expected_components:
             raise ValueError(f"{row_source} force component count mismatch")
         group = force_rows[offset : offset + components]
         offset += components
@@ -894,9 +901,11 @@ def _validate_calibration_source_identity(
         "min_q",
         "limits",
     }
-    if not isinstance(value, Mapping) or set(value) not in (
-        fields,
-        fields | {"curvature_artifact"},
+    optional_fields = {"curvature_artifact", "consumer_limits"}
+    if (
+        not isinstance(value, Mapping)
+        or not fields.issubset(value)
+        or not set(value).issubset(fields | optional_fields)
     ):
         raise ValueError(f"trusted evaluation progress identity {source} is invalid")
     identity = value
@@ -928,6 +937,10 @@ def _validate_calibration_source_identity(
     if min_q != 1.0e-30:
         raise ValueError(f"trusted evaluation progress identity {source}.min_q is invalid")
     _validate_limits_identity(identity["limits"], f"{source}.limits")
+    if "consumer_limits" in identity:
+        _validate_limits_identity(
+            identity["consumer_limits"], f"{source}.consumer_limits"
+        )
     return identity
 
 
@@ -1003,7 +1016,8 @@ def _trusted_progress_identity(
     }
     if not required.issubset(identity):
         raise ValueError("trusted evaluation progress identity is missing required fields")
-    if set(identity) != required:
+    optional = {"consumer_limits"}
+    if not set(identity).issubset(required | optional):
         raise ValueError("trusted evaluation progress identity has unexpected fields")
     _validate_versions(identity, "root")
     checkpoint = _validate_checkpoint_identity(identity["checkpoint"], "checkpoint")
@@ -1050,6 +1064,11 @@ def _trusted_progress_identity(
     if min_q != 1.0e-30:
         raise ValueError("trusted evaluation progress identity min_q is invalid")
     limits = _validate_limits_identity(identity["limits"], "limits")
+    consumer_limits = (
+        _validate_limits_identity(identity["consumer_limits"], "consumer_limits")
+        if "consumer_limits" in identity
+        else None
+    )
     observables = _identity_mapping(
         identity["observables"],
         {"energy", "forces", "residual", "variance"},
@@ -1076,6 +1095,14 @@ def _trusted_progress_identity(
             raise ValueError(
                 f"trusted evaluation progress identity {source} mismatch"
             )
+
+    calibration_consumer_limits = calibration_identity.get("consumer_limits")
+    if _strict_json_bytes(consumer_limits) != _strict_json_bytes(
+        calibration_consumer_limits
+    ):
+        raise ValueError(
+            "trusted evaluation progress identity calibration consumer limits mismatch"
+        )
 
     calibration_curvature_artifact = calibration_identity.get(
         "curvature_artifact"
@@ -1255,6 +1282,10 @@ def validate_publication_root(
         raise ValueError(f"publication root is not a directory: {root}")
     identities, trusted_identity = _publication_identities(root, identity)
     calibration_records = trusted_identity["calibration"]["records"]
+    consumer_limits = trusted_identity.get("consumer_limits") or {}
+    max_force_components = consumer_limits.get(
+        "max_force_components_per_structure"
+    )
     manifest_path = root / "manifest.json"
     manifest_exists = manifest_path.is_file()
     if manifest_exists:
@@ -1266,11 +1297,11 @@ def validate_publication_root(
     for variant in _VARIANTS:
         energy, energy_residuals, energy_std = _validate_energy(root, variant)
         forces, force_residuals, force_std, force_rows = _validate_forces(
-            root, variant, energy
+            root, variant, energy, max_force_components
         )
         energy_rows = _read_csv(root / variant / "energy.csv", ENERGY_FIELDS)
         force_structure = _validate_force_structures(
-            root, variant, energy, force_rows
+            root, variant, energy, force_rows, max_force_components
         )
         summary = _validate_summary(
             root, variant, energy_rows, force_rows, force_structure

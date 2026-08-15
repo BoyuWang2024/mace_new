@@ -1,0 +1,8 @@
+publication_root: ../outputs/smoke_mad_test_madval_alpha_r2scan/8f147ecffa1d/evaluation/deterministic
+output_dir: ../../Plots/LLPR/smoke_mad_test
+selected:
+  - [he, energy]
+  - [hf, forces]
+  - [hef, energy]
+  - [hef, forces]
+style: carnet_density

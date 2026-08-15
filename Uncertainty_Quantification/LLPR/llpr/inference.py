@@ -245,6 +245,19 @@ def _load_calibrations(
         require_identity(source_artifact, curvature_artifact)
     if identity.get("min_q") != config.curvature.min_q:
         raise ValueError("calibration min_q does not match evaluation configuration")
+    actual_consumer_limits = identity.get("consumer_limits", identity.get("limits"))
+    if not isinstance(actual_consumer_limits, Mapping):
+        raise ValueError("calibration consumer limits identity is invalid")
+    expected_consumer_limits = {
+        "max_structures": config.runtime.effective_consumer_max_structures,
+        "max_force_components_per_structure": (
+            config.runtime.effective_consumer_max_force_components_per_structure
+        ),
+    }
+    if dict(actual_consumer_limits) != expected_consumer_limits:
+        raise ValueError(
+            "calibration consumer limits do not match evaluation configuration"
+        )
 
     records = artifact.get("records")
     if not isinstance(records, list) or len(records) != 6:
@@ -332,7 +345,7 @@ def _evaluation_identity(
         ridge_identity["value"] = config.ridge.value
     else:
         ridge_identity["max_condition_number"] = config.ridge.max_condition_number
-    return {
+    identity = {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
         "checkpoint": _checkpoint_metadata(checkpoint),
@@ -370,6 +383,15 @@ def _evaluation_identity(
             "variance": "alpha_squared_times_q",
         },
     }
+    if config.runtime.has_explicit_consumer_limits:
+        identity["consumer_limits"] = {
+            "max_structures": config.runtime.effective_consumer_max_structures,
+            "max_force_components_per_structure": (
+                config.runtime.effective_consumer_max_force_components_per_structure
+            ),
+        }
+    return identity
+
 
 
 def _writer_key(variant: str, filename: str) -> str:
@@ -886,8 +908,9 @@ def run_evaluate(config: LLPRConfig) -> Path:
     evaluation_dir = root / "evaluation" / "deterministic"
     progress_path = evaluation_dir / "progress.pt"
     target_structures = dataset.size
-    if config.runtime.max_structures is not None:
-        target_structures = min(target_structures, config.runtime.max_structures)
+    consumer_max_structures = config.runtime.effective_consumer_max_structures
+    if consumer_max_structures is not None:
+        target_structures = min(target_structures, consumer_max_structures)
     progress: dict[str, Any] | None = None
     if progress_path.exists():
         candidate = load_torch_artifact(progress_path)
@@ -900,7 +923,7 @@ def run_evaluate(config: LLPRConfig) -> Path:
             _validate_complete_outputs(
                 evaluation_dir,
                 candidate,
-                config.runtime.max_force_components_per_structure,
+                config.runtime.effective_consumer_max_force_components_per_structure,
             )
             return evaluation_dir
         if not config.runtime.resume:
@@ -959,7 +982,7 @@ def run_evaluate(config: LLPRConfig) -> Path:
                         config.runtime.force_component_chunk_size
                     ),
                     max_force_components=(
-                        config.runtime.max_force_components_per_structure
+                        config.runtime.effective_consumer_max_force_components_per_structure
                     ),
                 )
                 _append_structure(

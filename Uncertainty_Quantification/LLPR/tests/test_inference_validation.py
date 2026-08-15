@@ -219,6 +219,13 @@ def _write_upstream_artifacts(config: LLPRConfig, layout: ReadoutLayout) -> None
             "max_force_components_per_structure": None,
         },
     }
+    if config.runtime.consumer_max_structures is not None:
+        calibration_identity["consumer_limits"] = {
+            "max_structures": config.runtime.consumer_max_structures,
+            "max_force_components_per_structure": (
+                config.runtime.consumer_max_force_components_per_structure
+            ),
+        }
     alphas = {
         "he": {"energy": 2.0, "forces": 3.0},
         "hf": {"energy": 4.0, "forces": 5.0},
@@ -373,7 +380,16 @@ def _install_fake_pipeline(
             calls.append(batch)
         if batch == fail_at_index:
             raise RuntimeError("simulated interruption")
-        return jacobians[batch]
+        result = jacobians[batch]
+        limit = kwargs.get("max_force_components")
+        if limit is None:
+            return result
+        assert isinstance(limit, int)
+        return replace(
+            result,
+            g_forces=result.g_forces[:limit],
+            force_indices=result.force_indices[:limit],
+        )
 
     monkeypatch.setattr(inference, "load_checkpoint", fake_load_checkpoint)
     monkeypatch.setattr(
@@ -416,6 +432,49 @@ def test_run_evaluate_uses_explicit_shared_curvature(
     assert progress["identity"]["curvature"]["sha256"] == sha256_file(
         external
     )
+
+
+def test_run_evaluate_applies_consumer_caps_and_records_separate_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    config = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            consumer_max_structures=1,
+            consumer_max_force_components_per_structure=2,
+        ),
+    )
+    _install_fake_pipeline(monkeypatch, config)
+
+    evaluation_dir = run_evaluate(config)
+
+    assert len(pd.read_csv(evaluation_dir / "he" / "energy.csv")) == 1
+    assert len(pd.read_csv(evaluation_dir / "he" / "force_components.csv")) == 2
+    assert (
+        pd.read_csv(evaluation_dir / "he" / "force_structure.csv")["components"].tolist()
+        == [2]
+    )
+    identity = load_torch_artifact(evaluation_dir / "progress.pt")["identity"]
+    assert identity["curvature"]["identity"]["limits"] == {
+        "max_structures": None,
+        "max_force_components_per_structure": None,
+    }
+    assert identity["limits"] == {
+        "max_structures": None,
+        "max_force_components_per_structure": None,
+    }
+    assert identity["consumer_limits"] == {
+        "max_structures": 1,
+        "max_force_components_per_structure": 2,
+    }
+    assert identity["calibration"]["identity"]["consumer_limits"] == {
+        "max_structures": 1,
+        "max_force_components_per_structure": 2,
+    }
+    assert validate_publication_root(evaluation_dir)["status"] == "valid"
+
 
 
 def test_publication_field_contracts() -> None:

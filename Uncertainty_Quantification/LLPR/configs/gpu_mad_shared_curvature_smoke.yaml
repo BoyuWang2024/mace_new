@@ -1,0 +1,36 @@
+checkpoint:
+  path: ../../../data/checkpoint/MACE-matpes-r2scan-omat-ft.model
+  expected_sha256: 8f147ecffa1d06a696e5648b13b81abda9c96fda9d0fb3faba3cd3fb27d9bba9
+  selected_head: default
+  expected_readout_size: 2192
+data:
+  build:
+    path: ../../../data/dataset/matpes_train.extxyz
+    expected_sha256: 12ff9403254c955537827ba96c140ee1753a7410ada7910f13c42be0aa308cec
+  calibration:
+    path: ../../../data/dataset/mad-val.filtered-r6.extxyz
+    expected_sha256: d6bd26aaf7a06f3fa9f61d4808dbd36eb9b6fdf04adecba01558319dfb90ecaf
+  test:
+    path: ../../../data/dataset/mad-test.filtered-r6.extxyz
+    expected_sha256: 007de78455794a42bfa8749c1a23e760ea5f39cf002d3378a9059871a9269e33
+artifacts:
+  curvature:
+    path: ../outputs/_shared_matpes_r2scan/8f147ecffa1d/curvature/base_curvature.pt
+    expected_sha256: 223d7a8e8091778df7f96209bbaceac2d447d682d5a0ebcd3df6b66e6f651ac3
+curvature:
+  variants: [he, hf, hef]
+  min_q: 1.0e-30
+ridge:
+  mode: fixed
+  value: 1.0e-12
+  max_condition_number: 1.0e12
+runtime:
+  device: cuda
+  force_component_chunk_size: 64
+  save_every_structures: 10
+  resume: true
+  consumer_max_structures: 2
+  consumer_max_force_components_per_structure: 3
+output:
+  root: ../outputs
+  experiment: smoke_mad_test_madval_alpha_r2scan

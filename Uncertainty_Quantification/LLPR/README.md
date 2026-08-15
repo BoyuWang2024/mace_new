@@ -108,6 +108,12 @@ outputs/<experiment>/<checkpoint_sha256前12位>/
 
 评估阶段记录九个 CSV 的已提交字节偏移；恢复时先截断到这些偏移，避免重复行。已完整且身份一致的缓存会直接复用。
 
+`runtime.max_structures` 和 `runtime.max_force_components_per_structure`
+仍属于 curvature build 身份。仅消费已有完整曲率的小规模校准/评估必须改用
+`runtime.consumer_max_structures` 和
+`runtime.consumer_max_force_components_per_structure`。consumer caps 不写入
+curvature 身份、不改变 build 上限，也不会放宽外部曲率 artifact 的 SHA 和身份验证。
+
 ## 结果可发表验证
 
 `validate` 会重新读取并哈希全部正式 CSV 与摘要，检查固定 schema、有限数值、正 `q`、非负 variance/std、残差与方差公式、三种曲率之间共享的结构键、原子数、分量索引和 reference 对齐，以及 manifest 身份和文件 SHA256。每个 variant 的 prediction 与 residual 可以独立产生，但必须在该 variant 内严格满足 `residual = reference - prediction`，其逐结构力误差和摘要也必须由本路径 CSV 自洽重建。
@@ -135,7 +141,26 @@ sbatch Uncertainty_Quantification/LLPR/scripts/submit_remote_stage.slurm evaluat
 sbatch Uncertainty_Quantification/LLPR/scripts/submit_remote_stage.slurm validate "$consumer_config"
 ```
 
-两个脚本都使用 `conda run -n mace_new`、`set -euo pipefail`，只接受 `calibrate`、`evaluate`、`validate` 和 `plot`。它们不会隐式计算或重建曲率。
+两个脚本都使用 `conda run -n mace_new`、`set -euo pipefail`，只接受
+`calibrate`、`evaluate`、`validate` 和 `plot`。它们优先使用显式
+`LLPR_CONDA_EXE`，否则通过 `command -v conda` 解析；找不到或不可执行时以
+状态 69 清晰失败。它们不会隐式计算或重建曲率。
+
+`print_task7_slurm_plan.sh` 只打印命令，永不调用 `sbatch`。下面四条分别生成
+两套 smoke 和两套 formal 的完整提交计划：
+
+```bash
+bash Uncertainty_Quantification/LLPR/scripts/print_task7_slurm_plan.sh smoke mad
+bash Uncertainty_Quantification/LLPR/scripts/print_task7_slurm_plan.sh smoke matpes-train
+bash Uncertainty_Quantification/LLPR/scripts/print_task7_slurm_plan.sh formal mad
+bash Uncertainty_Quantification/LLPR/scripts/print_task7_slurm_plan.sh formal matpes-train
+```
+
+每个计划固定远端 worktree `/home/bywang/code/UQ/mace_new-plots`、实测可执行的
+共享 conda 25.3.0 绝对路径、`gpu` partition、绝对 stdout/stderr 路径和明确的
+CPU/内存/时间；calibrate/evaluate 请求 `--gres=gpu:1`。作业 ID 通过
+`afterok` 串成 `calibrate → evaluate → validate → plot`，最后一级使用独立
+plot-only YAML，而不是计算 YAML。
 
 三个 `plot_carnet_*.yaml` 是彼此独立的四面板密度图 plot-only 入口，而不是 n20 结果的三个别名：
 

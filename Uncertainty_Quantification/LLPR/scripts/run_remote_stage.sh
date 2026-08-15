@@ -17,4 +17,20 @@ case "$stage" in
     ;;
 esac
 
-exec conda run -n mace_new python -m Uncertainty_Quantification.LLPR.llpr "$stage" --config "$config"
+if [ -n "${LLPR_CONDA_EXE:-}" ]; then
+  conda_exe="$LLPR_CONDA_EXE"
+else
+  conda_exe="$(command -v conda || true)"
+  if [ -z "$conda_exe" ]; then
+    echo "conda not found; set LLPR_CONDA_EXE to an executable conda path" >&2
+    exit 69
+  fi
+fi
+
+if [ ! -f "$conda_exe" ] || [ ! -x "$conda_exe" ]; then
+  echo "LLPR_CONDA_EXE is not executable: $conda_exe" >&2
+  exit 69
+fi
+
+export LLPR_CONDA_EXE="$conda_exe"
+exec "$LLPR_CONDA_EXE" run -n mace_new python -m Uncertainty_Quantification.LLPR.llpr "$stage" --config "$config"

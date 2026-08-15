@@ -1,0 +1,8 @@
+publication_root: ../outputs/smoke_matpes_train_matpesval_alpha_r2scan/8f147ecffa1d/evaluation/deterministic
+output_dir: ../../Plots/LLPR/smoke_matpes_train
+selected:
+  - [he, energy]
+  - [hf, forces]
+  - [hef, energy]
+  - [hef, forces]
+style: carnet_density

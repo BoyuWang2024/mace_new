@@ -34,6 +34,26 @@ class RuntimeConfig:
     resume: bool
     max_structures: int | None
     max_force_components_per_structure: int | None
+    consumer_max_structures: int | None = None
+    consumer_max_force_components_per_structure: int | None = None
+
+    @property
+    def effective_consumer_max_structures(self) -> int | None:
+        if self.consumer_max_structures is not None:
+            return self.consumer_max_structures
+        return self.max_structures
+
+    @property
+    def effective_consumer_max_force_components_per_structure(self) -> int | None:
+        if self.consumer_max_force_components_per_structure is not None:
+            return self.consumer_max_force_components_per_structure
+        return self.max_force_components_per_structure
+
+    @property
+    def has_explicit_consumer_limits(self) -> bool:
+        return self.consumer_max_structures is not None or (
+            self.consumer_max_force_components_per_structure is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -196,6 +216,31 @@ def load_config(path: Path) -> LLPRConfig:
     resume = runtime_data.get("resume", False)
     if not isinstance(resume, bool):
         raise ValueError("runtime.resume must be a boolean")
+    max_structures = _optional_positive_int(
+        runtime_data.get("max_structures"), "runtime.max_structures"
+    )
+    max_force_components = _optional_positive_int(
+        runtime_data.get("max_force_components_per_structure"),
+        "runtime.max_force_components_per_structure",
+    )
+    consumer_max_structures = _optional_positive_int(
+        runtime_data.get("consumer_max_structures"),
+        "runtime.consumer_max_structures",
+    )
+    consumer_max_force_components = _optional_positive_int(
+        runtime_data.get("consumer_max_force_components_per_structure"),
+        "runtime.consumer_max_force_components_per_structure",
+    )
+    if max_structures is not None and consumer_max_structures is not None:
+        raise ValueError(
+            "runtime.consumer_max_structures cannot be combined with "
+            "runtime.max_structures"
+        )
+    if max_force_components is not None and consumer_max_force_components is not None:
+        raise ValueError(
+            "runtime.consumer_max_force_components_per_structure cannot be combined "
+            "with runtime.max_force_components_per_structure"
+        )
     runtime = RuntimeConfig(
         device=str(runtime_data.get("device", "cpu")),
         force_component_chunk_size=chunk_size,
@@ -204,13 +249,10 @@ def load_config(path: Path) -> LLPRConfig:
         )
         or 1,
         resume=resume,
-        max_structures=_optional_positive_int(
-            runtime_data.get("max_structures"), "runtime.max_structures"
-        ),
-        max_force_components_per_structure=_optional_positive_int(
-            runtime_data.get("max_force_components_per_structure"),
-            "runtime.max_force_components_per_structure",
-        ),
+        max_structures=max_structures,
+        max_force_components_per_structure=max_force_components,
+        consumer_max_structures=consumer_max_structures,
+        consumer_max_force_components_per_structure=consumer_max_force_components,
     )
 
     output_data = _mapping(_required(document, "output", "config"), "output")

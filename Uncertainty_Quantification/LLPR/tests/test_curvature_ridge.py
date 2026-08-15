@@ -285,6 +285,28 @@ def test_run_build_accumulates_cpu_float64_and_completes(
     }
 
 
+def test_run_build_ignores_consumer_only_caps_in_artifact_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    config = replace(
+        config,
+        runtime=replace(
+            config.runtime,
+            consumer_max_structures=1,
+            consumer_max_force_components_per_structure=1,
+        ),
+    )
+    _install_fake_pipeline(monkeypatch, config)
+
+    artifact = load_torch_artifact(run_build(config))
+
+    assert artifact["structures"] == 2
+    assert artifact["components"] == 3
+    assert artifact["identity"]["limits"] == {
+        "max_structures": None,
+        "max_force_components_per_structure": None,
+    }
 def test_run_build_resumes_after_saved_structure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
