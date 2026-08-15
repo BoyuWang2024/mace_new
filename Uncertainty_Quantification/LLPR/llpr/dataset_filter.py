@@ -125,6 +125,12 @@ def filter_neighborless_extxyz(
             iread(source_path, index=":", format="extxyz")
         ):
             total_structures += 1
+            existing_source_index = atoms.info.get("source_index")
+            if existing_source_index is not None and existing_source_index != source_index:
+                raise ValueError(
+                    f"structure {source_index} has conflicting source_index {existing_source_index}"
+                )
+            atoms.info["source_index"] = source_index
             missing_indices = missing_neighbor_indices(atoms, cutoff)
             if missing_indices:
                 excluded.append(_audit_record(atoms, source_index, missing_indices))

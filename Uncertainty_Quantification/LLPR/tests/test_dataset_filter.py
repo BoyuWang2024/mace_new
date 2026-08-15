@@ -59,7 +59,9 @@ def test_filter_writes_hash_complete_audit(tmp_path: Path) -> None:
     assert report["total_structures"] == 2
     assert report["retained_structures"] == 1
     assert report["excluded_structures"] == 1
-    assert [atoms.info["structure_id"] for atoms in read(output, ":")] == ["keep"]
+    retained = read(output, ":")
+    assert [atoms.info["structure_id"] for atoms in retained] == ["keep"]
+    assert [atoms.info["source_index"] for atoms in retained] == [0]
 
     audit_data = json.loads(audit.read_text(encoding="utf-8"))
     assert audit_data == report
@@ -74,6 +76,26 @@ def test_filter_writes_hash_complete_audit(tmp_path: Path) -> None:
             "reason": "missing_neighbor_within_cutoff",
         }
     ]
+
+
+def test_filter_rejects_conflicting_existing_source_index(tmp_path: Path) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    retained = Atoms("H2", positions=[[0, 0, 0], [1, 0, 0]])
+    retained.info["source_index"] = 7
+    write(source, [retained], format="extxyz")
+
+    with pytest.raises(
+        ValueError,
+        match="structure 0 has conflicting source_index 7",
+    ):
+        filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert not output.exists()
+    assert not audit.exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert list(tmp_path.glob("*.bak")) == []
 
 
 def test_filter_is_deterministic_on_rerun(tmp_path: Path) -> None:
