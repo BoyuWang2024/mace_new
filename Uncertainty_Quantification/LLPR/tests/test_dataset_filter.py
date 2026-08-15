@@ -32,7 +32,7 @@ def test_missing_neighbor_detects_single_atom() -> None:
     assert missing_neighbor_indices(Atoms("H", positions=[[0, 0, 0]]), 6.0) == (0,)
 
 
-def test_missing_neighbor_respects_periodic_neighbors() -> None:
+def test_missing_neighbor_excludes_periodic_single_atom() -> None:
     atoms = Atoms(
         "H",
         positions=[[0, 0, 0]],
@@ -40,7 +40,7 @@ def test_missing_neighbor_respects_periodic_neighbors() -> None:
         pbc=True,
     )
 
-    assert missing_neighbor_indices(atoms, 6.0) == ()
+    assert missing_neighbor_indices(atoms, 6.0) == (0,)
 
 
 def test_filter_writes_hash_complete_audit(tmp_path: Path) -> None:
@@ -113,3 +113,45 @@ def test_filter_cleans_temporary_output_after_write_failure(
     assert not output.exists()
     assert not audit.exists()
     assert list(tmp_path.glob(".filtered.extxyz.*.tmp")) == []
+
+
+def test_missing_neighbor_respects_partial_periodic_boundary_neighbors() -> None:
+    atoms = Atoms(
+        "H2",
+        positions=[[0.2, 0, 0], [9.8, 0, 0]],
+        cell=[10, 20, 20],
+        pbc=[True, False, False],
+    )
+
+    assert missing_neighbor_indices(atoms, 1.0) == ()
+
+
+def test_filter_restores_both_previous_artifacts_when_audit_publish_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    _write_source(source)
+    output.write_text("old output", encoding="utf-8")
+    audit.write_text("old audit", encoding="utf-8")
+
+    def fail_second_publish(source_path: Path, destination: Path) -> Path:
+        if destination == audit and source_path.name.endswith(".tmp"):
+            raise OSError("simulated audit publish failure")
+        return source_path.replace(destination)
+
+    monkeypatch.setattr(
+        "Uncertainty_Quantification.LLPR.llpr.dataset_filter._replace_file",
+        fail_second_publish,
+    )
+
+    with pytest.raises(OSError, match="simulated audit publish failure"):
+        filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert output.read_text(encoding="utf-8") == "old output"
+    assert audit.read_text(encoding="utf-8") == "old audit"
+    assert list(tmp_path.glob(".filtered.extxyz.*.tmp")) == []
+    assert list(tmp_path.glob(".audit.json.*.tmp")) == []
+    assert list(tmp_path.glob(".filtered.extxyz.*.bak")) == []
+    assert list(tmp_path.glob(".audit.json.*.bak")) == []

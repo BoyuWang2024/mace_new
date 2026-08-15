@@ -9,7 +9,6 @@ from uuid import uuid4
 
 from ase import Atoms
 from ase.io import iread
-from ase.io import read as ase_read
 from ase.io import write as ase_write
 from matscipy.neighbours import neighbour_list
 
@@ -20,6 +19,8 @@ def missing_neighbor_indices(atoms: Atoms, cutoff: float) -> tuple[int, ...]:
     """Return indices of atoms that have no neighbour within ``cutoff``."""
     if cutoff <= 0:
         raise ValueError("cutoff must be positive")
+    if len(atoms) == 1:
+        return (0,)
 
     neighbour_atoms = atoms.copy()
     neighbour_atoms.set_cell(neighbour_atoms.cell.complete())
@@ -30,6 +31,53 @@ def missing_neighbor_indices(atoms: Atoms, cutoff: float) -> tuple[int, ...]:
 
 def _temporary_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+
+
+def _backup_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{uuid4().hex}.bak")
+
+
+def _replace_file(source: Path, destination: Path) -> Path:
+    return source.replace(destination)
+
+
+def _restore_file(target: Path, backup: Path | None, published: bool) -> None:
+    if backup is not None:
+        target.unlink(missing_ok=True)
+        _replace_file(backup, target)
+    elif published:
+        target.unlink(missing_ok=True)
+
+
+def _publish_pair(
+    temporary_output: Path,
+    temporary_audit: Path,
+    output_path: Path,
+    audit_path: Path,
+) -> None:
+    output_backup = _backup_path(output_path) if output_path.exists() else None
+    audit_backup = _backup_path(audit_path) if audit_path.exists() else None
+    output_published = False
+    audit_published = False
+
+    try:
+        if output_backup is not None:
+            _replace_file(output_path, output_backup)
+        if audit_backup is not None:
+            _replace_file(audit_path, audit_backup)
+        _replace_file(temporary_output, output_path)
+        output_published = True
+        _replace_file(temporary_audit, audit_path)
+        audit_published = True
+    except Exception:
+        _restore_file(audit_path, audit_backup, audit_published)
+        _restore_file(output_path, output_backup, output_published)
+        raise
+    finally:
+        if output_backup is not None:
+            output_backup.unlink(missing_ok=True)
+        if audit_backup is not None:
+            audit_backup.unlink(missing_ok=True)
 
 
 def _audit_record(
@@ -69,7 +117,9 @@ def filter_neighborless_extxyz(
     retained_structures = 0
 
     try:
-        for source_index, atoms in enumerate(iread(source_path, index=":", format="extxyz")):
+        for source_index, atoms in enumerate(
+            iread(source_path, index=":", format="extxyz")
+        ):
             total_structures += 1
             missing_indices = missing_neighbor_indices(atoms, cutoff)
             if missing_indices:
@@ -85,8 +135,10 @@ def filter_neighborless_extxyz(
 
         if retained_structures == 0:
             temporary_output.touch()
-        verified_structures = ase_read(temporary_output, index=":", format="extxyz")
-        if len(verified_structures) != retained_structures:
+        verified_structures = sum(
+            1 for _ in iread(temporary_output, index=":", format="extxyz")
+        )
+        if verified_structures != retained_structures:
             raise ValueError("temporary extxyz verification count mismatch")
 
         report: dict[str, Any] = {
@@ -104,8 +156,7 @@ def filter_neighborless_extxyz(
         if json.loads(temporary_audit.read_text(encoding="utf-8")) != report:
             raise ValueError("temporary audit verification mismatch")
 
-        temporary_output.replace(output_path)
-        temporary_audit.replace(audit_path)
+        _publish_pair(temporary_output, temporary_audit, output_path, audit_path)
         return report
     finally:
         temporary_output.unlink(missing_ok=True)
