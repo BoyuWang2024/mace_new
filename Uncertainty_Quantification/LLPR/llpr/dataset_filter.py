@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from shutil import copyfile
 from numbers import Integral
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,27 @@ def missing_neighbor_indices(atoms: Atoms, cutoff: float) -> tuple[int, ...]:
 def _is_nonnegative_integer(value: object) -> bool:
     return isinstance(value, Integral) and not isinstance(value, bool) and value >= 0
 
+
+
+
+MAX_STABLE_SOURCE_ATTEMPTS = 3
+
+
+def _stable_source_snapshot(source_path: Path, temporary_parent: Path) -> tuple[Path, str]:
+    for _ in range(MAX_STABLE_SOURCE_ATTEMPTS):
+        snapshot_path = _temporary_path(temporary_parent)
+        try:
+            initial_sha = sha256_file(source_path)
+            copyfile(source_path, snapshot_path)
+            snapshot_sha = sha256_file(snapshot_path)
+            final_sha = sha256_file(source_path)
+            if initial_sha == snapshot_sha == final_sha:
+                return snapshot_path, snapshot_sha
+        except Exception:
+            snapshot_path.unlink(missing_ok=True)
+            raise
+        snapshot_path.unlink(missing_ok=True)
+    raise ValueError("source changed while acquiring a stable snapshot")
 
 
 def _derive_source_filter_audit(
@@ -142,7 +164,6 @@ def _valid_cached_report(
         or report["audit_schema_version"] != FILTER_AUDIT_SCHEMA_VERSION
         or report["predicate_version"] != FILTER_PREDICATE_VERSION
         or recorded_cutoff != cutoff
-        or report["source_sha256"] != sha256_file(source_path)
         or report["output_sha256"] != sha256_file(output_path)
     ):
         return None
@@ -206,15 +227,20 @@ def _valid_cached_report(
         excluded_indices.append(int(index))
     if excluded_indices != sorted(set(excluded_indices)):
         return None
+    source_snapshot, stable_source_sha = _stable_source_snapshot(
+        source_path, output_path
+    )
     canonical_output = _temporary_path(output_path)
     try:
+        if report["source_sha256"] != stable_source_sha:
+            return None
         (
             expected_total,
             expected_retained_indices,
             expected_excluded,
             expected_ignored_edges,
             expected_output_sha,
-        ) = _derive_source_filter_audit(source_path, cutoff, canonical_output)
+        ) = _derive_source_filter_audit(source_snapshot, cutoff, canonical_output)
         if (
             total != expected_total
             or retained != len(expected_retained_indices)
@@ -223,6 +249,7 @@ def _valid_cached_report(
             or excluded != expected_excluded
             or report["output_sha256"] != expected_output_sha
             or sha256_file(output_path) != expected_output_sha
+            or sha256_file(source_path) != stable_source_sha
         ):
             return None
         try:
@@ -245,11 +272,13 @@ def _valid_cached_report(
             or set(retained_indices) | set(excluded_indices) != set(range(total))
             or set(retained_indices) & set(excluded_indices)
             or sha256_file(output_path) != expected_output_sha
+            or sha256_file(source_path) != stable_source_sha
         ):
             return None
         return report
     finally:
         canonical_output.unlink(missing_ok=True)
+        source_snapshot.unlink(missing_ok=True)
 
 
 def _temporary_path(path: Path) -> Path:
@@ -343,37 +372,53 @@ def filter_neighborless_extxyz(
     temporary_output = _temporary_path(output_path)
     temporary_audit = _temporary_path(audit_path)
     try:
-        (
-            total_structures,
-            retained_indices,
-            excluded,
-            ignored_self_image_edges,
-            canonical_output_sha,
-        ) = _derive_source_filter_audit(source_path, cutoff, temporary_output)
-        if canonical_output_sha is None:
-            raise AssertionError("canonical output SHA is required for publication")
-        retained_structures = len(retained_indices)
-
-        report: dict[str, Any] = {
-            "audit_schema_version": FILTER_AUDIT_SCHEMA_VERSION,
-            "predicate_version": FILTER_PREDICATE_VERSION,
-            "source_sha256": sha256_file(source_path),
-            "output_sha256": canonical_output_sha,
-            "cutoff": cutoff,
-            "ignored_self_image_edges": ignored_self_image_edges,
-            "total_structures": total_structures,
-            "retained_structures": retained_structures,
-            "excluded_structures": len(excluded),
-            "excluded": excluded,
-        }
-        temporary_audit.write_text(
-            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        if json.loads(temporary_audit.read_text(encoding="utf-8")) != report:
-            raise ValueError("temporary audit verification mismatch")
-
-        _publish_pair(temporary_output, temporary_audit, output_path, audit_path)
-        return report
+        for _ in range(MAX_STABLE_SOURCE_ATTEMPTS):
+            temporary_output.unlink(missing_ok=True)
+            temporary_audit.unlink(missing_ok=True)
+            source_snapshot, stable_source_sha = _stable_source_snapshot(
+                source_path, output_path
+            )
+            try:
+                (
+                    total_structures,
+                    retained_indices,
+                    excluded,
+                    ignored_self_image_edges,
+                    canonical_output_sha,
+                ) = _derive_source_filter_audit(
+                    source_snapshot, cutoff, temporary_output
+                )
+                if (
+                    canonical_output_sha is None
+                    or sha256_file(source_path) != stable_source_sha
+                ):
+                    continue
+                retained_structures = len(retained_indices)
+                report: dict[str, Any] = {
+                    "audit_schema_version": FILTER_AUDIT_SCHEMA_VERSION,
+                    "predicate_version": FILTER_PREDICATE_VERSION,
+                    "source_sha256": stable_source_sha,
+                    "output_sha256": canonical_output_sha,
+                    "cutoff": cutoff,
+                    "ignored_self_image_edges": ignored_self_image_edges,
+                    "total_structures": total_structures,
+                    "retained_structures": retained_structures,
+                    "excluded_structures": len(excluded),
+                    "excluded": excluded,
+                }
+                temporary_audit.write_text(
+                    json.dumps(report, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                if json.loads(temporary_audit.read_text(encoding="utf-8")) != report:
+                    raise ValueError("temporary audit verification mismatch")
+                if sha256_file(source_path) != stable_source_sha:
+                    continue
+                _publish_pair(temporary_output, temporary_audit, output_path, audit_path)
+                return report
+            finally:
+                source_snapshot.unlink(missing_ok=True)
+        raise ValueError("source changed during filtering; no artifacts were published")
     finally:
         temporary_output.unlink(missing_ok=True)
         temporary_audit.unlink(missing_ok=True)

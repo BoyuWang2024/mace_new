@@ -163,6 +163,37 @@ def test_filter_cache_hit_rederives_source_without_republishing(
 
 
 
+
+def test_filter_recomputes_when_source_changes_after_initial_cache_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    _write_source(source)
+    filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    original_sha256_file = dataset_filter.sha256_file
+    source_was_changed = False
+
+    def mutate_source_after_initial_sha(path: str | Path) -> str:
+        nonlocal source_was_changed
+        digest = original_sha256_file(path)
+        if Path(path) == source and not source_was_changed:
+            source.write_text(source.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            source_was_changed = True
+        return digest
+
+    monkeypatch.setattr(dataset_filter, "sha256_file", mutate_source_after_initial_sha)
+    report = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert source_was_changed
+    assert report["source_sha256"] == original_sha256_file(source)
+    assert json.loads(audit.read_text(encoding="utf-8"))["source_sha256"] == report[
+        "source_sha256"
+    ]
+
+
 def test_filter_recomputes_after_coordinated_output_and_audit_tampering(
     tmp_path: Path,
 ) -> None:
