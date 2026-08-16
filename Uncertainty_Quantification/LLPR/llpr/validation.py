@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import io
 import json
 import math
 import os
 import stat
+from contextlib import contextmanager
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Any, Mapping, Sequence
+from tempfile import NamedTemporaryFile, TemporaryDirectory
+from typing import Any, Iterator, Mapping, Sequence
 
 import torch
 
@@ -171,6 +173,29 @@ def _atomic_strict_json_dump(path: Path, value: Any) -> None:
         ) as handle:
             temporary = Path(handle.name)
             handle.write(_strict_json_bytes(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_bytes_dump(path: Path, payload: bytes) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="wb",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
@@ -1256,7 +1281,7 @@ def _validate_complete_progress(
 
 def _trusted_progress_identity(
     root: Path, explicit_identity: Mapping[str, Any] | None
-) -> tuple[Mapping[str, Any], Mapping[str, int] | None, str]:
+) -> tuple[Mapping[str, Any], Mapping[str, int] | None, str, Mapping[str, Any]]:
     progress_path = root / "progress.pt"
     if not progress_path.is_file():
         raise ValueError("trusted evaluation progress identity is missing")
@@ -1409,7 +1434,7 @@ def _trusted_progress_identity(
         raise ValueError("trusted evaluation progress identity ridge mismatch")
     if float(calibration_identity["min_q"]) != min_q:
         raise ValueError("trusted evaluation progress identity min_q mismatch")
-    return identity, progress_zero_q_counts, progress_sha256
+    return identity, progress_zero_q_counts, progress_sha256, progress
 
 
 def _validate_summary_calibration_contract(
@@ -1443,8 +1468,9 @@ def _publication_identities(
     Mapping[str, Any],
     Mapping[str, int] | None,
     str,
+    Mapping[str, Any],
 ]:
-    source, progress_zero_q_counts, progress_sha256 = (
+    source, progress_zero_q_counts, progress_sha256, progress = (
         _trusted_progress_identity(root, explicit_identity)
     )
 
@@ -1467,7 +1493,7 @@ def _publication_identities(
         normalized
     ):
         raise ValueError("manifest identity mismatch")
-    return normalized, source, progress_zero_q_counts, progress_sha256
+    return normalized, source, progress_zero_q_counts, progress_sha256, progress
 
 
 def _references_aligned(
@@ -1492,6 +1518,107 @@ def _canonical_file_hashes(root: Path) -> dict[str, str]:
         for variant in _VARIANTS
         for filename in _CANONICAL_FILES
     }
+
+
+def _validation_input_snapshots(root: Path) -> dict[str, bytes]:
+    relative_paths = ["progress.pt"]
+    relative_paths.extend(
+        f"{variant}/{filename}"
+        for variant in _VARIANTS
+        for filename in _CANONICAL_FILES
+    )
+    snapshots = {
+        relative_path: _regular_file_snapshot(
+            root / relative_path, f"validation input {relative_path}"
+        )
+        for relative_path in relative_paths
+    }
+    for relative_path, payload in snapshots.items():
+        if relative_path.endswith(".csv") and not payload.endswith(b"\n"):
+            raise ValueError(
+                f"trusted evaluation progress CSV offset requires complete final row: "
+                f"{relative_path}"
+            )
+    return snapshots
+
+
+def _validation_input_hashes(snapshots: Mapping[str, bytes]) -> dict[str, str]:
+    return {
+        relative_path: hashlib.sha256(payload).hexdigest()
+        for relative_path, payload in snapshots.items()
+    }
+
+
+def _assert_validation_inputs(
+    root: Path, expected_hashes: Mapping[str, str], message: str
+) -> None:
+    current = _validation_input_hashes(_validation_input_snapshots(root))
+    if current != expected_hashes:
+        raise ValueError(message)
+
+
+@contextmanager
+def _validation_output_lock(root: Path) -> Iterator[None]:
+    lock_path = root.parent / f".{root.name}.validation.lock"
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _restore_validation_reports(
+    root: Path, previous: Mapping[str, bytes | None]
+) -> None:
+    for name, payload in previous.items():
+        path = root / name
+        if payload is None:
+            path.unlink(missing_ok=True)
+        else:
+            _atomic_bytes_dump(path, payload)
+
+
+def _publish_validation_reports(
+    root: Path,
+    manifest: Mapping[str, Any],
+    report: Mapping[str, Any],
+    input_hashes: Mapping[str, str],
+) -> None:
+    report_names = ("manifest.json", "validation.json")
+    previous = {
+        name: (
+            _regular_file_snapshot(root / name, f"existing {name}")
+            if (root / name).is_file()
+            else None
+        )
+        for name in report_names
+    }
+    promoted = False
+    with TemporaryDirectory(prefix=".validation-staging-", dir=root) as directory:
+        staging = Path(directory)
+        _atomic_strict_json_dump(staging / "manifest.json", manifest)
+        _atomic_strict_json_dump(staging / "validation.json", report)
+        _assert_validation_inputs(
+            root,
+            input_hashes,
+            "publication input changed during report publication",
+        )
+        try:
+            promoted = True
+            for name in report_names:
+                os.replace(staging / name, root / name)
+            _assert_validation_inputs(
+                root,
+                input_hashes,
+                "publication input changed during report publication",
+            )
+        except BaseException:
+            if promoted:
+                _restore_validation_reports(root, previous)
+            raise
 
 
 def _validate_existing_manifest(
@@ -1539,7 +1666,7 @@ def _validate_existing_manifest(
             raise ValueError(f"manifest SHA256 mismatch for {relative_path}")
 
 
-def validate_publication_root(
+def _validate_publication_root_locked(
     publication_root: Path,
     *,
     identity: Mapping[str, Any] | None = None,
@@ -1557,10 +1684,15 @@ def validate_publication_root(
         trusted_identity,
         progress_zero_q_counts,
         progress_sha256,
+        progress,
     ) = _publication_identities(root, identity)
+    input_snapshots = _validation_input_snapshots(root)
+    input_hashes = _validation_input_hashes(input_snapshots)
     calibration_records = trusted_identity["calibration"]["records"]
     policy_bound = "zero_q" in trusted_identity
-    consumer_limits = trusted_identity.get("consumer_limits") or {}
+    consumer_limits = trusted_identity.get(
+        "consumer_limits", trusted_identity["limits"]
+    )
     max_force_components = consumer_limits.get(
         "max_force_components_per_structure"
     )
@@ -1574,6 +1706,7 @@ def validate_publication_root(
     force_baseline: list[tuple[str, int, int, int, float, float, float]] | None = None
     zero_q_baseline: tuple[tuple[str, str, str, str], ...] | None = None
     summary_zero_q_counts: dict[str, Mapping[str, int] | None] = {}
+    structure_counts: dict[str, tuple[int, int]] = {}
     for variant in _VARIANTS:
         energy, energy_residuals, energy_std = _validate_energy(root, variant)
         forces, force_residuals, force_std, force_rows = _validate_forces(
@@ -1582,6 +1715,10 @@ def validate_publication_root(
         energy_rows = _read_csv(root / variant / "energy.csv", ENERGY_FIELDS)
         force_structure = _validate_force_structures(
             root, variant, energy, force_rows, max_force_components
+        )
+        structure_counts[variant] = (
+            len(energy_rows),
+            int(force_structure["rows"]),
         )
         summary = _validate_summary(
             root, policy_bound, variant, energy_rows, force_rows, force_structure
@@ -1626,12 +1763,39 @@ def validate_publication_root(
             "forces": _quality_diagnostics(force_residuals, force_std),
         }
 
-    if policy_bound and any(
-        summary_zero_q_counts[variant] != progress_zero_q_counts
-        for variant in _VARIANTS
-    ):
-        raise ValueError("trusted evaluation progress zero-q counters mismatch")
-    file_hashes = _canonical_file_hashes(root)
+    if policy_bound:
+        target_structures = trusted_identity["test"]["size"]
+        max_structures = consumer_limits.get("max_structures")
+        if max_structures is not None:
+            target_structures = min(target_structures, max_structures)
+        if (
+            progress["next_index"] != target_structures
+            or progress["structures"] != target_structures
+            or any(
+                structure_counts[variant]
+                != (target_structures, target_structures)
+                for variant in _VARIANTS
+            )
+        ):
+            raise ValueError(
+                "trusted evaluation progress structure counters mismatch with "
+                "canonical CSV and identity"
+            )
+        for relative_path, offset in progress["csv_offsets"].items():
+            if offset != len(input_snapshots[relative_path]):
+                raise ValueError(
+                    f"trusted evaluation progress CSV offset mismatch: {relative_path}"
+                )
+        if any(
+            summary_zero_q_counts[variant] != progress_zero_q_counts
+            for variant in _VARIANTS
+        ):
+            raise ValueError("trusted evaluation progress zero-q counters mismatch")
+    file_hashes = {
+        relative_path: input_hashes[relative_path]
+        for relative_path in input_hashes
+        if relative_path != "progress.pt"
+    }
     current_progress_sha256 = hashlib.sha256(
         _regular_file_snapshot(root / "progress.pt", "trusted evaluation progress")
     ).hexdigest()
@@ -1659,21 +1823,31 @@ def validate_publication_root(
         },
         "files": file_hashes,
     }
-    if not manifest_exists:
-        _atomic_strict_json_dump(manifest_path, manifest)
     report = {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
         "status": "valid",
-        "manifest_sha256": sha256_file(root / "manifest.json"),
+        "manifest_sha256": hashlib.sha256(_strict_json_bytes(manifest)).hexdigest(),
         "tolerances": {
             "relative": RELATIVE_TOLERANCE,
             "absolute": ABSOLUTE_TOLERANCE,
         },
         "diagnostics": diagnostics,
     }
-    _atomic_strict_json_dump(root / "validation.json", report)
+    _publish_validation_reports(root, manifest, report, input_hashes)
     return report
+
+
+def validate_publication_root(
+    publication_root: Path,
+    *,
+    identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    root = Path(publication_root)
+    if not root.is_dir():
+        raise ValueError(f"publication root is not a directory: {root}")
+    with _validation_output_lock(root):
+        return _validate_publication_root_locked(root, identity=identity)
 
 
 def run_validate(config: LLPRConfig) -> dict[str, Any]:

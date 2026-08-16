@@ -2442,6 +2442,12 @@ def _refresh_force_aggregates_and_summary(root: Path, variant: str) -> None:
                 ),
             }
         )
+        progress["csv_offsets"].update(
+            {
+                f"{variant}/force_components.csv": force_path.stat().st_size,
+                f"{variant}/force_structure.csv": structure_path.stat().st_size,
+            }
+        )
         atomic_torch_save(progress_path, progress)
 
 
@@ -2479,6 +2485,44 @@ def test_standalone_validation_rejects_coherent_false_progress_zero_q_counts(
         validate_publication_root(root)
 
 
+@pytest.mark.parametrize("case", ("structures", "offsets"))
+def test_standalone_validation_rejects_coherent_false_structure_or_csv_offsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    if case == "structures":
+        progress["next_index"] = 999
+        progress["structures"] = 999
+    else:
+        progress["csv_offsets"] = {
+            relative_path: 0 for relative_path in progress["csv_offsets"]
+        }
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match="progress (structure|CSV offset)"):
+        validate_publication_root(root)
+
+
+def test_standalone_validation_rejects_csv_without_complete_final_newline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    relative_path = "he/energy.csv"
+    csv_path = root / relative_path
+    payload = csv_path.read_bytes()
+    assert payload.endswith(b"\n")
+    csv_path.write_bytes(payload[:-1])
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    progress["csv_offsets"][relative_path] = csv_path.stat().st_size
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match="complete final row"):
+        validate_publication_root(root)
+
+
 def test_standalone_validation_rejects_progress_change_during_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2511,6 +2555,58 @@ def test_standalone_validation_rejects_progress_change_during_validation(
 
     with pytest.raises(ValueError, match="progress changed during validation"):
         validate_publication_root(root)
+
+
+@pytest.mark.parametrize("existing_reports", (False, True))
+def test_standalone_validation_rolls_back_reports_when_progress_changes_at_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_reports: bool,
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    if existing_reports:
+        validate_publication_root(root)
+    report_paths = (root / "manifest.json", root / "validation.json")
+    original_reports = {
+        path: path.read_bytes() if path.exists() else None for path in report_paths
+    }
+    progress_path = root / "progress.pt"
+    replace = validation.os.replace
+    replaced = False
+
+    def replace_progress_after_live_report_promotion(
+        source: os.PathLike[str] | str,
+        destination: os.PathLike[str] | str,
+    ) -> None:
+        nonlocal replaced
+        replace(source, destination)
+        if not replaced and Path(destination) == root / "validation.json":
+            replaced = True
+            progress = load_torch_artifact(progress_path)
+            progress.update(
+                {
+                    "zero_q_rows": 999,
+                    "zero_q_zero_residual_rows": 499,
+                    "zero_q_nonzero_residual_rows": 500,
+                }
+            )
+            atomic_torch_save(progress_path, progress)
+
+    monkeypatch.setattr(
+        validation.os, "replace", replace_progress_after_live_report_promotion
+    )
+
+    with pytest.raises(ValueError, match="input changed during report publication"):
+        validate_publication_root(root)
+
+    for path, original in original_reports.items():
+        if original is None:
+            assert not path.exists()
+        else:
+            assert path.read_bytes() == original
+
 
 
 @pytest.mark.parametrize("case", ("missing", "extra", "bool", "negative", "sum"))
