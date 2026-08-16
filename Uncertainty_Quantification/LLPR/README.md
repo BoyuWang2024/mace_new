@@ -89,7 +89,8 @@ outputs/<experiment>/<checkpoint_sha256前12位>/
 │   ├── progress.pt
 │   ├── calibrations.pt
 │   ├── calibrations.csv
-│   └── ridge_diagnostics.json
+│   ├── ridge_diagnostics.json
+│   └── force_exclusions.json
 ├── evaluation/deterministic/
 │   ├── progress.pt
 │   ├── manifest.json
@@ -116,7 +117,11 @@ curvature 身份、不改变 build 上限，也不会放宽外部曲率 artifact
 
 ## 结果可发表验证
 
-`validate` 会重新读取并哈希全部正式 CSV 与摘要，检查固定 schema、有限数值、正 `q`、非负 variance/std、残差与方差公式、三种曲率之间共享的结构键、原子数、分量索引和 reference 对齐，以及 manifest 身份和文件 SHA256。每个 variant 的 prediction 与 residual 可以独立产生，但必须在该 variant 内严格满足 `residual = reference - prediction`，其逐结构力误差和摘要也必须由本路径 CSV 自洽重建。
+`validate` 会重新读取并哈希全部正式 CSV 与摘要，检查固定 schema、有限数值、
+非负 variance/std、残差与方差公式、三种曲率之间共享的结构键、原子数、分量索引和
+reference 对齐，以及 manifest 身份和文件 SHA256。能量 `q` 必须严格为正；力
+`q=0` 只允许出现在声明并绑定零 q policy、calibration population 和 exclusion
+audit SHA 的新结果中，且对应 variance/std 必须精确为零。
 
 当前评估流程对同一结构只执行一次模型预测，因此新计算的三个 variant 会自然共享 prediction；验证器允许科学上合法的 variant-specific prediction，不改变新计算的这一确定性行为。覆盖率、相关性和标准化残差是完整报告指标，不作为隐藏的质量门槛。
 
@@ -156,8 +161,8 @@ bash Uncertainty_Quantification/LLPR/scripts/print_task7_slurm_plan.sh formal ma
 bash Uncertainty_Quantification/LLPR/scripts/print_task7_slurm_plan.sh formal matpes-train
 ```
 
-每个计划固定远端 worktree `/home/bywang/code/UQ/mace_new-plots`、实测可执行的
-共享 conda 25.3.0 绝对路径、`gpu` partition、绝对 stdout/stderr 路径和明确的
+本文以 `${REMOTE_WORKTREE}` 表示固定远端 worktree；计划脚本仍保留并打印经实测的
+绝对部署路径、共享 conda 25.3.0 绝对路径、`gpu` partition、绝对 stdout/stderr 路径和明确的
 CPU/内存/时间；calibrate/evaluate 请求 `--gres=gpu:1`。作业 ID 通过
 `afterok` 串成 `calibrate → evaluate → validate → plot`，最后一级使用独立
 plot-only YAML，而不是计算 YAML。
@@ -167,10 +172,31 @@ smoke calibrate/evaluate 固定 30 分钟；formal calibrate/evaluate 固定
 在复审时已运行超过 1 天 4 小时且仍在运行，而正式 evaluation 包含 348,780 个
 结构。validate/plot 固定 2 小时。
 
+零 q recovery 配置使用全新 experiment 和绘图根，不会 resume 或覆盖失败的
+`mad_test_madval_alpha_r2scan`、`matpes_train_matpesval_alpha_r2scan` 及旧
+smoke 结果。MAD v2 输入固定为：
+以下计数和 SHA 是在与远端 raw SHA 一致的本地兼容副本上、使用同一 v2 filter
+得到的 candidate；配置暂时绑定这些 candidate 值。GitHub push 与远端 fetch 门禁
+仍被 SSH 22/443 超时阻塞，因此它们尚不是远端 measured 值，必须在门禁恢复后于
+干净远端 worktree 逐字节复现并确认，才能提交任何 recovery 作业。
+
+- val：`mad-val.filtered-r6-v2.extxyz`，9503 / 9476 / 27
+  （total / retained / excluded），SHA256
+  `5c730961cb85c960a2cd4942571a7c66656a389664ca96eee63908361f8163c2`；
+- test：`mad-test.filtered-r6-v2.extxyz`，9486 / 9460 / 26，SHA256
+  `71c5e48905176b5132f51f3555bbd2e4fedb4c2f342f24b5f183042c456f7657`。
+
+MAD recovery smoke 消费前 86 个 retained 结构，因此跨过被 v2 audit 排除的原始
+`source_index=85`；MATPES recovery smoke 消费前 159 个结构且不截断力分量，
+因此包含 calibration index 158 的单原子 Ba 及其全部三个分量。配置和计划文件只
+准备这些入口；它们本身不会提交任何 Slurm 作业。
+
 三个 `plot_carnet_*.yaml` 是彼此独立的四面板密度图 plot-only 入口，而不是 n20 结果的三个别名：
 
 - `plot_carnet_matpes_test.yaml` 读取现有已验证的 MATPES test canonical 结果，镜像到 `Uncertainty_Quantification/Plots/LLPR/matpes_test`；
-- `plot_carnet_mad_test.yaml` 读取正式 `mad_test_madval_alpha_r2scan` 结果，镜像到 `Uncertainty_Quantification/Plots/LLPR/mad_test`；
-- `plot_carnet_matpes_train.yaml` 读取正式 `matpes_train_matpesval_alpha_r2scan` 结果，镜像到 `Uncertainty_Quantification/Plots/LLPR/matpes_train`。
+- `plot_carnet_mad_test.yaml` 读取正式
+  `mad_test_madval_alpha_r2scan_zero_q_recovery_v1` 结果；
+- `plot_carnet_matpes_train.yaml` 读取正式
+  `matpes_train_matpesval_alpha_r2scan_zero_q_recovery_v1` 结果。
 
 它们统一使用固定 `carnet_density` 风格，没有 checkpoint 或 SHA256 字段；运行 `plot` 不会触发模型计算。MAD test 和 MATPES train 的正式 canonical 结果尚未生成时，相应 plot 命令会封闭失败，不能改指向 n20 结果来代替。

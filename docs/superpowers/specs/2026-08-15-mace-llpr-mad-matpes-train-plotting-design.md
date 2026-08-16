@@ -256,8 +256,22 @@ MAD 原始数据先经过确定性的 6 Å 邻域筛选。邻居必须是不同�
 正式配置使用筛选后的 `mad-val` 作为 calibration，筛选后的 `mad-test` 作为 test，
 共享同一个 canonical curvature，并执行 `calibrate → evaluate → validate → plot`。
 
-修正周期自镜像规则后必须重新生成两份 filtered MAD 和 audit，并测量新的 SHA；正式
-配置只能在最终 SHA 确定后更新。旧 filtered 文件和失败作业进度保持原样，不原地覆盖。
+v2 使用全新文件名，不覆盖旧 v1 输出：
+下列计数与 SHA 当前是用同一 v2 filter 在 raw SHA 相同的本地兼容副本上得到的
+candidate，并由配置临时绑定；它们尚未在远端 measured。SSH 22/443 网络门禁恢复后，
+必须在干净远端 worktree 逐字节复现并确认，且旧 v1 资产验收通过，才允许启动 recovery
+作业。
+
+- `mad-val.filtered-r6-v2.extxyz`：9503 / 9476 / 27
+  （total / retained / excluded），输出 SHA256
+  `5c730961cb85c960a2cd4942571a7c66656a389664ca96eee63908361f8163c2`，
+  audit SHA256 `a4d16d69f1ad395d622a1ffb44f5ff58fd84eca448c54c3310c0cc05f2b7eed8`；
+- `mad-test.filtered-r6-v2.extxyz`：9486 / 9460 / 26，输出 SHA256
+  `71c5e48905176b5132f51f3555bbd2e4fedb4c2f342f24b5f183042c456f7657`，
+  audit SHA256 `9d0242569d389f91c8742be2cec3128768a04b0aac4ad1e0e5d62633fde084af`。
+
+val audit 的精确排除索引包含原始 `source_index=85`。旧 filtered 文件、audit、
+失败作业进度和输出根保持原样，不原地覆盖或 resume。
 
 ### 7.3 MATPES test
 
@@ -275,20 +289,22 @@ Uncertainty_Quantification/LLPR/outputs/
 │   └── 8f147ecffa1d/
 │       ├── curvature/base_curvature.pt
 │       └── curvature/conversion_audit.json
-├── mad_test_madval_alpha_r2scan/
+├── mad_test_madval_alpha_r2scan_zero_q_recovery_v1/
 │   └── 8f147ecffa1d/
 │       ├── inputs/
 │       ├── calibration/deterministic/
 │       ├── evaluation/deterministic/
 │       └── plots/
-└── matpes_train_matpesval_alpha_r2scan/
+└── matpes_train_matpesval_alpha_r2scan_zero_q_recovery_v1/
     └── 8f147ecffa1d/
         ├── calibration/deterministic/
         ├── evaluation/deterministic/
         └── plots/
 ```
 
-现有本地 `legacy_matpes_r2scan` 目录不移动、不改名、不覆盖。
+现有本地 `legacy_matpes_r2scan` 目录不移动、不改名、不覆盖。失败的
+`mad_test_madval_alpha_r2scan` 和 `matpes_train_matpesval_alpha_r2scan`
+目录也只读保留。
 
 ## 9. carnet 风格绘图契约
 
@@ -453,14 +469,23 @@ MATPES/MAD 中确定性截取的小集合完成：
 - carnet plot；
 - 缓存重跑。
 
-小数据结果使用独立 experiment，不得与正式目录共用 progress 或输出。
-`runtime.consumer_max_structures` 与
+recovery smoke 使用全新 experiment，不得与旧 smoke、失败 formal 或新 formal
+目录共用 progress 或输出：
+
+- MAD smoke 使用 v2 filtered val/test，`consumer_max_structures: 86` 和
+  `consumer_max_force_components_per_structure: 3`。前 86 个 retained 结构跨过
+  audit 中被排除的原始 `source_index=85`，验收必须证明输出 source-index 序列没有
+  85；
+- MATPES smoke 使用 `consumer_max_structures: 159`，不设置力分量 consumer cap，
+  因此 calibration index 158 的单原子 Ba 及其全部三个力分量进入同一次结构级 policy
+  判定。
+
+`runtime.consumer_max_structures` 与可选的
 `runtime.consumer_max_force_components_per_structure` 只限制 calibration 和
-evaluation 的消费量；它们单独进入 consumer progress identity。原有
-`runtime.max_structures` 与 `runtime.max_force_components_per_structure`
+evaluation 的消费量；它们单独进入 consumer progress identity。原有 build caps
 继续定义 curvature build 身份，外部完整曲率仍严格绑定完整 build dataset、build
 limits、checkpoint、readout、公式和 artifact SHA。smoke consumer 不得把自己的
-2/3 上限伪装成 curvature build 上限。
+consumer 上限伪装成 curvature build 上限。
 
 
 ## 12. 远端正式执行

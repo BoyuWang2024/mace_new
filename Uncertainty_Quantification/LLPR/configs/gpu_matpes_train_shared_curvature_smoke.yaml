@@ -29,8 +29,7 @@ runtime:
   force_component_chunk_size: 64
   save_every_structures: 10
   resume: true
-  consumer_max_structures: 2
-  consumer_max_force_components_per_structure: 3
+  consumer_max_structures: 159
 output:
   root: ../outputs
-  experiment: smoke_matpes_train_matpesval_alpha_r2scan
+  experiment: smoke_matpes_train_matpesval_alpha_r2scan_zero_q_recovery_v1

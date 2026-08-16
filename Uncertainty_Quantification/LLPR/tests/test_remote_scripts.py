@@ -269,19 +269,19 @@ def _yaml_config(name: str) -> dict[str, object]:
     [
         (
             "gpu_mad_shared_curvature.yaml",
-            ("../../../data/dataset/mad-val.filtered-r6.extxyz", "d6bd26aaf7a06f3fa9f61d4808dbd36eb9b6fdf04adecba01558319dfb90ecaf"),
-            ("../../../data/dataset/mad-test.filtered-r6.extxyz", "007de78455794a42bfa8749c1a23e760ea5f39cf002d3378a9059871a9269e33"),
-            "mad_test_madval_alpha_r2scan",
+            ("../../../data/dataset/mad-val.filtered-r6-v2.extxyz", "5c730961cb85c960a2cd4942571a7c66656a389664ca96eee63908361f8163c2"),
+            ("../../../data/dataset/mad-test.filtered-r6-v2.extxyz", "71c5e48905176b5132f51f3555bbd2e4fedb4c2f342f24b5f183042c456f7657"),
+            "mad_test_madval_alpha_r2scan_zero_q_recovery_v1",
             "plot_carnet_mad_test.yaml",
-            "../../Plots/LLPR/mad_test",
+            "../../Plots/LLPR/mad_test_zero_q_recovery_v1",
         ),
         (
             "gpu_matpes_train_shared_curvature.yaml",
             ("../../../data/dataset/matpes_val.extxyz", "5b2ce7f0835f0f69d27840116608ee264536d2cc0ac253a33625ece29f985eef"),
             ("../../../data/dataset/matpes_train.extxyz", "12ff9403254c955537827ba96c140ee1753a7410ada7910f13c42be0aa308cec"),
-            "matpes_train_matpesval_alpha_r2scan",
+            "matpes_train_matpesval_alpha_r2scan_zero_q_recovery_v1",
             "plot_carnet_matpes_train.yaml",
-            "../../Plots/LLPR/matpes_train",
+            "../../Plots/LLPR/matpes_train_zero_q_recovery_v1",
         ),
     ],
 )
@@ -334,23 +334,27 @@ def test_formal_task7_configs_are_semantically_locked(
 
 
 @pytest.mark.parametrize(
-    ("formal_name", "smoke_name", "formal_plot", "smoke_plot", "smoke_experiment", "smoke_plot_dir"),
+    ("formal_name", "smoke_name", "formal_plot", "smoke_plot", "smoke_experiment", "smoke_plot_dir", "consumer_max_structures", "consumer_max_force_components"),
     [
         (
             "gpu_mad_shared_curvature.yaml",
             "gpu_mad_shared_curvature_smoke.yaml",
             "plot_carnet_mad_test.yaml",
             "plot_carnet_mad_test_smoke.yaml",
-            "smoke_mad_test_madval_alpha_r2scan",
-            "../../Plots/LLPR/smoke_mad_test",
+            "smoke_mad_test_madval_alpha_r2scan_zero_q_recovery_v1",
+            "../../Plots/LLPR/smoke_mad_test_zero_q_recovery_v1",
+            86,
+            3,
         ),
         (
             "gpu_matpes_train_shared_curvature.yaml",
             "gpu_matpes_train_shared_curvature_smoke.yaml",
             "plot_carnet_matpes_train.yaml",
             "plot_carnet_matpes_train_smoke.yaml",
-            "smoke_matpes_train_matpesval_alpha_r2scan",
-            "../../Plots/LLPR/smoke_matpes_train",
+            "smoke_matpes_train_matpesval_alpha_r2scan_zero_q_recovery_v1",
+            "../../Plots/LLPR/smoke_matpes_train_zero_q_recovery_v1",
+            159,
+            None,
         ),
     ],
 )
@@ -361,6 +365,8 @@ def test_smoke_configs_reuse_formal_artifacts_with_consumer_only_caps(
     smoke_plot: str,
     smoke_experiment: str,
     smoke_plot_dir: str,
+    consumer_max_structures: int,
+    consumer_max_force_components: int | None,
 ) -> None:
     formal = _yaml_config(formal_name)
     smoke = _yaml_config(smoke_name)
@@ -369,11 +375,13 @@ def test_smoke_configs_reuse_formal_artifacts_with_consumer_only_caps(
     assert smoke["artifacts"] == formal["artifacts"]
     assert smoke["curvature"] == formal["curvature"]
     assert smoke["ridge"] == formal["ridge"]
-    assert smoke["runtime"] == {
+    expected_runtime = {
         **formal["runtime"],
-        "consumer_max_structures": 2,
-        "consumer_max_force_components_per_structure": 3,
+        "consumer_max_structures": consumer_max_structures,
     }
+    if consumer_max_force_components is not None:
+        expected_runtime["consumer_max_force_components_per_structure"] = consumer_max_force_components
+    assert smoke["runtime"] == expected_runtime
     assert "max_structures" not in smoke["runtime"]
     assert "max_force_components_per_structure" not in smoke["runtime"]
     assert smoke["output"] == {"root": "../outputs", "experiment": smoke_experiment}
@@ -396,12 +404,12 @@ def test_plot_configs_use_distinct_dataset_roots_and_mirrors() -> None:
             LLPR_ROOT.parents[0] / "Plots/LLPR/matpes_test",
         ),
         "plot_carnet_mad_test.yaml": (
-            LLPR_ROOT / "outputs/mad_test_madval_alpha_r2scan/8f147ecffa1d/evaluation/deterministic",
-            LLPR_ROOT.parents[0] / "Plots/LLPR/mad_test",
+            LLPR_ROOT / "outputs/mad_test_madval_alpha_r2scan_zero_q_recovery_v1/8f147ecffa1d/evaluation/deterministic",
+            LLPR_ROOT.parents[0] / "Plots/LLPR/mad_test_zero_q_recovery_v1",
         ),
         "plot_carnet_matpes_train.yaml": (
-            LLPR_ROOT / "outputs/matpes_train_matpesval_alpha_r2scan/8f147ecffa1d/evaluation/deterministic",
-            LLPR_ROOT.parents[0] / "Plots/LLPR/matpes_train",
+            LLPR_ROOT / "outputs/matpes_train_matpesval_alpha_r2scan_zero_q_recovery_v1/8f147ecffa1d/evaluation/deterministic",
+            LLPR_ROOT.parents[0] / "Plots/LLPR/matpes_train_zero_q_recovery_v1",
         ),
     }
 
