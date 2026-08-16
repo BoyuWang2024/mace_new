@@ -26,6 +26,7 @@ from .artifacts import (
     sha256_file,
 )
 from .calibration_policy import (
+    CALIBRATION_POPULATION_FIELDS,
     ZERO_Q_POLICY,
     ForceCalibrationDecision,
     classify_force_calibration_structure,
@@ -89,6 +90,14 @@ class CalibrationRecord:
     alpha: float
     rows: int
     mean_residual_squared_over_q: float
+    zero_q_policy: str
+    energy_structures: int
+    force_used_structures: int
+    force_excluded_structures: int
+    force_components_total: int
+    force_components_used: int
+    force_components_excluded: int
+    force_exclusions_sha256: str
 
 
 def _squared_residual_over_q(
@@ -205,14 +214,7 @@ def _empty_accumulators() -> dict[str, dict[str, dict[str, float | int]]]:
 
 
 def _empty_counts() -> dict[str, int]:
-    return {
-        "energy_structures": 0,
-        "force_used_structures": 0,
-        "force_excluded_structures": 0,
-        "force_components_total": 0,
-        "force_components_used": 0,
-        "force_components_excluded": 0,
-    }
+    return {field: 0 for field in CALIBRATION_POPULATION_FIELDS}
 
 
 def _new_progress(identity: Mapping[str, Any]) -> dict[str, Any]:
@@ -228,6 +230,17 @@ def _new_progress(identity: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validate_progress(progress: Mapping[str, Any]) -> None:
+    expected_fields = {
+        "identity",
+        "status",
+        "next_index",
+        "structures",
+        "counts",
+        "exclusions",
+        "accumulators",
+    }
+    if not isinstance(progress, Mapping) or set(progress) != expected_fields:
+        raise ValueError("calibration progress schema mismatch")
     if progress.get("status") not in ("in_progress", "complete"):
         raise ValueError("calibration progress has an invalid status")
     for field in ("next_index", "structures"):
@@ -243,8 +256,13 @@ def _validate_progress(progress: Mapping[str, Any]) -> None:
             raise ValueError("calibration progress has invalid targets")
         for target in _TARGETS:
             accumulator = targets[target]
-            if not isinstance(accumulator, Mapping):
-                raise ValueError("calibration progress accumulator must be a mapping")
+            if not isinstance(accumulator, Mapping) or set(accumulator) != {
+                "sum",
+                "rows",
+            }:
+                raise ValueError(
+                    "calibration progress accumulator schema mismatch"
+                )
             total = accumulator.get("sum")
             rows = accumulator.get("rows")
             if (
@@ -491,9 +509,12 @@ def _validate_record_keys(records: Any) -> None:
     if not isinstance(records, list) or len(records) != 6:
         raise ValueError("complete calibration artifact records must contain six rows")
     keys: list[tuple[Any, Any]] = []
+    expected_fields = set(CalibrationRecord.__dataclass_fields__)
     for record in records:
-        if not isinstance(record, Mapping):
-            raise ValueError("complete calibration artifact record must be a mapping")
+        if not isinstance(record, Mapping) or set(record) != expected_fields:
+            raise ValueError(
+                "complete calibration artifact record schema mismatch"
+            )
         key = (record.get("variant"), record.get("target"))
         keys.append(key)
         rows = record.get("rows")
@@ -508,6 +529,26 @@ def _validate_record_keys(records: Any) -> None:
                 or float(value) < 0.0
             ):
                 raise ValueError(f"complete calibration record {field} is invalid")
+        if record["zero_q_policy"] != ZERO_Q_POLICY:
+            raise ValueError("complete calibration record policy is invalid")
+        for field in _empty_counts():
+            value = record[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"complete calibration record {field} is invalid"
+                )
+        audit_sha256 = record["force_exclusions_sha256"]
+        if (
+            not isinstance(audit_sha256, str)
+            or len(audit_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in audit_sha256
+            )
+        ):
+            raise ValueError(
+                "complete calibration record force exclusion SHA is invalid"
+            )
     expected = {(variant, target) for variant in _VARIANTS for target in _TARGETS}
     if len(set(keys)) != 6 or set(keys) != expected:
         raise ValueError("complete calibration record keys must be unique")
@@ -657,11 +698,15 @@ def _validate_complete_artifacts(
         raise ValueError("complete calibration progress count mismatch")
     _validate_complete_row_counts(progress, target_structures)
 
-    expected_records = _records_from_progress(progress, ridges)
+    expected_records = _records_from_progress(progress, ridges, complete_identity)
     expected_rows = [asdict(record) for record in expected_records]
     artifact = load_torch_artifact(artifact_path)
-    if not isinstance(artifact, Mapping):
-        raise ValueError("complete calibration artifact must be a mapping")
+    if not isinstance(artifact, Mapping) or set(artifact) != {
+        "identity",
+        "status",
+        "records",
+    }:
+        raise ValueError("complete calibration artifact schema mismatch")
     require_identity(artifact.get("identity", {}), complete_identity)
     if artifact.get("status") != "complete":
         raise ValueError("complete calibration artifact has an invalid status")
@@ -695,6 +740,18 @@ def _validate_complete_artifacts(
                         mean_residual_squared_over_q=float(
                             row["mean_residual_squared_over_q"]
                         ),
+                        zero_q_policy=row["zero_q_policy"],
+                        energy_structures=int(row["energy_structures"]),
+                        force_used_structures=int(row["force_used_structures"]),
+                        force_excluded_structures=int(
+                            row["force_excluded_structures"]
+                        ),
+                        force_components_total=int(row["force_components_total"]),
+                        force_components_used=int(row["force_components_used"]),
+                        force_components_excluded=int(
+                            row["force_components_excluded"]
+                        ),
+                        force_exclusions_sha256=row["force_exclusions_sha256"],
                     )
                 )
             )
@@ -803,9 +860,12 @@ def _ridge_diagnostics(
 def _records_from_progress(
     progress: Mapping[str, Any],
     ridges: Mapping[str, RidgeRecord],
+    complete_identity: Mapping[str, Any],
 ) -> list[CalibrationRecord]:
     records = []
     accumulators = progress["accumulators"]
+    population = complete_identity["calibration_population"]
+    audit_sha256 = complete_identity["force_exclusions"]["sha256"]
     for variant in _VARIANTS:
         for target in _TARGETS:
             accumulator = accumulators[variant][target]
@@ -822,6 +882,14 @@ def _records_from_progress(
                     alpha=math.sqrt(mean),
                     rows=rows,
                     mean_residual_squared_over_q=mean,
+                    zero_q_policy=ZERO_Q_POLICY,
+                    energy_structures=population["energy_structures"],
+                    force_used_structures=population["force_used_structures"],
+                    force_excluded_structures=population["force_excluded_structures"],
+                    force_components_total=population["force_components_total"],
+                    force_components_used=population["force_components_used"],
+                    force_components_excluded=population["force_components_excluded"],
+                    force_exclusions_sha256=audit_sha256,
                 )
             )
     return records
@@ -1102,7 +1170,7 @@ def run_calibrate(config: LLPRConfig) -> Path:
     complete_identity = _complete_identity(
         identity, progress["counts"], sha256_file(audit_path)
     )
-    records = _records_from_progress(progress, ridges)
+    records = _records_from_progress(progress, ridges, complete_identity)
     artifact = {
         "identity": complete_identity,
         "status": "complete",

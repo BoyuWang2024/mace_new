@@ -12,6 +12,14 @@ from torch import Tensor
 ZERO_Q_POLICY = (
     "exact-zero-force-jacobian-structure-excluded-from-force-alpha-v1"
 )
+CALIBRATION_POPULATION_FIELDS = (
+    "energy_structures",
+    "force_used_structures",
+    "force_excluded_structures",
+    "force_components_total",
+    "force_components_used",
+    "force_components_excluded",
+)
 _VARIANTS = ("he", "hf", "hef")
 
 

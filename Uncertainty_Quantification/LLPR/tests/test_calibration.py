@@ -478,6 +478,14 @@ def test_run_calibrate_writes_exactly_six_shared_ridge_records(
         "alpha",
         "rows",
         "mean_residual_squared_over_q",
+        "zero_q_policy",
+        "energy_structures",
+        "force_used_structures",
+        "force_excluded_structures",
+        "force_components_total",
+        "force_components_used",
+        "force_components_excluded",
+        "force_exclusions_sha256",
     ]
     diagnostics = json.loads(
         (calibration_dir / "ridge_diagnostics.json").read_text(encoding="utf-8")
@@ -611,7 +619,12 @@ def test_run_calibrate_identity_mismatch_is_fail_closed_when_resume_is_false(
 
 @pytest.mark.parametrize(
     "orphan",
-    ("calibrations.pt", "calibrations.csv", "ridge_diagnostics.json"),
+    (
+        "calibrations.pt",
+        "calibrations.csv",
+        "ridge_diagnostics.json",
+        "force_exclusions.json",
+    ),
 )
 def test_run_calibrate_rejects_internal_artifact_without_progress_before_writing(
     tmp_path: Path,
@@ -628,6 +641,7 @@ def test_run_calibrate_rejects_internal_artifact_without_progress_before_writing
         "calibrations.pt",
         "calibrations.csv",
         "ridge_diagnostics.json",
+        "force_exclusions.json",
     ):
         if name != orphan:
             (calibration_dir / name).unlink()
@@ -1033,3 +1047,190 @@ def test_run_calibrate_rejects_duplicate_exclusion_in_resume_progress(
 
     with pytest.raises(ValueError, match="duplicate"):
         run_calibrate(config)
+
+@pytest.mark.parametrize(
+    ("layer", "mutation"),
+    (
+        ("progress", "extra"),
+        ("progress", "missing"),
+        ("accumulator", "extra"),
+        ("accumulator", "missing"),
+        ("artifact", "extra"),
+        ("artifact", "missing"),
+        ("record", "extra"),
+        ("record", "missing"),
+    ),
+)
+def test_complete_cache_rejects_nonexact_torch_schemas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layer: str,
+    mutation: str,
+) -> None:
+    config = _config(tmp_path)
+    calls: list[int] = []
+    _install_fake_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_calibrate(config)
+    progress_path = artifact_path.parent / "progress.pt"
+
+    if layer in ("progress", "accumulator"):
+        document = load_torch_artifact(progress_path)
+        target = (
+            document
+            if layer == "progress"
+            else document["accumulators"]["he"]["energy"]
+        )
+        field = "exclusions" if layer == "progress" else "rows"
+        if mutation == "extra":
+            target["unexpected"] = {"foreign_semantics": True}
+        else:
+            target.pop(field)
+        atomic_torch_save(progress_path, document)
+    else:
+        document = load_torch_artifact(artifact_path)
+        target = document if layer == "artifact" else document["records"][0]
+        field = "records" if layer == "artifact" else "alpha"
+        if mutation == "extra":
+            target["unexpected"] = {"foreign_semantics": True}
+        else:
+            target.pop(field)
+        atomic_torch_save(artifact_path, document)
+
+    with pytest.raises(ValueError, match="schema|calibration progress|record"):
+        run_calibrate(config)
+    assert calls == [0]
+
+
+@pytest.mark.parametrize(
+    ("layer", "mutation"),
+    (
+        ("progress", "extra"),
+        ("progress", "missing"),
+        ("accumulator", "extra"),
+        ("accumulator", "missing"),
+    ),
+)
+def test_resume_rejects_nonexact_progress_schemas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layer: str,
+    mutation: str,
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config, fail=True)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_calibrate(config)
+
+    progress_path = (
+        run_root(config, "a" * 64)
+        / "calibration"
+        / "deterministic"
+        / "progress.pt"
+    )
+    progress = load_torch_artifact(progress_path)
+    target = (
+        progress
+        if layer == "progress"
+        else progress["accumulators"]["he"]["energy"]
+    )
+    field = "exclusions" if layer == "progress" else "rows"
+    if mutation == "extra":
+        target["unexpected"] = 1
+    else:
+        target.pop(field)
+    atomic_torch_save(progress_path, progress)
+    _install_fake_pipeline(monkeypatch, config)
+
+    with pytest.raises(ValueError, match="schema|calibration progress"):
+        run_calibrate(config)
+
+
+def test_new_calibration_rows_bind_policy_population_and_audit_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_zero_q_pipeline(monkeypatch, config)
+    artifact_path = run_calibrate(config)
+    audit_path = artifact_path.parent / "force_exclusions.json"
+    counts = {
+        "energy_structures": 2,
+        "force_used_structures": 1,
+        "force_excluded_structures": 1,
+        "force_components_total": 5,
+        "force_components_used": 2,
+        "force_components_excluded": 3,
+    }
+    expected_bindings = {
+        "zero_q_policy": ZERO_Q_POLICY,
+        **counts,
+        "force_exclusions_sha256": sha256_file(audit_path),
+    }
+
+    with (artifact_path.parent / "calibrations.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        csv_rows = list(csv.DictReader(handle))
+    pt_rows = load_torch_artifact(artifact_path)["records"]
+
+    assert len(csv_rows) == len(pt_rows) == 6
+    for csv_row, pt_row in zip(csv_rows, pt_rows):
+        assert {
+            field: (
+                int(csv_row[field]) if field in counts else csv_row[field]
+            )
+            for field in expected_bindings
+        } == expected_bindings
+        assert {
+            field: pt_row[field] for field in expected_bindings
+        } == expected_bindings
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "zero_q_policy",
+        "energy_structures",
+        "force_used_structures",
+        "force_excluded_structures",
+        "force_components_total",
+        "force_components_used",
+        "force_components_excluded",
+        "force_exclusions_sha256",
+    ),
+)
+@pytest.mark.parametrize("mutation", ("missing", "changed"))
+def test_complete_cache_rejects_calibration_csv_binding_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    mutation: str,
+) -> None:
+    config = _config(tmp_path)
+    calls: list[int] = []
+    _install_zero_q_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_calibrate(config)
+    csv_path = artifact_path.parent / "calibrations.csv"
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or ())
+        rows = list(reader)
+    assert field in fieldnames
+
+    if mutation == "missing":
+        fieldnames.remove(field)
+        for row in rows:
+            row.pop(field)
+    else:
+        rows[0][field] = (
+            "wrong"
+            if field in ("zero_q_policy", "force_exclusions_sha256")
+            else str(int(rows[0][field]) + 1)
+        )
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with pytest.raises(ValueError, match="CSV|record|identity|binding"):
+        run_calibrate(config)
+    assert calls == [0, 1]
