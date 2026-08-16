@@ -25,6 +25,7 @@ from .artifacts import (
 from .calibration import CholeskyQuadraticForm
 from .calibration_policy import (
     ZERO_Q_POLICY,
+    CALIBRATION_POPULATION_FIELDS,
     classify_force_calibration_structure,
 )
 from .checkpoint import CheckpointIdentity, load_checkpoint
@@ -262,6 +263,56 @@ def _load_calibrations(
         raise ValueError(
             "calibration consumer limits do not match evaluation configuration"
         )
+    modern_fields = {
+        "zero_q_policy",
+        "calibration_population",
+        "force_exclusions",
+    }
+    present_modern_fields = modern_fields & set(identity)
+    is_policy_bound = bool(present_modern_fields)
+    population: Mapping[str, Any] | None = None
+    audit_sha256: str | None = None
+    if is_policy_bound:
+        if present_modern_fields != modern_fields:
+            raise ValueError("calibration zero-q provenance is incomplete")
+        if identity["zero_q_policy"] != ZERO_Q_POLICY:
+            raise ValueError("calibration zero-q policy mismatch")
+        population = identity["calibration_population"]
+        if (
+            not isinstance(population, Mapping)
+            or set(population) != set(CALIBRATION_POPULATION_FIELDS)
+        ):
+            raise ValueError("calibration population schema mismatch")
+        for field in CALIBRATION_POPULATION_FIELDS:
+            value = population[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("calibration population count is invalid")
+        if (
+            population["force_used_structures"]
+            + population["force_excluded_structures"]
+            != population["energy_structures"]
+            or population["force_components_used"]
+            + population["force_components_excluded"]
+            != population["force_components_total"]
+        ):
+            raise ValueError("calibration population arithmetic mismatch")
+        audit = identity["force_exclusions"]
+        if (
+            not isinstance(audit, Mapping)
+            or set(audit) != {"path", "sha256"}
+            or audit.get("path") != "force_exclusions.json"
+        ):
+            raise ValueError("calibration force exclusion audit identity is invalid")
+        audit_sha256 = audit.get("sha256")
+        if (
+            not isinstance(audit_sha256, str)
+            or len(audit_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in audit_sha256)
+        ):
+            raise ValueError("calibration force exclusion audit SHA is invalid")
+        audit_path = path.parent / "force_exclusions.json"
+        if not audit_path.is_file() or sha256_file(audit_path) != audit_sha256:
+            raise ValueError("calibration force exclusion audit SHA mismatch")
 
     records = artifact.get("records")
     if not isinstance(records, list) or len(records) != 6:
@@ -270,6 +321,27 @@ def _load_calibrations(
     for source in records:
         if not isinstance(source, Mapping):
             raise ValueError("calibration record must be a mapping")
+        if is_policy_bound:
+            expected_record_fields = {
+                "variant",
+                "target",
+                "ridge_mode",
+                "ridge",
+                "alpha",
+                "rows",
+                "mean_residual_squared_over_q",
+                "zero_q_policy",
+                *CALIBRATION_POPULATION_FIELDS,
+                "force_exclusions_sha256",
+            }
+            if set(source) != expected_record_fields:
+                raise ValueError("calibration zero-q record schema mismatch")
+            if (
+                source["zero_q_policy"] != ZERO_Q_POLICY
+                or source["force_exclusions_sha256"] != audit_sha256
+                or any(source[field] != population[field] for field in CALIBRATION_POPULATION_FIELDS)
+            ):
+                raise ValueError("calibration zero-q record provenance mismatch")
         variant = source.get("variant")
         target = source.get("target")
         if variant not in _VARIANTS or target not in ("energy", "forces"):
@@ -306,6 +378,15 @@ def _load_calibrations(
             forces["ridge"],
         ):
             raise ValueError(f"calibration {variant} must share one ridge")
+    if is_policy_bound:
+        for variant in _VARIANTS:
+            if (
+                by_variant[variant]["energy"]["rows"]
+                != population["energy_structures"]
+                or by_variant[variant]["forces"]["rows"]
+                != population["force_components_used"]
+            ):
+                raise ValueError("calibration zero-q record rows mismatch")
     return identity, by_variant
 
 
@@ -450,7 +531,12 @@ def _validate_progress(progress: Mapping[str, Any], target_structures: int) -> N
         "zero_q_nonzero_residual_rows",
     }
     fields = set(progress)
-    if fields not in (base_fields, base_fields | zero_fields):
+    policy_bound = isinstance(progress.get("identity"), Mapping) and "zero_q" in progress["identity"]
+    if (
+        fields != base_fields | zero_fields
+        if policy_bound
+        else fields not in (base_fields, base_fields | zero_fields)
+    ):
         raise ValueError("evaluation progress schema mismatch")
     if fields == base_fields | zero_fields:
         for field in zero_fields:
@@ -663,11 +749,15 @@ def _validated_force_q_by_variant(
     g_forces: Tensor,
     indices: Tensor,
     q_by_variant: Mapping[str, Tensor],
+    *,
+    allow_zero_q: bool,
 ) -> tuple[dict[str, Tensor], Any]:
     """Apply the audited force zero-q policy before any CSV mutation."""
     decision = classify_force_calibration_structure(
         g_forces, q_by_variant, indices
     )
+    if decision.zero_rows and not allow_zero_q:
+        raise ValueError("force zero q requires a policy-bound calibration")
     validated: dict[str, Tensor] = {}
     for variant in _VARIANTS:
         values = q_by_variant[variant].detach().to(
@@ -685,6 +775,8 @@ def _append_structure(
     jacobians: Any,
     solvers: Mapping[str, CholeskyQuadraticForm],
     calibrations: Mapping[str, Mapping[str, Any]],
+    *,
+    allow_zero_q: bool,
 ) -> dict[str, int]:
     energy_reference = float(sample.reference_energy_per_atom.detach().cpu())
     energy_prediction = float(jacobians.energy_per_atom)
@@ -718,15 +810,20 @@ def _append_structure(
         for variant in _VARIANTS
     }
     force_q_by_variant, zero_decision = _validated_force_q_by_variant(
-        jacobians.g_forces, indices, raw_force_q
+        jacobians.g_forces, indices, raw_force_q, allow_zero_q=allow_zero_q
     )
 
-    for variant in _VARIANTS:
-        energy_q = validate_q(
+    energy_q_by_variant = {
+        variant: validate_q(
             solvers[variant].q(jacobians.g_energy.reshape(1, -1)),
             structure_index=sample.index,
             target="energy",
         )[0]
+        for variant in _VARIANTS
+    }
+    for variant in _VARIANTS:
+
+        energy_q = energy_q_by_variant[variant]
         force_q = force_q_by_variant[variant]
         energy_alpha = float(calibrations[variant]["energy"]["alpha"])
         force_alpha = float(calibrations[variant]["forces"]["alpha"])
@@ -961,6 +1058,43 @@ def _validate_complete_outputs(
             force_zero_baseline = force_zero_keys
         elif force_zero_keys != force_zero_baseline:
             raise ValueError("force zero-q rows must match across variants")
+    if isinstance(progress.get("identity"), Mapping) and "zero_q" in progress["identity"]:
+        canonical_force_rows = csv_rows[("he", "force_components.csv")]
+        zero_rows = [
+            row for row in canonical_force_rows if float(row["q"]) == 0.0
+        ]
+        expected_zero_counts = {
+            "zero_q_rows": len(zero_rows),
+            "zero_q_zero_residual_rows": sum(
+                float(row["residual"]) == 0.0 for row in zero_rows
+            ),
+        }
+        expected_zero_counts["zero_q_nonzero_residual_rows"] = (
+            expected_zero_counts["zero_q_rows"]
+            - expected_zero_counts["zero_q_zero_residual_rows"]
+        )
+        if any(progress[field] != value for field, value in expected_zero_counts.items()):
+            raise ValueError("evaluation progress zero-q counters mismatch")
+        for variant in _VARIANTS:
+            force_summary = summaries[variant].get("forces")
+            if not isinstance(force_summary, Mapping) or any(
+                force_summary.get(field) != value
+                for field, value in expected_zero_counts.items()
+            ):
+                raise ValueError("evaluation summary zero-q counters mismatch")
+    for variant in _VARIANTS:
+        summary = summaries[variant]
+        expected_summary = summarize_variant(
+            evaluation_dir / variant,
+            variant=variant,
+            ridge_mode=summary["ridge"]["mode"],
+            ridge=float(summary["ridge"]["value"]),
+            energy_alpha=float(summary["alpha"]["energy"]),
+            force_alpha=float(summary["alpha"]["forces"]),
+            cholesky_diagnostics=summary["cholesky_diagnostics"],
+        )
+        if summary != expected_summary:
+            raise ValueError("complete evaluation summary does not match canonical CSV")
 
 
 def run_evaluate(config: LLPRConfig) -> Path:
@@ -1104,6 +1238,7 @@ def run_evaluate(config: LLPRConfig) -> Path:
                     jacobians,
                     solvers,
                     calibrations,
+                    allow_zero_q="zero_q" in identity,
                 )
                 offsets = {key: writer.flush() for key, writer in writers.items()}
                 progress["csv_offsets"] = offsets

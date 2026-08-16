@@ -576,6 +576,18 @@ def test_run_evaluate_preserves_legal_zero_q_force_rows(
     config = _config(tmp_path)
     _install_fake_pipeline(monkeypatch, config)
     compute = inference.compute_structure_jacobians
+    evaluation_identity = inference._evaluation_identity
+
+    def policy_bound_identity(*args: object, **kwargs: object) -> dict[str, object]:
+        result = evaluation_identity(*args, **kwargs)
+        result["zero_q"] = {
+            "policy": "test-policy",
+            "calibration_population": {},
+            "force_exclusions_sha256": "0" * 64,
+        }
+        return result
+
+    monkeypatch.setattr(inference, "_evaluation_identity", policy_bound_identity)
 
     def legal_zero_first_force_row(**kwargs: object) -> StructureJacobians:
         result = compute(**kwargs)
@@ -639,6 +651,7 @@ def test_force_q_policy_rejects_illegal_zero_cases() -> None:
                 gradients,
                 torch.tensor([0]),
                 q_by_variant,
+                allow_zero_q=True,
             )
 
 
