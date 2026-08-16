@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import io
 import json
 import math
 import os
+import stat
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Mapping, Sequence
 
+import torch
+
 from .artifacts import (
     FORMULA_VERSION,
     SCHEMA_VERSION,
-    load_torch_artifact,
     sha256_file,
     stable_id,
 )
@@ -99,6 +103,13 @@ _ZERO_Q_SUMMARY_FIELDS = {
     "zero_q_rows",
     "zero_q_zero_residual_rows",
     "zero_q_nonzero_residual_rows",
+}
+_PROGRESS_BASE_FIELDS = {
+    "identity",
+    "status",
+    "next_index",
+    "structures",
+    "csv_offsets",
 }
 _DISTRIBUTION_FIELDS = {"rows", "mean", "std", "min", "max"}
 _CHOLESKY_FIELDS = {
@@ -523,6 +534,7 @@ def _validate_summary(
         "force_structures": len(energy_rows),
     }
     _require_equivalent(document["counts"], expected_counts, f"{source}.counts")
+    force_zero_q_counts: dict[str, int] | None = None
     for target, rows in (("energy", energy_rows), ("forces", force_rows)):
         target_fields = (
             set(document[target]) if isinstance(document[target], Mapping) else set()
@@ -540,11 +552,19 @@ def _validate_summary(
                 document[target], _TARGET_SUMMARY_FIELDS, f"{source}.{target}"
             )
             raise AssertionError("unreachable")
+        expected_target = _target_summary(
+            rows, include_zero_q_counts=include_zero_q_counts
+        )
         _require_equivalent(
             document[target],
-            _target_summary(rows, include_zero_q_counts=include_zero_q_counts),
+            expected_target,
             f"{source}.{target}",
         )
+        if target == "forces" and include_zero_q_counts:
+            force_zero_q_counts = {
+                field: int(expected_target[field])
+                for field in _ZERO_Q_SUMMARY_FIELDS
+            }
     _require_equivalent(
         document["force_structure"],
         force_structure_summary,
@@ -566,6 +586,7 @@ def _validate_summary(
     return {
         "alpha": {target: float(value) for target, value in alpha.items()},
         "ridge": {"mode": ridge["mode"], "value": float(ridge["value"])},
+        "force_zero_q_counts": force_zero_q_counts,
     }
 
 
@@ -1145,13 +1166,101 @@ def _validate_calibration_records(
     return variants
 
 
+def _regular_file_snapshot(path: Path, source: str) -> bytes:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    non_blocking = getattr(os, "O_NONBLOCK", None)
+    if no_follow is None or non_blocking is None:
+        raise ValueError(f"{source} requires safe nonblocking no-follow open")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow | non_blocking)
+    except OSError as error:
+        raise ValueError(f"{source} is unavailable") from error
+    try:
+        handle = os.fdopen(descriptor, "rb")
+    except OSError as error:
+        os.close(descriptor)
+        raise ValueError(f"{source} is invalid") from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+    try:
+        with handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"{source} must be regular")
+            return handle.read()
+    except OSError as error:
+        raise ValueError(f"{source} is invalid") from error
+
+
+def _load_progress_snapshot(path: Path) -> tuple[Any, str]:
+    payload = _regular_file_snapshot(path, "trusted evaluation progress")
+    try:
+        progress = torch.load(
+            io.BytesIO(payload), map_location="cpu", weights_only=True
+        )
+    except TypeError:
+        progress = torch.load(io.BytesIO(payload), map_location="cpu")
+    return progress, hashlib.sha256(payload).hexdigest()
+
+
+def _validate_complete_progress(
+    progress: Mapping[str, Any], *, policy_bound: bool
+) -> Mapping[str, int] | None:
+    fields = set(progress)
+    modern_fields = _PROGRESS_BASE_FIELDS | _ZERO_Q_SUMMARY_FIELDS
+    valid_schemas = (modern_fields,) if policy_bound else (
+        _PROGRESS_BASE_FIELDS,
+        modern_fields,
+    )
+    if fields not in valid_schemas:
+        raise ValueError("trusted evaluation progress schema mismatch")
+    for field in ("next_index", "structures"):
+        value = progress[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"trusted evaluation progress {field} is invalid")
+    if progress["next_index"] != progress["structures"]:
+        raise ValueError("trusted evaluation progress structure counters mismatch")
+    offsets = progress["csv_offsets"]
+    expected_offsets = {
+        f"{variant}/{filename}"
+        for variant in _VARIANTS
+        for filename in (
+            "energy.csv",
+            "force_components.csv",
+            "force_structure.csv",
+        )
+    }
+    if not isinstance(offsets, Mapping) or set(offsets) != expected_offsets:
+        raise ValueError("trusted evaluation progress CSV offsets schema mismatch")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in offsets.values()
+    ):
+        raise ValueError("trusted evaluation progress CSV offset is invalid")
+    if not _ZERO_Q_SUMMARY_FIELDS.issubset(progress):
+        return None
+    counts: dict[str, int] = {}
+    for field in _ZERO_Q_SUMMARY_FIELDS:
+        value = progress[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("trusted evaluation progress zero-q counter is invalid")
+        counts[field] = value
+    if counts["zero_q_rows"] != (
+        counts["zero_q_zero_residual_rows"]
+        + counts["zero_q_nonzero_residual_rows"]
+    ):
+        raise ValueError("trusted evaluation progress zero-q counter mismatch")
+    return counts
+
+
 def _trusted_progress_identity(
     root: Path, explicit_identity: Mapping[str, Any] | None
-) -> Mapping[str, Any]:
+) -> tuple[Mapping[str, Any], Mapping[str, int] | None, str]:
     progress_path = root / "progress.pt"
     if not progress_path.is_file():
         raise ValueError("trusted evaluation progress identity is missing")
-    progress = load_torch_artifact(progress_path)
+    progress, progress_sha256 = _load_progress_snapshot(progress_path)
     if not isinstance(progress, Mapping) or progress.get("status") != "complete":
         raise ValueError("trusted evaluation progress identity requires complete progress")
     identity = progress.get("identity")
@@ -1161,6 +1270,9 @@ def _trusted_progress_identity(
         explicit_identity
     ):
         raise ValueError("trusted evaluation progress identity mismatch")
+    progress_zero_q_counts = _validate_complete_progress(
+        progress, policy_bound="zero_q" in identity
+    )
 
     required = {
         "schema_version",
@@ -1297,7 +1409,7 @@ def _trusted_progress_identity(
         raise ValueError("trusted evaluation progress identity ridge mismatch")
     if float(calibration_identity["min_q"]) != min_q:
         raise ValueError("trusted evaluation progress identity min_q mismatch")
-    return identity
+    return identity, progress_zero_q_counts, progress_sha256
 
 
 def _validate_summary_calibration_contract(
@@ -1326,8 +1438,15 @@ def _validate_summary_calibration_contract(
 
 def _publication_identities(
     root: Path, explicit_identity: Mapping[str, Any] | None
-) -> tuple[dict[str, Any], Mapping[str, Any]]:
-    source = _trusted_progress_identity(root, explicit_identity)
+) -> tuple[
+    dict[str, Any],
+    Mapping[str, Any],
+    Mapping[str, int] | None,
+    str,
+]:
+    source, progress_zero_q_counts, progress_sha256 = (
+        _trusted_progress_identity(root, explicit_identity)
+    )
 
     existing_path = root / "manifest.json"
     existing: Mapping[str, Any] | None = None
@@ -1343,23 +1462,12 @@ def _publication_identities(
             raise ValueError("manifest schema or formula identity mismatch")
         existing = value["identities"]
 
-    if source is None:
-        return (
-            dict(existing)
-            if existing is not None
-            else {
-                "checkpoint": None,
-                "data": None,
-                "readout": None,
-                "config": None,
-            }
-        )
     normalized = _normalise_identities(source)
     if existing is not None and _strict_json_bytes(existing) != _strict_json_bytes(
         normalized
     ):
         raise ValueError("manifest identity mismatch")
-    return normalized, source
+    return normalized, source, progress_zero_q_counts, progress_sha256
 
 
 def _references_aligned(
@@ -1444,7 +1552,12 @@ def validate_publication_root(
     root = Path(publication_root)
     if not root.is_dir():
         raise ValueError(f"publication root is not a directory: {root}")
-    identities, trusted_identity = _publication_identities(root, identity)
+    (
+        identities,
+        trusted_identity,
+        progress_zero_q_counts,
+        progress_sha256,
+    ) = _publication_identities(root, identity)
     calibration_records = trusted_identity["calibration"]["records"]
     policy_bound = "zero_q" in trusted_identity
     consumer_limits = trusted_identity.get("consumer_limits") or {}
@@ -1460,6 +1573,7 @@ def validate_publication_root(
     energy_baseline: list[tuple[str, int, float, float, float]] | None = None
     force_baseline: list[tuple[str, int, int, int, float, float, float]] | None = None
     zero_q_baseline: tuple[tuple[str, str, str, str], ...] | None = None
+    summary_zero_q_counts: dict[str, Mapping[str, int] | None] = {}
     for variant in _VARIANTS:
         energy, energy_residuals, energy_std = _validate_energy(root, variant)
         forces, force_residuals, force_std, force_rows = _validate_forces(
@@ -1472,6 +1586,7 @@ def validate_publication_root(
         summary = _validate_summary(
             root, policy_bound, variant, energy_rows, force_rows, force_structure
         )
+        summary_zero_q_counts[variant] = summary["force_zero_q_counts"]
         _validate_summary_calibration_contract(
             variant, summary, calibration_records
         )
@@ -1511,7 +1626,17 @@ def validate_publication_root(
             "forces": _quality_diagnostics(force_residuals, force_std),
         }
 
+    if policy_bound and any(
+        summary_zero_q_counts[variant] != progress_zero_q_counts
+        for variant in _VARIANTS
+    ):
+        raise ValueError("trusted evaluation progress zero-q counters mismatch")
     file_hashes = _canonical_file_hashes(root)
+    current_progress_sha256 = hashlib.sha256(
+        _regular_file_snapshot(root / "progress.pt", "trusted evaluation progress")
+    ).hexdigest()
+    if current_progress_sha256 != progress_sha256:
+        raise ValueError("trusted evaluation progress changed during validation")
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,

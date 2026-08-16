@@ -2427,6 +2427,22 @@ def _refresh_force_aggregates_and_summary(root: Path, variant: str) -> None:
             cholesky_diagnostics=previous["cholesky_diagnostics"],
         ),
     )
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    if "zero_q" in progress["identity"]:
+        canonical_forces = pd.read_csv(root / "he" / "force_components.csv")
+        zero_rows = canonical_forces[canonical_forces["q"] == 0.0]
+        zero_residual_rows = int((zero_rows["residual"] == 0.0).sum())
+        progress.update(
+            {
+                "zero_q_rows": len(zero_rows),
+                "zero_q_zero_residual_rows": zero_residual_rows,
+                "zero_q_nonzero_residual_rows": (
+                    len(zero_rows) - zero_residual_rows
+                ),
+            }
+        )
+        atomic_torch_save(progress_path, progress)
 
 
 def test_validation_accepts_policy_bound_publication_without_deleted_sources(
@@ -2442,6 +2458,100 @@ def test_validation_accepts_policy_bound_publication_without_deleted_sources(
         (calibration_dir / name).unlink()
 
     assert validate_publication_root(root)["status"] == "valid"
+
+
+def test_standalone_validation_rejects_coherent_false_progress_zero_q_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    progress.update(
+        {
+            "zero_q_rows": 999,
+            "zero_q_zero_residual_rows": 499,
+            "zero_q_nonzero_residual_rows": 500,
+        }
+    )
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match="progress zero-q counters mismatch"):
+        validate_publication_root(root)
+
+
+def test_standalone_validation_rejects_progress_change_during_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    progress_path = root / "progress.pt"
+    read_csv = validation._read_csv
+    replaced = False
+
+    def replace_progress_after_first_csv_read(*args: object, **kwargs: object):
+        nonlocal replaced
+        rows = read_csv(*args, **kwargs)
+        if not replaced:
+            progress = load_torch_artifact(progress_path)
+            progress.update(
+                {
+                    "zero_q_rows": 999,
+                    "zero_q_zero_residual_rows": 499,
+                    "zero_q_nonzero_residual_rows": 500,
+                }
+            )
+            atomic_torch_save(progress_path, progress)
+            replaced = True
+        return rows
+
+    monkeypatch.setattr(
+        validation, "_read_csv", replace_progress_after_first_csv_read
+    )
+
+    with pytest.raises(ValueError, match="progress changed during validation"):
+        validate_publication_root(root)
+
+
+@pytest.mark.parametrize("case", ("missing", "extra", "bool", "negative", "sum"))
+def test_standalone_validation_rejects_invalid_policy_progress_schema_or_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    if case == "missing":
+        del progress["zero_q_rows"]
+    elif case == "extra":
+        progress["unexpected"] = "field"
+    elif case == "bool":
+        progress["zero_q_rows"] = True
+    elif case == "negative":
+        progress["zero_q_nonzero_residual_rows"] = -1
+    else:
+        progress["zero_q_rows"] += 1
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match="progress (schema|zero-q)"):
+        validate_publication_root(root)
+
+
+def test_standalone_validation_accepts_legacy_progress_without_zero_q_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    for field in (
+        "zero_q_rows",
+        "zero_q_zero_residual_rows",
+        "zero_q_nonzero_residual_rows",
+    ):
+        del progress[field]
+    atomic_torch_save(progress_path, progress)
+
+    assert validate_publication_root(root)["status"] == "valid"
+
 
 
 @pytest.mark.parametrize(
