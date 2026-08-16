@@ -24,7 +24,11 @@ from .artifacts import (
     require_identity,
     sha256_file,
 )
-from .calibration import CholeskyQuadraticForm, _validate_exclusion_entry
+from .calibration import (
+    CholeskyQuadraticForm,
+    _validate_exclusion_entry,
+    _validate_ridge_diagnostics,
+)
 from .calibration_policy import (
     ZERO_Q_POLICY,
     CALIBRATION_POPULATION_FIELDS,
@@ -37,6 +41,7 @@ from .curvature import run_root
 from .data import DatasetHandle, build_dataset, iter_samples
 from .observables import compute_structure_jacobians
 from .readout import ReadoutLayout, discover_readout_layout
+from .ridge import RidgeRecord
 
 
 ENERGY_FIELDS = [
@@ -236,7 +241,15 @@ def _load_secure_json_snapshot(path: Path, source: str) -> tuple[Mapping[str, An
     except OSError as error:
         raise ValueError(f"{source} is unavailable") from error
     try:
-        with os.fdopen(descriptor, "rb") as handle:
+        handle = os.fdopen(descriptor, "rb")
+    except OSError as error:
+        os.close(descriptor)
+        raise ValueError(f"{source} is invalid") from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+    try:
+        with handle:
             metadata = os.fstat(handle.fileno())
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(f"{source} must be regular")
@@ -517,58 +530,16 @@ def _load_cholesky_diagnostics(
     calibrations: Mapping[str, Mapping[str, Mapping[str, Any]]],
 ) -> tuple[dict[str, Mapping[str, Any]], str]:
     document, digest = _load_secure_json_snapshot(path, "calibration ridge diagnostics")
-    if (
-        set(document) != {"identity", "status", "variants"}
-        or document.get("status") != "complete"
-    ):
-        raise ValueError("ridge diagnostics must be a complete mapping")
-    require_identity(document.get("identity", {}), calibration_identity)
-    variants = document.get("variants")
-    if not isinstance(variants, Mapping) or set(variants) != set(_VARIANTS):
-        raise ValueError("ridge diagnostics must contain he, hf, and hef")
-    fields = {
-        "ridge_mode",
-        "ridge",
-        "eigenvalue_min",
-        "eigenvalue_max",
-        "regularized_condition_number",
+    ridges = {
+        variant: RidgeRecord(
+            mode=calibrations[variant]["energy"]["ridge_mode"],
+            value=float(calibrations[variant]["energy"]["ridge"]),
+        )
+        for variant in _VARIANTS
     }
-    result: dict[str, Mapping[str, Any]] = {}
-    for variant in _VARIANTS:
-        value = variants[variant]
-        if not isinstance(value, Mapping) or set(value) != fields:
-            raise ValueError("ridge diagnostics variant schema mismatch")
-        energy = calibrations[variant]["energy"]
-        if value["ridge_mode"] != energy["ridge_mode"]:
-            raise ValueError("ridge diagnostics ridge mode mismatch")
-        for field in ("ridge", "eigenvalue_min", "eigenvalue_max"):
-            number = value[field]
-            if (
-                isinstance(number, bool)
-                or not isinstance(number, (int, float))
-                or not math.isfinite(float(number))
-            ):
-                raise ValueError(f"ridge diagnostics {field} is invalid")
-        if (
-            float(value["ridge"]) < 0.0
-            or float(value["eigenvalue_max"]) < float(value["eigenvalue_min"])
-            or not math.isclose(
-                float(value["ridge"]),
-                float(energy["ridge"]),
-                rel_tol=1.0e-12,
-                abs_tol=1.0e-15,
-            )
-        ):
-            raise ValueError("ridge diagnostics values mismatch")
-        condition = value["regularized_condition_number"]
-        if condition is not None and (
-            isinstance(condition, bool)
-            or not isinstance(condition, (int, float))
-            or not math.isfinite(float(condition))
-            or float(condition) < 0.0
-        ):
-            raise ValueError("ridge diagnostics condition is invalid")
-        result[variant] = dict(value)
+    _validate_ridge_diagnostics(document, calibration_identity, ridges, {})
+    variants = document["variants"]
+    result = {variant: dict(variants[variant]) for variant in _VARIANTS}
     return result, digest
 
 

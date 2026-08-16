@@ -271,7 +271,11 @@ def _write_upstream_artifacts(config: LLPRConfig, layout: ReadoutLayout) -> None
                     "ridge": 1.0,
                     "eigenvalue_min": float(index + 1),
                     "eigenvalue_max": float(index + 3),
-                    "regularized_condition_number": float(index + 2),
+                    "regularized_condition_number": (
+                        2.0,
+                        1.6666666666666667,
+                        1.5,
+                    )[index],
                 }
                 for index, variant in enumerate(_VARIANTS)
             },
@@ -1137,6 +1141,146 @@ def test_secure_json_snapshot_rejects_fifo_directory_and_symlink_bounded(
         check=False,
     )
     assert completed.returncode == 0
+
+
+def test_secure_json_snapshot_directory_rejection_does_not_leak_descriptors(
+    tmp_path: Path,
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr.inference import (
+        _load_secure_json_snapshot,
+    )
+
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(64):
+        with pytest.raises(ValueError, match="test snapshot"):
+            _load_secure_json_snapshot(directory, "test snapshot")
+    after = len(os.listdir("/proc/self/fd"))
+
+    assert after == before
+
+
+def test_secure_json_snapshot_fdopen_failure_does_not_leak_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr.inference import (
+        _load_secure_json_snapshot,
+    )
+
+    path = tmp_path / "snapshot.json"
+    path.write_text("{}", encoding="utf-8")
+
+    def fail_fdopen(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise OSError("injected fdopen construction failure")
+
+    monkeypatch.setattr(os, "fdopen", fail_fdopen)
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(64):
+        with pytest.raises(ValueError, match="test snapshot is invalid"):
+            _load_secure_json_snapshot(path, "test snapshot")
+    after = len(os.listdir("/proc/self/fd"))
+
+    assert after == before
+
+
+def test_secure_json_snapshot_parses_bytes_from_the_opened_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr.inference import (
+        _load_secure_json_snapshot,
+    )
+
+    path = tmp_path / "snapshot.json"
+    replacement = tmp_path / "replacement.json"
+    path.write_text('{"value":"opened"}', encoding="utf-8")
+    replacement.write_text('{"value":"replacement"}', encoding="utf-8")
+    expected_digest = sha256_file(path)
+    original_fdopen = os.fdopen
+
+    def replace_path_after_open(
+        descriptor: int, *args: object, **kwargs: object
+    ) -> object:
+        handle = original_fdopen(descriptor, *args, **kwargs)
+        replacement.replace(path)
+        return handle
+
+    monkeypatch.setattr(os, "fdopen", replace_path_after_open)
+
+    document, digest = _load_secure_json_snapshot(path, "test snapshot")
+
+    assert document == {"value": "opened"}
+    assert digest == expected_digest
+    assert json.loads(path.read_text(encoding="utf-8")) == {"value": "replacement"}
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum", "condition"),
+    (
+        (1.0, 3.0, None),
+        (1.0, 3.0, 999.0),
+        (-1.0, 3.0, 2.0),
+    ),
+)
+def test_run_evaluate_rejects_noncanonical_diagnostics_condition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minimum: float,
+    maximum: float,
+    condition: float | None,
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    diagnostics_path = (
+        run_root(config, "a" * 64)
+        / "calibration"
+        / "deterministic"
+        / "ridge_diagnostics.json"
+    )
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    diagnostics["variants"]["he"].update(
+        eigenvalue_min=minimum,
+        eigenvalue_max=maximum,
+        regularized_condition_number=condition,
+    )
+    atomic_json_dump(diagnostics_path, diagnostics)
+
+    with pytest.raises(ValueError, match="diagnostics"):
+        run_evaluate(config)
+
+
+@pytest.mark.parametrize(
+    ("minimum", "maximum", "condition"),
+    (
+        (1.0, 3.0, 2.000000000000001),
+        (-1.0, 3.0, None),
+    ),
+)
+def test_run_evaluate_accepts_canonical_diagnostics_condition_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    minimum: float,
+    maximum: float,
+    condition: float | None,
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    diagnostics_path = (
+        run_root(config, "a" * 64)
+        / "calibration"
+        / "deterministic"
+        / "ridge_diagnostics.json"
+    )
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    diagnostics["variants"]["he"].update(
+        eigenvalue_min=minimum,
+        eigenvalue_max=maximum,
+        regularized_condition_number=condition,
+    )
+    atomic_json_dump(diagnostics_path, diagnostics)
+
+    assert run_evaluate(config).is_dir()
 
 
 def test_diagnostics_snapshot_rejects_a_sha_b_parse_attack(
