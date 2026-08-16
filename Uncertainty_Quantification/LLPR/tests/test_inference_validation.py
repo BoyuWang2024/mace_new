@@ -803,6 +803,21 @@ def test_run_evaluate_restores_all_csvs_to_committed_offsets(
     assert completed["next_index"] == 2
 
 
+def test_complete_cache_rejects_force_structure_aggregate_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    path = evaluation_dir / "he" / "force_structure.csv"
+    frame = pd.read_csv(path)
+    frame.loc[0, "mean_q"] = 999.0
+    _replace_committed_csv(evaluation_dir, "he/force_structure.csv", frame)
+
+    with pytest.raises(ValueError, match="force-structure mean_q"):
+        run_evaluate(config)
+
+
 def test_run_evaluate_rejects_resume_identity_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

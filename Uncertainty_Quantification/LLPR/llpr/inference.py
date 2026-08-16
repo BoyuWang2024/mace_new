@@ -22,7 +22,7 @@ from .artifacts import (
     require_identity,
     sha256_file,
 )
-from .calibration import CholeskyQuadraticForm
+from .calibration import CholeskyQuadraticForm, _validate_exclusion_entry
 from .calibration_policy import (
     ZERO_Q_POLICY,
     CALIBRATION_POPULATION_FIELDS,
@@ -313,6 +313,46 @@ def _load_calibrations(
         audit_path = path.parent / "force_exclusions.json"
         if not audit_path.is_file() or sha256_file(audit_path) != audit_sha256:
             raise ValueError("calibration force exclusion audit SHA mismatch")
+        try:
+            audit_document = json.loads(audit_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ValueError("calibration force exclusion audit is invalid") from error
+        audit_fields = {
+            "schema_version",
+            "zero_q_policy",
+            "identity",
+            "status",
+            "counts",
+            "exclusions",
+        }
+        base_identity = dict(identity)
+        base_identity.pop("calibration_population")
+        base_identity.pop("force_exclusions")
+        if (
+            not isinstance(audit_document, Mapping)
+            or set(audit_document) != audit_fields
+            or audit_document["zero_q_policy"] != ZERO_Q_POLICY
+            or audit_document["status"] != "complete"
+            or audit_document["identity"] != base_identity
+            or audit_document["counts"] != dict(population)
+            or not isinstance(audit_document["exclusions"], list)
+        ):
+            raise ValueError("calibration force exclusion audit provenance mismatch")
+        audit_indices: list[int] = []
+        excluded_components = 0
+        for entry in audit_document["exclusions"]:
+            index, components = _validate_exclusion_entry(
+                entry, next_index=population["energy_structures"]
+            )
+            audit_indices.append(index)
+            excluded_components += components
+        if (
+            audit_indices != sorted(audit_indices)
+            or len(set(audit_indices)) != len(audit_indices)
+            or len(audit_indices) != population["force_excluded_structures"]
+            or excluded_components != population["force_components_excluded"]
+        ):
+            raise ValueError("calibration force exclusion audit counts mismatch")
 
     records = artifact.get("records")
     if not isinstance(records, list) or len(records) != 6:
@@ -994,6 +1034,41 @@ def _validate_complete_outputs(
         for index, row in enumerate(structure_rows):
             source = f"{variant}/force_structure.csv"
             num_atoms = _csv_integer(row, "num_atoms", source)
+        component_offset = 0
+        for structure_row, component_count in zip(
+            structure_rows, expected_component_counts
+        ):
+            component_rows = force_rows[
+                component_offset : component_offset + component_count
+            ]
+            component_offset += component_count
+            residual_values = [float(row["residual"]) for row in component_rows]
+            q_component_values = [float(row["q"]) for row in component_rows]
+            variance_component_values = [
+                float(row["variance"]) for row in component_rows
+            ]
+            expected_structure_values = {
+                "mae": math.fsum(abs(value) for value in residual_values)
+                / component_count,
+                "rmse": math.sqrt(
+                    math.fsum(value * value for value in residual_values)
+                    / component_count
+                ),
+                "mean_q": math.fsum(q_component_values) / component_count,
+                "mean_variance": math.fsum(variance_component_values)
+                / component_count,
+            }
+            for field, expected_value in expected_structure_values.items():
+                actual_value = _finite_float(
+                    structure_row[field],
+                    f"{variant}/force_structure.csv {field}",
+                )
+                if not math.isclose(
+                    actual_value, expected_value, rel_tol=1.0e-12, abs_tol=1.0e-15
+                ):
+                    raise ValueError(
+                        f"{variant} force-structure {field} does not match components"
+                    )
             components = _csv_integer(row, "components", source)
             if components != expected_component_counts[index]:
                 raise ValueError(f"{variant} force component count mismatch")
