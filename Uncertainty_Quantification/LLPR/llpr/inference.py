@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
 import os
 from pathlib import Path
+import stat
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
 import torch
@@ -222,6 +224,52 @@ def _dataset_metadata(dataset: DatasetHandle) -> dict[str, Any]:
 
 
 
+def _load_audit_document(path: Path, expected_sha256: str) -> Mapping[str, Any]:
+    """Read, digest, and strictly parse one stable regular audit object."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError("calibration force exclusion audit SHA mismatch") from error
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("calibration force exclusion audit must be regular")
+            payload = handle.read()
+    except OSError as error:
+        raise ValueError("calibration force exclusion audit is invalid") from error
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("calibration force exclusion audit SHA mismatch")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("calibration force exclusion audit has duplicate keys")
+            result[key] = value
+        return result
+
+    def reject_nonfinite_constant(value: str) -> Any:
+        raise ValueError(
+            "calibration force exclusion audit has a non-finite JSON constant: "
+            + value
+        )
+
+    try:
+        document = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite_constant,
+        )
+    except (UnicodeError, ValueError) as error:
+        raise ValueError("calibration force exclusion audit is invalid") from error
+    if not isinstance(document, Mapping):
+        raise ValueError("calibration force exclusion audit is invalid")
+    return document
+
+
 def _load_calibrations(
     path: Path,
     checkpoint: CheckpointIdentity,
@@ -232,7 +280,11 @@ def _load_calibrations(
     if not path.exists():
         raise ValueError("completed calibration artifact is missing")
     artifact = load_torch_artifact(path)
-    if not isinstance(artifact, Mapping) or artifact.get("status") != "complete":
+    if (
+        not isinstance(artifact, Mapping)
+        or set(artifact) != {"identity", "status", "records"}
+        or artifact.get("status") != "complete"
+    ):
         raise ValueError("calibration artifact must be a complete mapping")
     identity = artifact.get("identity")
     if not isinstance(identity, Mapping):
@@ -311,14 +363,7 @@ def _load_calibrations(
         ):
             raise ValueError("calibration force exclusion audit SHA is invalid")
         audit_path = path.parent / "force_exclusions.json"
-        if not audit_path.is_file() or sha256_file(audit_path) != audit_sha256:
-            raise ValueError("calibration force exclusion audit SHA mismatch")
-        try:
-            audit_document = json.loads(audit_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError) as error:
-            raise ValueError("calibration force exclusion audit is invalid") from error
-        if sha256_file(audit_path) != audit_sha256:
-            raise ValueError("calibration force exclusion audit SHA mismatch")
+        audit_document = _load_audit_document(audit_path, audit_sha256)
         audit_fields = {
             "schema_version",
             "zero_q_policy",
@@ -381,10 +426,35 @@ def _load_calibrations(
                 raise ValueError("calibration zero-q record schema mismatch")
             if (
                 source["zero_q_policy"] != ZERO_Q_POLICY
+                or not isinstance(source["force_exclusions_sha256"], str)
                 or source["force_exclusions_sha256"] != audit_sha256
-                or any(source[field] != population[field] for field in CALIBRATION_POPULATION_FIELDS)
             ):
                 raise ValueError("calibration zero-q record provenance mismatch")
+            for field in CALIBRATION_POPULATION_FIELDS:
+                value = source[field]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value != population[field]
+                ):
+                    raise ValueError("calibration zero-q record population mismatch")
+            for field in ("ridge", "alpha", "mean_residual_squared_over_q"):
+                value = source[field]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) < 0.0
+                ):
+                    raise ValueError(f"calibration zero-q record {field} is invalid")
+            if (
+                source["ridge_mode"] not in ("fixed", "condition_number")
+                or not isinstance(source["ridge_mode"], str)
+                or isinstance(source["rows"], bool)
+                or not isinstance(source["rows"], int)
+                or source["rows"] <= 0
+            ):
+                raise ValueError("calibration zero-q record field is invalid")
         variant = source.get("variant")
         target = source.get("target")
         if variant not in _VARIANTS or target not in ("energy", "forces"):
@@ -948,12 +1018,18 @@ def _validate_complete_outputs(
     evaluation_dir: Path,
     progress: Mapping[str, Any],
     max_force_components_per_structure: int | None,
+    calibrations: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    diagnostics: Mapping[str, Mapping[str, Any]],
 ) -> None:
     structures = int(progress["structures"])
     offsets = progress["csv_offsets"]
     csv_rows: dict[tuple[str, str], list[dict[str, str]]] = {}
     summaries: dict[str, Mapping[str, Any]] = {}
 
+    policy_bound = (
+        isinstance(progress.get("identity"), Mapping)
+        and "zero_q" in progress["identity"]
+    )
     for variant in _VARIANTS:
         for filename, fields in _CSV_SPECS.items():
             key = _writer_key(variant, filename)
@@ -1070,6 +1146,8 @@ def _validate_complete_outputs(
             ]
             if values[3] < 0.0 or values[4] < 0.0 or values[5] < 0.0:
                 raise ValueError(f"{source} has invalid uncertainty values")
+            if not policy_bound and values[3] <= 0.0:
+                raise ValueError(f"{source} legacy force q must be positive")
             if values[3] == 0.0:
                 if values[4] != 0.0 or values[5] != 0.0:
                     raise ValueError(f"{source} zero q must have zero variance and std")
@@ -1136,7 +1214,7 @@ def _validate_complete_outputs(
             force_zero_baseline = force_zero_keys
         elif force_zero_keys != force_zero_baseline:
             raise ValueError("force zero-q rows must match across variants")
-    if isinstance(progress.get("identity"), Mapping) and "zero_q" in progress["identity"]:
+    if policy_bound:
         canonical_force_rows = csv_rows[("he", "force_components.csv")]
         zero_rows = [
             row for row in canonical_force_rows if float(row["q"]) == 0.0
@@ -1161,17 +1239,39 @@ def _validate_complete_outputs(
             ):
                 raise ValueError("evaluation summary zero-q counters mismatch")
     for variant in _VARIANTS:
-        summary = summaries[variant]
+        candidate_summary = summaries[variant]
+        energy = calibrations[variant]["energy"]
+        forces = calibrations[variant]["forces"]
         expected_summary = summarize_variant(
             evaluation_dir / variant,
             variant=variant,
-            ridge_mode=summary["ridge"]["mode"],
-            ridge=float(summary["ridge"]["value"]),
-            energy_alpha=float(summary["alpha"]["energy"]),
-            force_alpha=float(summary["alpha"]["forces"]),
-            cholesky_diagnostics=summary["cholesky_diagnostics"],
+            ridge_mode=str(energy["ridge_mode"]),
+            ridge=float(energy["ridge"]),
+            energy_alpha=float(energy["alpha"]),
+            force_alpha=float(forces["alpha"]),
+            cholesky_diagnostics=diagnostics[variant],
         )
-        if summary != expected_summary:
+        if not policy_bound:
+            for target in ("energy", "forces"):
+                candidate_target = candidate_summary.get(target)
+                if (
+                    isinstance(candidate_target, Mapping)
+                    and not any(
+                        field in candidate_target
+                        for field in (
+                            "zero_q_rows",
+                            "zero_q_zero_residual_rows",
+                            "zero_q_nonzero_residual_rows",
+                        )
+                    )
+                ):
+                    for field in (
+                        "zero_q_rows",
+                        "zero_q_zero_residual_rows",
+                        "zero_q_nonzero_residual_rows",
+                    ):
+                        expected_summary[target].pop(field)
+        if candidate_summary != expected_summary:
             raise ValueError("complete evaluation summary does not match canonical CSV")
 
 
@@ -1243,6 +1343,8 @@ def run_evaluate(config: LLPRConfig) -> Path:
                 evaluation_dir,
                 candidate,
                 config.runtime.effective_consumer_max_force_components_per_structure,
+                calibrations,
+                diagnostics,
             )
             return evaluation_dir
         if not config.runtime.resume:

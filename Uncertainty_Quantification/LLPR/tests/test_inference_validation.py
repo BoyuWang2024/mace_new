@@ -978,6 +978,126 @@ def test_complete_cache_rejects_force_structure_mean_variance_tamper(
         run_evaluate(config)
 
 
+def test_complete_legacy_cache_rejects_coherent_zero_q_forgery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    for variant in _VARIANTS:
+        component_path = evaluation_dir / variant / "force_components.csv"
+        components = pd.read_csv(component_path)
+        components.loc[0, ["q", "variance", "std"]] = 0.0
+        _replace_committed_csv(
+            evaluation_dir, f"{variant}/force_components.csv", components
+        )
+        structure_path = evaluation_dir / variant / "force_structure.csv"
+        structures = pd.read_csv(structure_path)
+        structures.loc[0, ["mean_q", "mean_variance"]] = [1.0 / 3.0, 3.0]
+        _replace_committed_csv(
+            evaluation_dir, f"{variant}/force_structure.csv", structures
+        )
+        summary_path = evaluation_dir / variant / "summary.json"
+        previous = json.loads(summary_path.read_text(encoding="utf-8"))
+        atomic_json_dump(
+            summary_path,
+            summarize_variant(
+                evaluation_dir / variant,
+                variant=variant,
+                ridge_mode=previous["ridge"]["mode"],
+                ridge=previous["ridge"]["value"],
+                energy_alpha=previous["alpha"]["energy"],
+                force_alpha=previous["alpha"]["forces"],
+                cholesky_diagnostics=previous["cholesky_diagnostics"],
+            ),
+        )
+
+    with pytest.raises(ValueError, match="legacy force q must be positive"):
+        run_evaluate(config)
+
+
+def test_complete_legacy_cache_accepts_actual_old_summary_and_progress_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    progress_path = evaluation_dir / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    for field in (
+        "zero_q_rows",
+        "zero_q_zero_residual_rows",
+        "zero_q_nonzero_residual_rows",
+    ):
+        del progress[field]
+    atomic_torch_save(progress_path, progress)
+    for variant in _VARIANTS:
+        summary_path = evaluation_dir / variant / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        for target in ("energy", "forces"):
+            for field in (
+                "zero_q_rows",
+                "zero_q_zero_residual_rows",
+                "zero_q_nonzero_residual_rows",
+            ):
+                del summary[target][field]
+        atomic_json_dump(summary_path, summary)
+
+    assert run_evaluate(config) == evaluation_dir
+
+
+def test_complete_cache_rejects_forged_summary_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    summary_path = evaluation_dir / "he" / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["ridge"]["value"] = 888.0
+    summary["alpha"]["energy"] = 999.0
+    summary["cholesky_diagnostics"] = {"forged": True}
+    atomic_json_dump(summary_path, summary)
+
+    with pytest.raises(ValueError, match="summary does not match"):
+        run_evaluate(config)
+
+
+@pytest.mark.parametrize("case", ("extra", "float_population", "nan_metric"))
+def test_policy_bound_calibration_rejects_noncanonical_artifact_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    calibration_path = _upgrade_policy_bound_calibration(config)
+    artifact = load_torch_artifact(calibration_path)
+    if case == "extra":
+        artifact["extra"] = "forged"
+    elif case == "float_population":
+        artifact["records"][0]["energy_structures"] = 2.0
+    else:
+        artifact["records"][0]["mean_residual_squared_over_q"] = float("nan")
+    atomic_torch_save(calibration_path, artifact)
+
+    with pytest.raises(ValueError):
+        run_evaluate(config)
+
+
+def test_audit_parser_rejects_duplicate_keys_and_nonfinite_constants(
+    tmp_path: Path,
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr.inference import _load_audit_document
+
+    for name, payload in (
+        ("duplicate", b'{"status":"complete","status":"complete"}'),
+        ("nonfinite", b'{"status":NaN}'),
+    ):
+        path = tmp_path / f"{name}.json"
+        path.write_bytes(payload)
+        with pytest.raises(ValueError, match="audit"):
+            _load_audit_document(path, sha256_file(path))
+
+
 def test_run_evaluate_rejects_resume_identity_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
