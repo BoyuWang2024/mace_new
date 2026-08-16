@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import math
 from shutil import copyfile
@@ -10,7 +11,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import numpy as np
 from ase import Atoms
+from ase.calculators.calculator import all_properties
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import iread
 from ase.io import read as ase_read
@@ -55,13 +58,34 @@ def _is_nonnegative_integer(value: object) -> bool:
 
 
 def _copy_atoms_with_calculator_results(atoms: Atoms) -> Atoms:
-    copied_atoms = atoms.copy()
     if atoms.calc is None:
-        return copied_atoms
-    copied_atoms.calc = SinglePointCalculator(
-        copied_atoms,
-        **atoms.calc.results,
-    )
+        return atoms.copy()
+
+    copied_results: dict[str, Any] = {}
+    for name, value in atoms.calc.results.items():
+        if not isinstance(name, str) or name not in all_properties:
+            raise ValueError(f"unsupported calculator result property {name!r}")
+        try:
+            if isinstance(value, np.ndarray):
+                copied_value = (
+                    value.item() if value.ndim == 0 else np.array(value, copy=True)
+                )
+            else:
+                copied_value = deepcopy(value)
+        except Exception as error:
+            raise ValueError(
+                f"calculator result {name!r} cannot be copied safely"
+            ) from error
+        copied_results[name] = copied_value
+
+    copied_atoms = atoms.copy()
+    try:
+        copied_atoms.calc = SinglePointCalculator(
+            copied_atoms,
+            **copied_results,
+        )
+    except Exception as error:
+        raise ValueError("calculator results cannot be represented safely") from error
     return copied_atoms
 
 

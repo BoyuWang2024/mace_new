@@ -186,6 +186,113 @@ def test_filter_preserves_reference_results_and_structure_metadata(
     assert filter_neighborless_extxyz(source, output, audit, cutoff=6.0) == first_report
 
 
+def test_calculator_result_copy_has_no_mutable_aliases() -> None:
+    atoms = Atoms("H2", positions=[[0, 0, 0], [1, 0, 0]])
+    atoms.calc = SinglePointCalculator(
+        atoms,
+        energy=np.array(-2.0, dtype=np.float32),
+        free_energy=np.array(-2.1, dtype=np.float64),
+        magmom=np.array(1.25, dtype=np.float32),
+        forces=np.array(
+            [[0.1, 0.2, 0.3], [-0.1, -0.2, -0.3]], dtype=np.float64
+        ),
+        stress=np.arange(6, dtype=np.float64),
+        born_effective_charges=np.arange(18, dtype=np.float64).reshape(2, 3, 3),
+    )
+    atoms.calc.results["dielectric_tensor"] = [
+        [1.0, 0.1, 0.2],
+        [0.1, 2.0, 0.3],
+        [0.2, 0.3, 3.0],
+    ]
+    original_values = {
+        name: np.asarray(value).copy() for name, value in atoms.calc.results.items()
+    }
+
+    copied = dataset_filter._copy_atoms_with_calculator_results(atoms)
+
+    assert copied is not atoms
+    assert copied.calc is not None
+    assert copied.calc is not atoms.calc
+    assert copied.calc.results is not atoms.calc.results
+    assert copied.calc.results.keys() == atoms.calc.results.keys()
+    assert copied.arrays.keys() == atoms.arrays.keys()
+    for name in atoms.arrays:
+        assert not np.shares_memory(copied.arrays[name], atoms.arrays[name])
+    for name in ("energy", "free_energy", "magmom"):
+        assert copied.calc.results[name] is not atoms.calc.results[name]
+        assert not isinstance(copied.calc.results[name], np.ndarray)
+        np.testing.assert_array_equal(copied.calc.results[name], original_values[name])
+    for name in ("forces", "stress", "born_effective_charges", "dielectric_tensor"):
+        assert copied.calc.results[name] is not atoms.calc.results[name]
+        assert not np.shares_memory(
+            copied.calc.results[name], atoms.calc.results[name]
+        )
+        assert copied.calc.results[name].dtype == np.asarray(
+            atoms.calc.results[name]
+        ).dtype
+        assert copied.calc.results[name].shape == np.asarray(
+            atoms.calc.results[name]
+        ).shape
+        np.testing.assert_array_equal(copied.calc.results[name], original_values[name])
+
+    atoms.calc.results["energy"][...] = -9.0
+    atoms.calc.results["forces"][0, 0] = 91.0
+    atoms.calc.results["born_effective_charges"][0, 0, 0] = 92.0
+    atoms.calc.results["dielectric_tensor"][0][0] = 93.0
+    np.testing.assert_array_equal(copied.calc.results["energy"], original_values["energy"])
+    np.testing.assert_array_equal(copied.calc.results["forces"], original_values["forces"])
+    np.testing.assert_array_equal(
+        copied.calc.results["born_effective_charges"],
+        original_values["born_effective_charges"],
+    )
+    np.testing.assert_array_equal(
+        copied.calc.results["dielectric_tensor"], original_values["dielectric_tensor"]
+    )
+
+    copied.calc.results["energy"] = -8.0
+    copied.calc.results["stress"][0] = 81.0
+    copied.calc.results["born_effective_charges"][1, 2, 2] = 82.0
+    assert atoms.calc.results["energy"] == -9.0
+    np.testing.assert_array_equal(atoms.calc.results["stress"], original_values["stress"])
+    assert atoms.calc.results["born_effective_charges"][1, 2, 2] == (
+        original_values["born_effective_charges"][1, 2, 2]
+    )
+    copied.calc.results["dielectric_tensor"][2, 2] = 83.0
+    assert atoms.calc.results["dielectric_tensor"][2][2] == (
+        original_values["dielectric_tensor"][2, 2]
+    )
+    copied.positions[0, 0] = 84.0
+    assert atoms.positions[0, 0] == 0.0
+
+
+def test_calculator_result_copy_rejects_unknown_property() -> None:
+    atoms = Atoms("H2", positions=[[0, 0, 0], [1, 0, 0]])
+    atoms.calc = SinglePointCalculator(atoms, energy=-2.0)
+    atoms.calc.results["unknown_reference_label"] = np.array([1.0])
+
+    with pytest.raises(
+        ValueError,
+        match="unsupported calculator result property 'unknown_reference_label'",
+    ):
+        dataset_filter._copy_atoms_with_calculator_results(atoms)
+
+
+def test_calculator_result_copy_rejects_value_that_cannot_be_copied() -> None:
+    class UncopyableResult:
+        def __deepcopy__(self, memo: dict[int, object]) -> object:
+            raise TypeError("cannot copy this value")
+
+    atoms = Atoms("H2", positions=[[0, 0, 0], [1, 0, 0]])
+    atoms.calc = SinglePointCalculator(atoms, energy=-2.0)
+    atoms.calc.results["energy"] = UncopyableResult()
+
+    with pytest.raises(
+        ValueError,
+        match="calculator result 'energy' cannot be copied safely",
+    ):
+        dataset_filter._copy_atoms_with_calculator_results(atoms)
+
+
 @pytest.mark.parametrize(
     "field, value",
     [
