@@ -156,7 +156,7 @@ def _load_plot_data(root: Path) -> dict[str, dict[str, _PanelData]]:
 def _load_carnet_panels(
     root: Path,
 ) -> dict[tuple[str, str], Any]:
-    """Load only the two numeric columns used by the four density panels."""
+    """Load only q, std, and residual for the four density panels."""
     from .density_plotting import CARNET_SELECTED, DensityPanel
 
     panels: dict[tuple[str, str], Any] = {}
@@ -164,13 +164,14 @@ def _load_carnet_panels(
         filename = "energy.csv" if target == "energy" else "force_components.csv"
         frame = pd.read_csv(
             root / variant / filename,
-            usecols=("std", "residual"),
+            usecols=("q", "std", "residual"),
         )
         uncertainty = frame["std"].to_numpy(dtype=np.float64, copy=True)
         residual = frame["residual"].to_numpy(dtype=np.float64, copy=True)
         np.abs(residual, out=residual)
         panels[(variant, target)] = DensityPanel(
             uncertainty=uncertainty,
+            q=frame["q"].to_numpy(dtype=np.float64, copy=True),
             absolute_residual=residual,
             target=target,
             unit="eV/atom" if target == "energy" else "eV/\u00c5",
@@ -210,10 +211,6 @@ def _standardized_residuals(
     values = np.abs(
         panel.signed_residual[positive_std] / panel.uncertainty[positive_std]
     )
-    if np.any(zero_zero):
-        values = np.concatenate(
-            (values, np.zeros(int(np.count_nonzero(zero_zero)), dtype=np.float64))
-        )
     return values, int(np.count_nonzero(undefined)), int(np.count_nonzero(zero_zero))
 
 
@@ -899,6 +896,8 @@ def _parse_carnet_statistics(path: Path) -> list[dict[str, Any]]:
         raise RuntimeError("carnet statistics schema or row count mismatch")
     integer_fields = {
         "rows", "finite_rows", "nonfinite_rows", "nonpositive_std_rows",
+        "zero_q_rows", "zero_q_zero_residual_rows",
+        "zero_q_nonzero_residual_rows",
         "zero_absolute_residual_rows", "metric_rows", "log_plot_rows",
         "excluded_from_log_rows", "correlation_rows", "correlation_degenerate",
     }
@@ -944,6 +943,15 @@ def _parse_carnet_statistics(path: Path) -> list[dict[str, Any]]:
                 row[field] = value
         if row["finite_rows"] + row["nonfinite_rows"] != row["rows"]:
             raise RuntimeError("carnet statistics finite counts are inconsistent")
+        if (
+            row["zero_q_zero_residual_rows"]
+            + row["zero_q_nonzero_residual_rows"]
+            != row["zero_q_rows"]
+            or row["zero_q_rows"] > row["nonpositive_std_rows"]
+        ):
+            raise RuntimeError(
+                "carnet statistics zero-q counts are inconsistent"
+            )
         if row["log_plot_rows"] + row["excluded_from_log_rows"] != row["rows"]:
             raise RuntimeError("carnet statistics exclusion counts are inconsistent")
         if row["correlation_rows"] != row["log_plot_rows"]:

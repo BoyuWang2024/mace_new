@@ -17,6 +17,10 @@ from .artifacts import (
     sha256_file,
     stable_id,
 )
+from .calibration_policy import (
+    CALIBRATION_POPULATION_FIELDS,
+    ZERO_Q_POLICY,
+)
 from .config import LLPRConfig
 from .curvature import run_root
 
@@ -90,6 +94,11 @@ _TARGET_SUMMARY_FIELDS = {
     "std",
     "coverage",
     "standardized_residual",
+}
+_ZERO_Q_SUMMARY_FIELDS = {
+    "zero_q_rows",
+    "zero_q_zero_residual_rows",
+    "zero_q_nonzero_residual_rows",
 }
 _DISTRIBUTION_FIELDS = {"rows", "mean", "std", "min", "max"}
 _CHOLESKY_FIELDS = {
@@ -256,9 +265,11 @@ def _validate_energy(
         num_atoms = _integer(row, "num_atoms", row_source)
         if num_atoms <= 0:
             raise ValueError(f"{row_source} num_atoms must be positive")
-        reference, prediction, residual, _, _, std = _validate_observation(
+        reference, prediction, residual, q_value, _, std = _validate_observation(
             row, row_source
         )
+        if q_value <= 0.0:
+            raise ValueError(f"{row_source} energy q must be positive")
         observations.append(
             (structure_id, num_atoms, reference, prediction, residual)
         )
@@ -272,6 +283,7 @@ def _validate_forces(
     variant: str,
     energy: Sequence[tuple[str, int, float, float, float]],
     max_force_components_per_structure: int | None = None,
+    allow_zero_q: bool = False,
 ) -> tuple[
     list[tuple[str, int, int, int, float, float, float]],
     list[float],
@@ -312,9 +324,16 @@ def _validate_forces(
             raise ValueError(f"{source} contains duplicate force component key {key}")
         seen.add(key)
         actual_keys.append(key)
-        reference, prediction, residual, _, _, std = _validate_observation(
+        reference, prediction, residual, q_value, variance, std = _validate_observation(
             row, row_source
         )
+        if q_value == 0.0:
+            if not allow_zero_q:
+                raise ValueError(f"{row_source} legacy force q must be positive")
+            if variance != 0.0 or std != 0.0:
+                raise ValueError(
+                    f"{row_source} zero q requires variance and std literal zero"
+                )
         observations.append((*key, reference, prediction, residual))
         residuals.append(residual)
         std_values.append(std)
@@ -340,23 +359,29 @@ def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
     }
 
 
-def _target_summary(rows: Sequence[Mapping[str, str]]) -> dict[str, Any]:
+def _target_summary(
+    rows: Sequence[Mapping[str, str]], *, include_zero_q_counts: bool
+) -> dict[str, Any]:
     residuals = [_finite(row, "residual", "summary source") for row in rows]
     q_values = [_finite(row, "q", "summary source") for row in rows]
     variances = [_finite(row, "variance", "summary source") for row in rows]
     std_values = [_finite(row, "std", "summary source") for row in rows]
     standardized = []
     coverage = {1: 0, 2: 0, 3: 0}
-    for residual, std in zip(residuals, std_values):
+    zero_q_rows = 0
+    zero_q_zero_residual_rows = 0
+    for residual, q_value, std in zip(residuals, q_values, std_values):
+        if q_value == 0.0:
+            zero_q_rows += 1
+            if residual == 0.0:
+                zero_q_zero_residual_rows += 1
         for multiplier in coverage:
             if abs(residual) <= multiplier * std:
                 coverage[multiplier] += 1
         if std > 0.0:
             standardized.append(residual / std)
-        elif residual == 0.0:
-            standardized.append(0.0)
     count = len(rows)
-    return {
+    summary = {
         "rows": count,
         "mae": math.fsum(abs(value) for value in residuals) / count,
         "rmse": math.sqrt(math.fsum(value * value for value in residuals) / count),
@@ -369,6 +394,17 @@ def _target_summary(rows: Sequence[Mapping[str, str]]) -> dict[str, Any]:
         },
         "standardized_residual": _distribution(standardized),
     }
+    if include_zero_q_counts:
+        summary.update(
+            {
+                "zero_q_rows": zero_q_rows,
+                "zero_q_zero_residual_rows": zero_q_zero_residual_rows,
+                "zero_q_nonzero_residual_rows": (
+                    zero_q_rows - zero_q_zero_residual_rows
+                ),
+            }
+        )
+    return summary
 
 
 def _require_equivalent(actual: Any, expected: Any, source: str) -> None:
@@ -451,6 +487,7 @@ def _validate_force_structures(
 
 def _validate_summary(
     root: Path,
+    require_zero_q_counts: bool,
     variant: str,
     energy_rows: Sequence[Mapping[str, str]],
     force_rows: Sequence[Mapping[str, str]],
@@ -487,11 +524,26 @@ def _validate_summary(
     }
     _require_equivalent(document["counts"], expected_counts, f"{source}.counts")
     for target, rows in (("energy", energy_rows), ("forces", force_rows)):
-        _require_keys(
-            document[target], _TARGET_SUMMARY_FIELDS, f"{source}.{target}"
+        target_fields = (
+            set(document[target]) if isinstance(document[target], Mapping) else set()
         )
+        if target_fields == _TARGET_SUMMARY_FIELDS:
+            if require_zero_q_counts:
+                raise ValueError(
+                    f"{source}.{target} zero-q summary schema mismatch"
+                )
+            include_zero_q_counts = False
+        elif target_fields == _TARGET_SUMMARY_FIELDS | _ZERO_Q_SUMMARY_FIELDS:
+            include_zero_q_counts = True
+        else:
+            _require_keys(
+                document[target], _TARGET_SUMMARY_FIELDS, f"{source}.{target}"
+            )
+            raise AssertionError("unreachable")
         _require_equivalent(
-            document[target], _target_summary(rows), f"{source}.{target}"
+            document[target],
+            _target_summary(rows, include_zero_q_counts=include_zero_q_counts),
+            f"{source}.{target}",
         )
     _require_equivalent(
         document["force_structure"],
@@ -888,6 +940,108 @@ def _validate_curvature_source_identity(
     return identity
 
 
+def _validate_population_identity(value: Any, source: str) -> Mapping[str, int]:
+    population = _identity_mapping(
+        value, set(CALIBRATION_POPULATION_FIELDS), source
+    )
+    for field in CALIBRATION_POPULATION_FIELDS:
+        count = population[field]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(
+                f"trusted evaluation progress identity {source} population count is invalid"
+            )
+    if (
+        population["force_used_structures"]
+        + population["force_excluded_structures"]
+        != population["energy_structures"]
+        or population["force_components_used"]
+        + population["force_components_excluded"]
+        != population["force_components_total"]
+    ):
+        raise ValueError(
+            f"trusted evaluation progress identity {source} population arithmetic mismatch"
+        )
+    return population
+
+
+def _calibration_zero_q_binding(
+    identity: Mapping[str, Any], source: str
+) -> tuple[Mapping[str, int], str] | None:
+    fields = {"zero_q_policy", "calibration_population", "force_exclusions"}
+    present = fields & set(identity)
+    if not present:
+        return None
+    if present != fields:
+        raise ValueError(
+            f"trusted evaluation progress identity {source} zero-q provenance is incomplete"
+        )
+    if identity["zero_q_policy"] != ZERO_Q_POLICY:
+        raise ValueError(
+            f"trusted evaluation progress identity {source} zero-q policy mismatch"
+        )
+    population = _validate_population_identity(
+        identity["calibration_population"], f"{source}.calibration_population"
+    )
+    audit = _identity_mapping(
+        identity["force_exclusions"],
+        {"path", "sha256"},
+        f"{source}.force_exclusions",
+    )
+    if audit["path"] != "force_exclusions.json":
+        raise ValueError(
+            f"trusted evaluation progress identity {source} zero-q audit path mismatch"
+        )
+    audit_sha256 = _identity_sha256(
+        audit["sha256"], f"{source}.force_exclusions.sha256"
+    )
+    if audit_sha256 != audit_sha256.lower():
+        raise ValueError(
+            f"trusted evaluation progress identity {source} zero-q audit SHA is invalid"
+        )
+    return population, audit_sha256
+
+
+def _validate_evaluation_zero_q_identity(
+    value: Any,
+    calibration_identity: Mapping[str, Any],
+    records: Mapping[str, Any],
+) -> None:
+    calibration_binding = _calibration_zero_q_binding(
+        calibration_identity, "calibration.identity"
+    )
+    if value is None:
+        if calibration_binding is not None:
+            raise ValueError("trusted evaluation progress identity zero-q binding is missing")
+        return
+    zero_q = _identity_mapping(
+        value,
+        {"policy", "calibration_population", "force_exclusions_sha256"},
+        "zero_q",
+    )
+    if zero_q["policy"] != ZERO_Q_POLICY or calibration_binding is None:
+        raise ValueError("trusted evaluation progress identity zero-q policy mismatch")
+    population = _validate_population_identity(
+        zero_q["calibration_population"], "zero_q.calibration_population"
+    )
+    audit_sha256 = _identity_sha256(
+        zero_q["force_exclusions_sha256"], "zero_q.force_exclusions_sha256"
+    )
+    if audit_sha256 != audit_sha256.lower():
+        raise ValueError("trusted evaluation progress identity zero-q audit SHA is invalid")
+    calibration_population, calibration_audit_sha256 = calibration_binding
+    if dict(population) != dict(calibration_population):
+        raise ValueError("trusted evaluation progress identity zero-q population mismatch")
+    if audit_sha256 != calibration_audit_sha256:
+        raise ValueError("trusted evaluation progress identity zero-q audit SHA mismatch")
+    for variant in _VARIANTS:
+        if (
+            records[variant]["energy"]["rows"] != population["energy_structures"]
+            or records[variant]["forces"]["rows"]
+            != population["force_components_used"]
+        ):
+            raise ValueError("trusted evaluation progress identity zero-q record population mismatch")
+
+
 def _validate_calibration_source_identity(
     value: Any, source: str
 ) -> Mapping[str, Any]:
@@ -901,7 +1055,13 @@ def _validate_calibration_source_identity(
         "min_q",
         "limits",
     }
-    optional_fields = {"curvature_artifact", "consumer_limits"}
+    optional_fields = {
+        "curvature_artifact",
+        "consumer_limits",
+        "zero_q_policy",
+        "calibration_population",
+        "force_exclusions",
+    }
     if (
         not isinstance(value, Mapping)
         or not fields.issubset(value)
@@ -941,6 +1101,7 @@ def _validate_calibration_source_identity(
         _validate_limits_identity(
             identity["consumer_limits"], f"{source}.consumer_limits"
         )
+    _calibration_zero_q_binding(identity, source)
     return identity
 
 
@@ -1016,7 +1177,7 @@ def _trusted_progress_identity(
     }
     if not required.issubset(identity):
         raise ValueError("trusted evaluation progress identity is missing required fields")
-    optional = {"consumer_limits"}
+    optional = {"consumer_limits", "zero_q"}
     if not set(identity).issubset(required | optional):
         raise ValueError("trusted evaluation progress identity has unexpected fields")
     _validate_versions(identity, "root")
@@ -1053,8 +1214,11 @@ def _trusted_progress_identity(
     calibration_identity = _validate_calibration_source_identity(
         calibration["identity"], "calibration.identity"
     )
-    _validate_calibration_records(
+    calibration_records = _validate_calibration_records(
         calibration["records"], calibration_identity["ridge"], "calibration.records"
+    )
+    _validate_evaluation_zero_q_identity(
+        identity.get("zero_q"), calibration_identity, calibration_records
     )
     test = _validate_dataset_identity(identity["test"], "test")
     ridge = _validate_ridge_identity(identity["ridge"], "ridge", selected=False)
@@ -1282,6 +1446,7 @@ def validate_publication_root(
         raise ValueError(f"publication root is not a directory: {root}")
     identities, trusted_identity = _publication_identities(root, identity)
     calibration_records = trusted_identity["calibration"]["records"]
+    policy_bound = "zero_q" in trusted_identity
     consumer_limits = trusted_identity.get("consumer_limits") or {}
     max_force_components = consumer_limits.get(
         "max_force_components_per_structure"
@@ -1294,17 +1459,18 @@ def validate_publication_root(
     diagnostics: dict[str, Any] = {}
     energy_baseline: list[tuple[str, int, float, float, float]] | None = None
     force_baseline: list[tuple[str, int, int, int, float, float, float]] | None = None
+    zero_q_baseline: tuple[tuple[str, str, str, str], ...] | None = None
     for variant in _VARIANTS:
         energy, energy_residuals, energy_std = _validate_energy(root, variant)
         forces, force_residuals, force_std, force_rows = _validate_forces(
-            root, variant, energy, max_force_components
+            root, variant, energy, max_force_components, policy_bound
         )
         energy_rows = _read_csv(root / variant / "energy.csv", ENERGY_FIELDS)
         force_structure = _validate_force_structures(
             root, variant, energy, force_rows, max_force_components
         )
         summary = _validate_summary(
-            root, variant, energy_rows, force_rows, force_structure
+            root, policy_bound, variant, energy_rows, force_rows, force_structure
         )
         _validate_summary_calibration_contract(
             variant, summary, calibration_records
@@ -1326,6 +1492,20 @@ def validate_publication_root(
             key_fields=4,
         ):
             raise ValueError("variant alignment mismatch for canonical observations")
+        zero_q_keys = tuple(
+            (
+                row["structure_id"],
+                row["num_atoms"],
+                row["atom_index"],
+                row["direction"],
+            )
+            for row in force_rows
+            if float(row["q"]) == 0.0
+        )
+        if zero_q_baseline is None:
+            zero_q_baseline = zero_q_keys
+        elif zero_q_keys != zero_q_baseline:
+            raise ValueError("zero-q force keys mismatch across variants")
         diagnostics[variant] = {
             "energy": _quality_diagnostics(energy_residuals, energy_std),
             "forces": _quality_diagnostics(force_residuals, force_std),

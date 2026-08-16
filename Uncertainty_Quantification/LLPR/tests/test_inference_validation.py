@@ -1810,18 +1810,15 @@ def test_validation_rejects_stale_or_malformed_summary(
         validate_publication_root(root)
 
 
-def test_validation_reports_quality_diagnostics_without_gating_and_handles_zero_std(
+def test_validation_rejects_zero_q_energy_even_with_zero_residual(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = _evaluated_publication_root(tmp_path, monkeypatch)
     for variant in _VARIANTS:
         energy_path = root / variant / "energy.csv"
         energy = pd.read_csv(energy_path)
-        energy["prediction"] = energy["reference"]
-        energy["residual"] = 0.0
-        energy["q"] = 0.0
-        energy["variance"] = 0.0
-        energy["std"] = 0.0
+        energy.loc[0, "prediction"] = energy.loc[0, "reference"]
+        energy.loc[0, ["residual", "q", "variance", "std"]] = 0.0
         energy.to_csv(energy_path, index=False)
         summary_path = root / variant / "summary.json"
         previous = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -1836,16 +1833,8 @@ def test_validation_reports_quality_diagnostics_without_gating_and_handles_zero_
         )
         atomic_json_dump(summary_path, summary)
 
-    report = validate_publication_root(root)
-
-    assert report["status"] == "valid"
-    energy_diagnostics = report["diagnostics"]["he"]["energy"]
-    assert energy_diagnostics["coverage_1sigma"] == 1.0
-    assert energy_diagnostics["standardized_residual"]["rows"] == 2
-    assert energy_diagnostics["uncertainty_residual_correlation"] is None
-    serialized = (root / "validation.json").read_text(encoding="utf-8")
-    assert "NaN" not in serialized
-    assert "Infinity" not in serialized
+    with pytest.raises(ValueError, match="energy q must be positive"):
+        validate_publication_root(root)
 
 
 def test_revalidation_after_valid_content_change_fails_closed(
@@ -2387,4 +2376,146 @@ def test_validation_rejects_surplus_or_missing_named_csv_values(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
+        validate_publication_root(root)
+
+
+def _policy_bound_publication_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, LLPRConfig]:
+    from Uncertainty_Quantification.LLPR.llpr import inference
+
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    _upgrade_policy_bound_calibration(config)
+    compute = inference.compute_structure_jacobians
+
+    def legal_zero_first_force_row(**kwargs: object) -> StructureJacobians:
+        result = compute(**kwargs)
+        gradients = result.g_forces.clone()
+        gradients[0] = 0.0
+        return replace(result, g_forces=gradients)
+
+    monkeypatch.setattr(
+        inference, "compute_structure_jacobians", legal_zero_first_force_row
+    )
+    return run_evaluate(config), config
+
+
+def _refresh_force_aggregates_and_summary(root: Path, variant: str) -> None:
+    force_path = root / variant / "force_components.csv"
+    forces = pd.read_csv(force_path)
+    structure_path = root / variant / "force_structure.csv"
+    structures = pd.read_csv(structure_path)
+    for row_index, structure in structures.iterrows():
+        group = forces[forces["structure_id"] == structure["structure_id"]]
+        structures.loc[row_index, "mae"] = group["residual"].abs().mean()
+        structures.loc[row_index, "rmse"] = (group["residual"].pow(2).mean()) ** 0.5
+        structures.loc[row_index, "mean_q"] = group["q"].mean()
+        structures.loc[row_index, "mean_variance"] = group["variance"].mean()
+    structures.to_csv(structure_path, index=False)
+    summary_path = root / variant / "summary.json"
+    previous = json.loads(summary_path.read_text(encoding="utf-8"))
+    atomic_json_dump(
+        summary_path,
+        summarize_variant(
+            root / variant,
+            variant=variant,
+            ridge_mode=previous["ridge"]["mode"],
+            ridge=previous["ridge"]["value"],
+            energy_alpha=previous["alpha"]["energy"],
+            force_alpha=previous["alpha"]["forces"],
+            cholesky_diagnostics=previous["cholesky_diagnostics"],
+        ),
+    )
+
+
+def test_validation_accepts_policy_bound_publication_without_deleted_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, config = _policy_bound_publication_root(tmp_path, monkeypatch)
+    calibration_dir = run_root(config, "a" * 64) / "calibration" / "deterministic"
+    for name in (
+        "calibrations.pt",
+        "ridge_diagnostics.json",
+        "force_exclusions.json",
+    ):
+        (calibration_dir / name).unlink()
+
+    assert validate_publication_root(root)["status"] == "valid"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("policy", "population", "audit_sha", "calibration_policy", "schema"),
+)
+def test_validation_rejects_tampered_policy_population_or_audit_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    progress_path = root / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    identity = progress["identity"]
+    if case == "policy":
+        identity["zero_q"]["policy"] = "forged-policy"
+    elif case == "population":
+        identity["zero_q"]["calibration_population"]["energy_structures"] += 1
+    elif case == "audit_sha":
+        identity["zero_q"]["force_exclusions_sha256"] = "0" * 64
+    elif case == "calibration_policy":
+        identity["calibration"]["identity"]["zero_q_policy"] = "forged-policy"
+    else:
+        identity["zero_q"]["unexpected"] = "forged-schema-field"
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match="zero[-_]q|population|audit|policy"):
+        validate_publication_root(root)
+
+
+
+def test_validation_rejects_legacy_force_zero_q_even_with_coherent_summaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    for variant in _VARIANTS:
+        force_path = root / variant / "force_components.csv"
+        forces = pd.read_csv(force_path)
+        forces.loc[0, ["q", "variance", "std"]] = 0.0
+        forces.to_csv(force_path, index=False)
+        _refresh_force_aggregates_and_summary(root, variant)
+
+    with pytest.raises(ValueError, match="legacy force q must be positive"):
+        validate_publication_root(root)
+
+
+def test_validation_requires_literal_zero_variance_and_std_for_zero_force_q(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    for variant in _VARIANTS:
+        force_path = root / variant / "force_components.csv"
+        forces = pd.read_csv(force_path)
+        assert forces.loc[0, "q"] == 0.0
+        forces.loc[0, "std"] = 1.0e-13
+        forces.to_csv(force_path, index=False)
+        _refresh_force_aggregates_and_summary(root, variant)
+
+    with pytest.raises(ValueError, match="zero q.*variance.*std.*literal"):
+        validate_publication_root(root)
+
+
+def test_validation_rejects_cross_variant_zero_force_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    force_path = root / "hf" / "force_components.csv"
+    forces = pd.read_csv(force_path)
+    alpha = json.loads(
+        (root / "hf" / "summary.json").read_text(encoding="utf-8")
+    )["alpha"]["forces"]
+    variance = alpha * alpha * 0.5
+    forces.loc[0, ["q", "variance", "std"]] = [0.5, variance, variance**0.5]
+    forces.to_csv(force_path, index=False)
+    _refresh_force_aggregates_and_summary(root, "hf")
+
+    with pytest.raises(ValueError, match="zero-q.*variant"):
         validate_publication_root(root)

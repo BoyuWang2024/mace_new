@@ -99,7 +99,7 @@ def _rewrite_energy_with_zero_pair(root: Path) -> None:
         path = root / variant / "energy.csv"
         frame = pd.read_csv(path)
         frame.loc[0, "prediction"] = frame.loc[0, "reference"]
-        frame.loc[0, ["residual", "q", "variance", "std"]] = 0.0
+        frame.loc[0, "residual"] = 0.0
         frame.to_csv(path, index=False)
         summary_path = root / variant / "summary.json"
         previous = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -161,18 +161,19 @@ def _write_plot_config(
 
 
 def _density_panel(
-    uncertainty: list[float], absolute_residual: list[float], *, target: str
-) -> _PanelData:
+    uncertainty: list[float],
+    absolute_residual: list[float],
+    *,
+    target: str,
+    q: list[float] | None = None,
+) -> density_plotting.DensityPanel:
     values = np.asarray(absolute_residual, dtype=np.float64)
-    return _PanelData(
+    return density_plotting.DensityPanel(
+        q=np.asarray(q if q is not None else [1.0] * len(values), dtype=np.float64),
         uncertainty=np.asarray(uncertainty, dtype=np.float64),
         absolute_residual=values,
-        signed_residual=values,
-        mae_values=values,
-        squared_error_values=values**2,
         target=target,
-        data_level="energy" if target == "energy" else "force_component",
-        unit="eV/atom" if target == "energy" else "force_component",
+        unit="eV/atom" if target == "energy" else "eV/\u00c5",
     )
 
 
@@ -357,7 +358,7 @@ def test_zero_values_are_excluded_only_from_log_rendering_not_statistics(
     expected_mae = float(np.mean(np.abs(source["residual"].to_numpy())))
     assert row["rows"] == 2
     assert row["log_plot_rows"] == 1
-    assert row["zero_std_rows"] == 1
+    assert row["zero_std_rows"] == 0
     assert row["zero_absolute_residual_rows"] == 1
     assert row["mae"] == pytest.approx(expected_mae)
     manifest = _strict_json(result / "plotting_manifest.json")
@@ -436,32 +437,21 @@ def test_manifest_figure_paths_follow_configured_selection(
     ]
 
 
-def test_constant_and_zero_statistics_are_finite_and_ecdf_counts_zero_zero(
+def test_zero_std_is_excluded_from_standardized_ecdf_but_raw_counts_remain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root = _publication_root(tmp_path, monkeypatch)
+    (tmp_path / "publication").mkdir()
+    root, _ = publication_support._policy_bound_publication_root(
+        tmp_path / "publication", monkeypatch
+    )
     for variant in ("he", "hf", "hef"):
-        path = root / variant / "energy.csv"
+        path = root / variant / "force_components.csv"
         frame = pd.read_csv(path)
         frame.loc[0, "prediction"] = frame.loc[0, "reference"]
         frame.loc[0, "residual"] = 0.0
-        frame.loc[1, "residual"] = 1.0
-        frame.loc[1, "prediction"] = frame.loc[1, "reference"] - 1.0
-        frame.loc[:, ["q", "variance", "std"]] = 0.0
         frame.to_csv(path, index=False)
-        summary_path = root / variant / "summary.json"
-        previous = json.loads(summary_path.read_text(encoding="utf-8"))
-        atomic_json_dump(
-            summary_path,
-            summarize_variant(
-                root / variant,
-                variant=variant,
-                ridge_mode=previous["ridge"]["mode"],
-                ridge=previous["ridge"]["value"],
-                energy_alpha=previous["alpha"]["energy"],
-                force_alpha=previous["alpha"]["forces"],
-                cholesky_diagnostics=previous["cholesky_diagnostics"],
-            ),
+        publication_support._refresh_force_aggregates_and_summary(
+            root, variant
         )
 
     _refresh_publication_validation(root)
@@ -471,19 +461,18 @@ def test_constant_and_zero_statistics_are_finite_and_ecdf_counts_zero_zero(
     numeric = statistics.drop(columns=["variant", "target", "data_level", "unit"])
     assert not numeric.isna().any(axis=None)
     assert np.isfinite(numeric.to_numpy(dtype=np.float64)).all()
-    row = statistics.query("variant == 'he' and data_level == 'energy'").iloc[0]
-    assert row["standardized_residual_rows"] == 1
+    row = statistics.query(
+        "variant == 'hf' and data_level == 'force_component'"
+    ).iloc[0]
+    assert row["rows"] == 6
+    assert row["standardized_residual_rows"] == 4
     assert row["zero_zero_standardized_residual_rows"] == 1
     assert row["undefined_standardized_residual_rows"] == 1
-    assert row["mean_absolute_standardized_residual"] == 0.0
-    assert row["uncertainty_residual_correlation"] == 0.0
-    assert row["correlation_valid_rows"] == 2
-    assert row["correlation_degenerate"] == 1
 
     manifest = _strict_json(result / "plotting_manifest.json")
-    counts = manifest["standardized_residual_counts"]["he/energy"]
+    counts = manifest["standardized_residual_counts"]["hf/force_component"]
     assert counts == {
-        "ecdf_rows": 1,
+        "ecdf_rows": 4,
         "undefined_rows": 1,
         "zero_zero_rows": 1,
     }
@@ -892,19 +881,19 @@ def test_density_grid_sigma_rc_and_artists_follow_config(tmp_path: Path, monkeyp
     assert seen["artist"] == ("He energy", 26.0, 22.0, 18.0, 16.0, "--", 1.5, {1.5}, "ConstrainedLayoutEngine")
 
 
-def test_density_loader_reads_only_four_panels_two_columns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_density_loader_reads_only_four_panels_three_columns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from Uncertainty_Quantification.LLPR.llpr import plotting
     expected = {"he/energy.csv", "hf/force_components.csv", "hef/energy.csv", "hef/force_components.csv"}
     for relative in expected:
         path = tmp_path / relative; path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame({"std": [1.0], "residual": [-2.0], "unused": ["x"]}).to_csv(path, index=False)
+        pd.DataFrame({"q": [0.5], "std": [1.0], "residual": [-2.0], "unused": ["x"]}).to_csv(path, index=False)
     calls: list[tuple[str, tuple[str, ...]]] = []; real_read = pd.read_csv
     def read(path: Path, **kwargs: object) -> pd.DataFrame:
         calls.append((str(Path(path).relative_to(tmp_path)), tuple(kwargs.get("usecols", ())))); return real_read(path, **kwargs)
     monkeypatch.setattr(plotting.pd, "read_csv", read)
     panels = plotting._load_carnet_panels(tmp_path)
     assert {name for name, _ in calls} == expected
-    assert all(columns == ("std", "residual") for _, columns in calls)
+    assert all(columns == ("q", "std", "residual") for _, columns in calls)
     assert all(not hasattr(panel, "signed_residual") for panel in panels.values())
 
 
@@ -974,3 +963,75 @@ def test_density_live_change_preserves_existing_output_bytes(tmp_path: Path, mon
     with pytest.raises(ValueError, match="input.*changed"):
         run_plot(root, output_dir=output, style="carnet_density")
     assert {path.relative_to(output): path.read_bytes() for path in output.rglob("*") if path.is_file()} == before
+
+
+def test_density_zero_q_categories_retain_raw_rows_but_exclude_zero_std() -> None:
+    panels = {
+        path: _density_panel(
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 2.0, 0.0, 3.0],
+            target=path[1],
+            q=[0.0, 0.0, 1.0, 1.0],
+        )
+        for path in density_plotting.CARNET_SELECTED
+    }
+
+    row = density_plotting.carnet_statistics(
+        panels, carnet_shared_limits(panels, margin=0.05)
+    )[0]
+
+    assert row["rows"] == 4
+    assert row["zero_q_rows"] == 2
+    assert row["zero_q_zero_residual_rows"] == 1
+    assert row["zero_q_nonzero_residual_rows"] == 1
+    assert row["metric_rows"] == 2
+    assert row["log_plot_rows"] == 1
+    assert row["excluded_from_log_rows"] == 3
+
+
+def test_density_policy_publication_reports_zero_q_categories_in_csv_and_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "publication").mkdir()
+    root, _ = publication_support._policy_bound_publication_root(
+        tmp_path / "publication", monkeypatch
+    )
+    validate_publication_root(root)
+
+    result = run_plot(
+        root, output_dir=tmp_path / "plots", style="carnet_density"
+    )
+
+    statistics = pd.read_csv(result / "plotting_statistics.csv")
+    manifest = _strict_json(result / "plotting_manifest.json")
+    for variant in ("hf", "hef"):
+        row = statistics.query(
+            "variant == @variant and target == 'forces'"
+        ).iloc[0]
+        assert row["zero_q_rows"] == 2
+        assert row["zero_q_zero_residual_rows"] == 0
+        assert row["zero_q_nonzero_residual_rows"] == 2
+        assert row["metric_rows"] == row["rows"] - 2
+        assert manifest["statistics"][f"{variant}/forces"][
+            "zero_q_nonzero_residual_rows"
+        ] == 2
+
+
+def test_density_staging_rejects_inconsistent_zero_q_categories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    result = run_plot(
+        root, output_dir=tmp_path / "plots", style="carnet_density"
+    )
+    statistics_path = result / "plotting_statistics.csv"
+    statistics = pd.read_csv(statistics_path)
+    statistics.loc[0, "zero_q_rows"] = 1
+    statistics.loc[0, "zero_q_zero_residual_rows"] = 0
+    statistics.loc[0, "zero_q_nonzero_residual_rows"] = 0
+    statistics.to_csv(statistics_path, index=False)
+
+    with pytest.raises(RuntimeError, match="zero-q.*inconsistent"):
+        plotting._validate_carnet_staging(result)

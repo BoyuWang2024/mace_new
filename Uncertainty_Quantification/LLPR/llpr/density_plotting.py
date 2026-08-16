@@ -61,6 +61,9 @@ CARNET_STATISTICS_FIELDS = (
     "rows",
     "finite_rows",
     "nonfinite_rows",
+    "zero_q_rows",
+    "zero_q_zero_residual_rows",
+    "zero_q_nonzero_residual_rows",
     "nonpositive_std_rows",
     "zero_absolute_residual_rows",
     "metric_rows",
@@ -78,9 +81,10 @@ CARNET_STATISTICS_FIELDS = (
 
 @dataclass(frozen=True, slots=True)
 class DensityPanel:
-    """The only two numeric arrays needed by one density panel."""
+    """The only three numeric arrays needed by one density panel."""
 
     uncertainty: np.ndarray
+    q: np.ndarray
     absolute_residual: np.ndarray
     target: str
     unit: str
@@ -115,6 +119,15 @@ def _panel_arrays(panel: Any) -> tuple[np.ndarray, np.ndarray]:
     if uncertainty.ndim != 1 or residual.ndim != 1 or uncertainty.shape != residual.shape:
         raise ValueError("density panel arrays must be aligned one-dimensional arrays")
     return uncertainty, residual
+
+
+def _panel_q(panel: Any, shape: tuple[int, ...]) -> np.ndarray:
+    q_value = np.asarray(panel.q, dtype=np.float64)
+    if q_value.ndim != 1 or q_value.shape != shape:
+        raise ValueError("density panel q must align with plotted arrays")
+    if not np.isfinite(q_value).all() or np.any(q_value < 0.0):
+        raise ValueError("density panel q must be finite and non-negative")
+    return q_value
 
 
 def _log_mask(panel: Any) -> np.ndarray:
@@ -202,6 +215,12 @@ def _analyze_panel(
     limits: tuple[float, float],
 ) -> _PanelAnalysis:
     uncertainty, residual = _panel_arrays(panel)
+    q_value = _panel_q(panel, uncertainty.shape)
+    zero_q = q_value == 0.0
+    zero_q_rows = int(np.count_nonzero(zero_q))
+    zero_q_zero_residual_rows = int(
+        np.count_nonzero(zero_q & (residual == 0.0))
+    )
     finite = np.isfinite(uncertainty) & np.isfinite(residual)
     metric = finite & (uncertainty > 0.0)
     log_mask = metric & (residual > 0.0)
@@ -216,6 +235,11 @@ def _analyze_panel(
         "rows": int(uncertainty.size),
         "finite_rows": int(np.count_nonzero(finite)),
         "nonfinite_rows": int(np.count_nonzero(~finite)),
+        "zero_q_rows": zero_q_rows,
+        "zero_q_zero_residual_rows": zero_q_zero_residual_rows,
+        "zero_q_nonzero_residual_rows": (
+            zero_q_rows - zero_q_zero_residual_rows
+        ),
         "nonpositive_std_rows": int(
             np.count_nonzero(finite & (uncertainty <= 0.0))
         ),
