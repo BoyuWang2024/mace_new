@@ -192,7 +192,7 @@ def test_calculator_result_copy_has_no_mutable_aliases() -> None:
         atoms,
         energy=np.array(-2.0, dtype=np.float32),
         free_energy=np.array(-2.1, dtype=np.float64),
-        magmom=np.array(1.25, dtype=np.float32),
+        magmom=np.array(2, dtype=np.int32),
         forces=np.array(
             [[0.1, 0.2, 0.3], [-0.1, -0.2, -0.3]], dtype=np.float64
         ),
@@ -220,8 +220,11 @@ def test_calculator_result_copy_has_no_mutable_aliases() -> None:
         assert not np.shares_memory(copied.arrays[name], atoms.arrays[name])
     for name in ("energy", "free_energy", "magmom"):
         assert copied.calc.results[name] is not atoms.calc.results[name]
-        assert not isinstance(copied.calc.results[name], np.ndarray)
+        assert isinstance(copied.calc.results[name], np.generic)
         np.testing.assert_array_equal(copied.calc.results[name], original_values[name])
+        assert np.asarray(copied.calc.results[name]).dtype == np.asarray(
+            atoms.calc.results[name]
+        ).dtype
     for name in ("forces", "stress", "born_effective_charges", "dielectric_tensor"):
         assert copied.calc.results[name] is not atoms.calc.results[name]
         assert not np.shares_memory(
@@ -291,6 +294,44 @@ def test_calculator_result_copy_rejects_value_that_cannot_be_copied() -> None:
         match="calculator result 'energy' cannot be copied safely",
     ):
         dataset_filter._copy_atoms_with_calculator_results(atoms)
+
+
+def test_calculator_result_copy_rejects_object_dtype_arrays() -> None:
+    class UncopyableResult:
+        def __deepcopy__(self, memo: dict[int, object]) -> object:
+            raise TypeError("object array contents must not be copied")
+
+    boxed_mutable = np.empty((), dtype=object)
+    boxed_mutable[()] = ["original"]
+    boxed_uncopyable = np.empty((1,), dtype=object)
+    boxed_uncopyable[0] = UncopyableResult()
+
+    for boxed_value in (boxed_mutable, boxed_uncopyable):
+        atoms = Atoms("H2", positions=[[0, 0, 0], [1, 0, 0]])
+        atoms.calc = SinglePointCalculator(atoms, energy=-2.0)
+        atoms.calc.results["energy"] = boxed_value
+
+        with pytest.raises(
+            ValueError,
+            match="calculator result 'energy' uses an object-dtype array",
+        ):
+            dataset_filter._copy_atoms_with_calculator_results(atoms)
+
+
+def test_calculator_result_copy_rejects_none_without_dropping_key() -> None:
+    atoms = Atoms("H2", positions=[[0, 0, 0], [1, 0, 0]])
+    atoms.calc = SinglePointCalculator(atoms, energy=-2.0)
+    atoms.calc.results["free_energy"] = None
+    original_keys = atoms.calc.results.keys()
+
+    with pytest.raises(
+        ValueError,
+        match="calculator result 'free_energy' cannot be None",
+    ):
+        dataset_filter._copy_atoms_with_calculator_results(atoms)
+
+    assert atoms.calc.results.keys() == original_keys
+    assert atoms.calc.results["free_energy"] is None
 
 
 @pytest.mark.parametrize(

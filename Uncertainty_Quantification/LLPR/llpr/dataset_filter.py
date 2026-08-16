@@ -65,10 +65,16 @@ def _copy_atoms_with_calculator_results(atoms: Atoms) -> Atoms:
     for name, value in atoms.calc.results.items():
         if not isinstance(name, str) or name not in all_properties:
             raise ValueError(f"unsupported calculator result property {name!r}")
+        if value is None:
+            raise ValueError(f"calculator result {name!r} cannot be None")
+        if isinstance(value, np.ndarray) and value.dtype.hasobject:
+            raise ValueError(
+                f"calculator result {name!r} uses an object-dtype array"
+            )
         try:
             if isinstance(value, np.ndarray):
                 copied_value = (
-                    value.item() if value.ndim == 0 else np.array(value, copy=True)
+                    value.copy()[()] if value.ndim == 0 else np.array(value, copy=True)
                 )
             else:
                 copied_value = deepcopy(value)
