@@ -317,6 +317,8 @@ def _load_calibrations(
             audit_document = json.loads(audit_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError) as error:
             raise ValueError("calibration force exclusion audit is invalid") from error
+        if sha256_file(audit_path) != audit_sha256:
+            raise ValueError("calibration force exclusion audit SHA mismatch")
         audit_fields = {
             "schema_version",
             "zero_q_policy",
@@ -331,6 +333,7 @@ def _load_calibrations(
         if (
             not isinstance(audit_document, Mapping)
             or set(audit_document) != audit_fields
+            or audit_document["schema_version"] != SCHEMA_VERSION
             or audit_document["zero_q_policy"] != ZERO_Q_POLICY
             or audit_document["status"] != "complete"
             or audit_document["identity"] != base_identity
@@ -1034,41 +1037,6 @@ def _validate_complete_outputs(
         for index, row in enumerate(structure_rows):
             source = f"{variant}/force_structure.csv"
             num_atoms = _csv_integer(row, "num_atoms", source)
-        component_offset = 0
-        for structure_row, component_count in zip(
-            structure_rows, expected_component_counts
-        ):
-            component_rows = force_rows[
-                component_offset : component_offset + component_count
-            ]
-            component_offset += component_count
-            residual_values = [float(row["residual"]) for row in component_rows]
-            q_component_values = [float(row["q"]) for row in component_rows]
-            variance_component_values = [
-                float(row["variance"]) for row in component_rows
-            ]
-            expected_structure_values = {
-                "mae": math.fsum(abs(value) for value in residual_values)
-                / component_count,
-                "rmse": math.sqrt(
-                    math.fsum(value * value for value in residual_values)
-                    / component_count
-                ),
-                "mean_q": math.fsum(q_component_values) / component_count,
-                "mean_variance": math.fsum(variance_component_values)
-                / component_count,
-            }
-            for field, expected_value in expected_structure_values.items():
-                actual_value = _finite_float(
-                    structure_row[field],
-                    f"{variant}/force_structure.csv {field}",
-                )
-                if not math.isclose(
-                    actual_value, expected_value, rel_tol=1.0e-12, abs_tol=1.0e-15
-                ):
-                    raise ValueError(
-                        f"{variant} force-structure {field} does not match components"
-                    )
             components = _csv_integer(row, "components", source)
             if components != expected_component_counts[index]:
                 raise ValueError(f"{variant} force component count mismatch")
@@ -1110,6 +1078,41 @@ def _validate_complete_outputs(
                 raise ValueError(f"{source} positive q must have positive variance and std")
             force_observations.append((*actual_key, *values[:3]))
 
+        component_offset = 0
+        for structure_row, component_count in zip(
+            structure_rows, expected_component_counts
+        ):
+            component_rows = force_rows[
+                component_offset : component_offset + component_count
+            ]
+            component_offset += component_count
+            residual_values = [float(row["residual"]) for row in component_rows]
+            q_component_values = [float(row["q"]) for row in component_rows]
+            variance_component_values = [
+                float(row["variance"]) for row in component_rows
+            ]
+            expected_structure_values = {
+                "mae": math.fsum(abs(value) for value in residual_values)
+                / component_count,
+                "rmse": math.sqrt(
+                    math.fsum(value * value for value in residual_values)
+                    / component_count
+                ),
+                "mean_q": math.fsum(q_component_values) / component_count,
+                "mean_variance": math.fsum(variance_component_values)
+                / component_count,
+            }
+            for field, expected_value in expected_structure_values.items():
+                actual_value = _finite_float(
+                    structure_row[field],
+                    f"{variant}/force_structure.csv {field}",
+                )
+                if not math.isclose(
+                    actual_value, expected_value, rel_tol=1.0e-12, abs_tol=1.0e-15
+                ):
+                    raise ValueError(
+                        f"{variant} force-structure {field} does not match components"
+                    )
         counts = summaries[variant].get("counts")
         expected_counts = {
             "structures": structures,

@@ -45,6 +45,9 @@ from Uncertainty_Quantification.LLPR.llpr.observables import StructureJacobians
 from Uncertainty_Quantification.LLPR.llpr.readout import ReadoutLayout
 from Uncertainty_Quantification.LLPR.llpr.validation import validate_publication_root
 
+from Uncertainty_Quantification.LLPR.llpr.calibration_policy import (
+    ZERO_Q_POLICY,
+)
 
 _VARIANTS = ("he", "hf", "hef")
 def _formal_output_bytes(evaluation_dir: Path) -> dict[str, bytes]:
@@ -313,6 +316,64 @@ def _samples() -> tuple[list[StructureSample], dict[int, StructureJacobians]]:
     return samples, jacobians
 
 
+def _upgrade_policy_bound_calibration(config: LLPRConfig) -> Path:
+    calibration_dir = run_root(config, "a" * 64) / "calibration" / "deterministic"
+    calibration_path = calibration_dir / "calibrations.pt"
+    artifact = load_torch_artifact(calibration_path)
+    base_identity = dict(artifact["identity"])
+    base_identity.pop("zero_q_policy", None)
+    base_identity.pop("calibration_population", None)
+    base_identity.pop("force_exclusions", None)
+    population = {
+        "energy_structures": 2,
+        "force_used_structures": 2,
+        "force_excluded_structures": 0,
+        "force_components_total": 6,
+        "force_components_used": 6,
+        "force_components_excluded": 0,
+    }
+    audit_document = {
+        "schema_version": SCHEMA_VERSION,
+        "zero_q_policy": ZERO_Q_POLICY,
+        "identity": {**base_identity, "zero_q_policy": ZERO_Q_POLICY},
+        "status": "complete",
+        "counts": population,
+        "exclusions": [],
+    }
+    audit_path = calibration_dir / "force_exclusions.json"
+    atomic_json_dump(audit_path, audit_document)
+    modern_identity = {
+        **base_identity,
+        "zero_q_policy": ZERO_Q_POLICY,
+        "calibration_population": population,
+        "force_exclusions": {
+            "path": "force_exclusions.json",
+            "sha256": sha256_file(audit_path),
+        },
+    }
+    records = [
+        {
+            **record,
+            "rows": population[
+                "energy_structures" if record["target"] == "energy" else "force_components_used"
+            ],
+            "zero_q_policy": ZERO_Q_POLICY,
+            **population,
+            "force_exclusions_sha256": modern_identity["force_exclusions"]["sha256"],
+        }
+        for record in artifact["records"]
+    ]
+    atomic_torch_save(
+        calibration_path,
+        {"identity": modern_identity, "status": "complete", "records": records},
+    )
+    diagnostics_path = calibration_dir / "ridge_diagnostics.json"
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    diagnostics["identity"] = modern_identity
+    atomic_json_dump(diagnostics_path, diagnostics)
+    return calibration_path
+
+
 def _install_fake_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     config: LLPRConfig,
@@ -575,19 +636,8 @@ def test_run_evaluate_preserves_legal_zero_q_force_rows(
 
     config = _config(tmp_path)
     _install_fake_pipeline(monkeypatch, config)
+    _upgrade_policy_bound_calibration(config)
     compute = inference.compute_structure_jacobians
-    evaluation_identity = inference._evaluation_identity
-
-    def policy_bound_identity(*args: object, **kwargs: object) -> dict[str, object]:
-        result = evaluation_identity(*args, **kwargs)
-        result["zero_q"] = {
-            "policy": "test-policy",
-            "calibration_population": {},
-            "force_exclusions_sha256": "0" * 64,
-        }
-        return result
-
-    monkeypatch.setattr(inference, "_evaluation_identity", policy_bound_identity)
 
     def legal_zero_first_force_row(**kwargs: object) -> StructureJacobians:
         result = compute(**kwargs)
@@ -815,6 +865,116 @@ def test_complete_cache_rejects_force_structure_aggregate_tamper(
     _replace_committed_csv(evaluation_dir, "he/force_structure.csv", frame)
 
     with pytest.raises(ValueError, match="force-structure mean_q"):
+        run_evaluate(config)
+
+
+def test_policy_bound_calibration_rejects_bad_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    calibration_path = _upgrade_policy_bound_calibration(config)
+    artifact = load_torch_artifact(calibration_path)
+    artifact["identity"]["calibration_population"]["energy_structures"] = True
+    atomic_torch_save(calibration_path, artifact)
+
+    with pytest.raises(ValueError, match="population count"):
+        run_evaluate(config)
+
+
+def test_policy_bound_calibration_rejects_nonhex_or_tampered_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    calibration_path = _upgrade_policy_bound_calibration(config)
+    artifact = load_torch_artifact(calibration_path)
+    artifact["identity"]["force_exclusions"]["sha256"] = "G" * 64
+    atomic_torch_save(calibration_path, artifact)
+
+    with pytest.raises(ValueError, match="audit SHA is invalid"):
+        run_evaluate(config)
+
+    _upgrade_policy_bound_calibration(config)
+    audit_path = calibration_path.parent / "force_exclusions.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["status"] = "tampered"
+    atomic_json_dump(audit_path, audit)
+    with pytest.raises(ValueError, match="audit SHA mismatch"):
+        run_evaluate(config)
+
+
+def test_policy_bound_calibration_rejects_missing_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    calibration_path = _upgrade_policy_bound_calibration(config)
+    (calibration_path.parent / "force_exclusions.json").unlink()
+
+    with pytest.raises(ValueError, match="audit SHA mismatch"):
+        run_evaluate(config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        ("zero_q_rows", None, "progress schema"),
+        ("zero_q_rows", 7, "zero-q counter"),
+    ),
+)
+def test_complete_policy_cache_rejects_missing_or_forged_zero_q_counter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: int | None,
+    match: str,
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    _upgrade_policy_bound_calibration(config)
+    evaluation_dir = run_evaluate(config)
+    progress_path = evaluation_dir / "progress.pt"
+    progress = load_torch_artifact(progress_path)
+    if value is None:
+        del progress[field]
+    else:
+        progress[field] = value
+    atomic_torch_save(progress_path, progress)
+
+    with pytest.raises(ValueError, match=match):
+        run_evaluate(config)
+
+
+def test_complete_policy_cache_rejects_positive_force_rows_forged_to_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    _upgrade_policy_bound_calibration(config)
+    evaluation_dir = run_evaluate(config)
+    for variant in _VARIANTS:
+        relative_path = f"{variant}/force_components.csv"
+        frame = pd.read_csv(evaluation_dir / relative_path)
+        frame.loc[0, ["q", "variance", "std"]] = 0.0
+        _replace_committed_csv(evaluation_dir, relative_path, frame)
+
+    with pytest.raises(ValueError):
+        run_evaluate(config)
+
+
+def test_complete_cache_rejects_force_structure_mean_variance_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    path = evaluation_dir / "he" / "force_structure.csv"
+    frame = pd.read_csv(path)
+    frame.loc[0, "mean_variance"] = 999.0
+    _replace_committed_csv(evaluation_dir, "he/force_structure.csv", frame)
+
+    with pytest.raises(ValueError, match="force-structure mean_variance"):
         run_evaluate(config)
 
 
