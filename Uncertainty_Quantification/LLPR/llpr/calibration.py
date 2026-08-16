@@ -11,6 +11,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Literal, Mapping
 
+from ase.data import chemical_symbols
 import torch
 from torch import Tensor
 
@@ -22,6 +23,12 @@ from .artifacts import (
     canonical_json,
     load_torch_artifact,
     require_identity,
+    sha256_file,
+)
+from .calibration_policy import (
+    ZERO_Q_POLICY,
+    ForceCalibrationDecision,
+    classify_force_calibration_structure,
 )
 from .checkpoint import CheckpointIdentity, load_checkpoint
 from .config import LLPRConfig
@@ -161,6 +168,7 @@ def _calibration_identity(
     identity = {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
+        "zero_q_policy": ZERO_Q_POLICY,
         "checkpoint": _checkpoint_metadata(checkpoint),
         "curvature": dict(curvature_identity),
         "calibration": _dataset_metadata(dataset),
@@ -196,12 +204,25 @@ def _empty_accumulators() -> dict[str, dict[str, dict[str, float | int]]]:
     }
 
 
+def _empty_counts() -> dict[str, int]:
+    return {
+        "energy_structures": 0,
+        "force_used_structures": 0,
+        "force_excluded_structures": 0,
+        "force_components_total": 0,
+        "force_components_used": 0,
+        "force_components_excluded": 0,
+    }
+
+
 def _new_progress(identity: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "identity": dict(identity),
         "status": "in_progress",
         "next_index": 0,
         "structures": 0,
+        "counts": _empty_counts(),
+        "exclusions": [],
         "accumulators": _empty_accumulators(),
     }
 
@@ -235,6 +256,7 @@ def _validate_progress(progress: Mapping[str, Any]) -> None:
                 raise ValueError("calibration progress sum must be finite and non-negative")
             if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
                 raise ValueError("calibration progress rows must be non-negative")
+    _validate_progress_population(progress)
 
 
 def _matching_identity(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
@@ -276,6 +298,178 @@ def _finite_number(value: Any, field: str, *, non_negative: bool = False) -> flo
 
 def _close_float(actual: float, expected: float) -> bool:
     return math.isclose(actual, expected, rel_tol=1.0e-12, abs_tol=1.0e-15)
+
+
+def _validate_exclusion_entry(
+    entry: Any,
+    *,
+    next_index: int,
+) -> tuple[int, int]:
+    fields = {
+        "calibration_index",
+        "structure_id",
+        "num_atoms",
+        "elements",
+        "force_components_total",
+        "zero_components",
+    }
+    if not isinstance(entry, Mapping) or set(entry) != fields:
+        raise ValueError("calibration progress exclusion schema mismatch")
+    calibration_index = entry["calibration_index"]
+    if (
+        isinstance(calibration_index, bool)
+        or not isinstance(calibration_index, int)
+        or calibration_index < 0
+        or calibration_index >= next_index
+    ):
+        raise ValueError("calibration progress exclusion index is invalid")
+    if not isinstance(entry["structure_id"], str) or not entry["structure_id"]:
+        raise ValueError("calibration progress exclusion structure id is invalid")
+    num_atoms = entry["num_atoms"]
+    if isinstance(num_atoms, bool) or not isinstance(num_atoms, int) or num_atoms <= 0:
+        raise ValueError("calibration progress exclusion num_atoms is invalid")
+    elements = entry["elements"]
+    if (
+        not isinstance(elements, list)
+        or not elements
+        or any(not isinstance(element, str) or not element for element in elements)
+        or elements != sorted(set(elements))
+    ):
+        raise ValueError("calibration progress exclusion elements are invalid")
+    component_total = entry["force_components_total"]
+    if (
+        isinstance(component_total, bool)
+        or not isinstance(component_total, int)
+        or component_total <= 0
+    ):
+        raise ValueError("calibration progress exclusion component count is invalid")
+    zero_components = entry["zero_components"]
+    if not isinstance(zero_components, list) or not zero_components:
+        raise ValueError("calibration progress exclusion zero components are invalid")
+
+    component_fields = {
+        "flat_index",
+        "atom_index",
+        "direction",
+        "reference",
+        "prediction",
+        "residual",
+        "q",
+    }
+    flat_indices: list[int] = []
+    for component in zero_components:
+        if not isinstance(component, Mapping) or set(component) != component_fields:
+            raise ValueError("calibration progress exclusion component schema mismatch")
+        flat_index = component["flat_index"]
+        atom_index = component["atom_index"]
+        direction = component["direction"]
+        if (
+            any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in (flat_index, atom_index, direction)
+            )
+            or flat_index < 0
+            or atom_index < 0
+            or atom_index >= num_atoms
+            or direction not in (0, 1, 2)
+            or divmod(flat_index, 3) != (atom_index, direction)
+        ):
+            raise ValueError("calibration progress exclusion component index is invalid")
+        flat_indices.append(flat_index)
+        reference = _finite_number(component["reference"], "reference")
+        prediction = _finite_number(component["prediction"], "prediction")
+        residual = _finite_number(component["residual"], "residual")
+        if not _close_float(residual, reference - prediction):
+            raise ValueError("calibration progress exclusion residual is inconsistent")
+        q_values = component["q"]
+        if not isinstance(q_values, Mapping) or set(q_values) != set(_VARIANTS):
+            raise ValueError("calibration progress exclusion q variants mismatch")
+        if any(
+            isinstance(q_values[variant], bool)
+            or not isinstance(q_values[variant], (int, float))
+            or float(q_values[variant]) != 0.0
+            for variant in _VARIANTS
+        ):
+            raise ValueError("calibration progress exclusion q must be exact zero")
+    if (
+        flat_indices != sorted(flat_indices)
+        or len(set(flat_indices)) != len(flat_indices)
+        or len(flat_indices) > component_total
+    ):
+        raise ValueError("calibration progress exclusion components are duplicated")
+    return calibration_index, component_total
+
+
+def _validate_progress_population(progress: Mapping[str, Any]) -> None:
+    counts = progress.get("counts")
+    expected_count_fields = set(_empty_counts())
+    if not isinstance(counts, Mapping) or set(counts) != expected_count_fields:
+        raise ValueError("calibration progress counts schema mismatch")
+    for field in expected_count_fields:
+        value = counts[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"calibration progress count {field} is invalid")
+
+    structures = progress["structures"]
+    next_index = progress["next_index"]
+    if next_index != structures:
+        raise ValueError("calibration progress next_index and structures mismatch")
+    if counts["energy_structures"] != structures:
+        raise ValueError("calibration progress energy structure count mismatch")
+    if (
+        counts["force_used_structures"] + counts["force_excluded_structures"]
+        != structures
+    ):
+        raise ValueError("calibration progress force structure count mismatch")
+    if (
+        counts["force_components_used"] + counts["force_components_excluded"]
+        != counts["force_components_total"]
+    ):
+        raise ValueError("calibration progress force component count mismatch")
+
+    accumulators = progress["accumulators"]
+    energy_rows = {
+        accumulators[variant]["energy"]["rows"] for variant in _VARIANTS
+    }
+    force_rows = {
+        accumulators[variant]["forces"]["rows"] for variant in _VARIANTS
+    }
+    if energy_rows != {counts["energy_structures"]}:
+        raise ValueError("calibration progress energy row count mismatch")
+    if force_rows != {counts["force_components_used"]}:
+        raise ValueError("calibration progress force row count mismatch")
+
+    exclusions = progress.get("exclusions")
+    if not isinstance(exclusions, list):
+        raise ValueError("calibration progress exclusions must be a list")
+    indices: list[int] = []
+    excluded_components = 0
+    for entry in exclusions:
+        calibration_index, component_total = _validate_exclusion_entry(
+            entry, next_index=next_index
+        )
+        indices.append(calibration_index)
+        excluded_components += component_total
+    if len(set(indices)) != len(indices) or indices != sorted(indices):
+        raise ValueError("calibration progress has duplicate exclusion entries")
+    if len(exclusions) != counts["force_excluded_structures"]:
+        raise ValueError("calibration progress exclusion count mismatch")
+    if excluded_components != counts["force_components_excluded"]:
+        raise ValueError("calibration progress excluded component count mismatch")
+
+
+def _complete_identity(
+    identity: Mapping[str, Any],
+    counts: Mapping[str, int],
+    audit_sha256: str,
+) -> dict[str, Any]:
+    result = dict(identity)
+    result["calibration_population"] = dict(counts)
+    result["force_exclusions"] = {
+        "path": "force_exclusions.json",
+        "sha256": audit_sha256,
+    }
+    return result
 
 
 def _validate_complete_row_counts(
@@ -387,10 +581,60 @@ def _validate_ridge_diagnostics(
                 raise ValueError("complete calibration diagnostics condition mismatch")
 
 
+def _force_exclusion_audit(
+    identity: Mapping[str, Any],
+    progress: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "zero_q_policy": ZERO_Q_POLICY,
+        "identity": dict(identity),
+        "status": "complete",
+        "counts": dict(progress["counts"]),
+        "exclusions": list(progress["exclusions"]),
+    }
+
+
+def _validate_force_exclusion_audit(
+    audit_path: Path,
+    identity: Mapping[str, Any],
+    progress: Mapping[str, Any],
+) -> dict[str, Any]:
+    audit = _load_strict_json(audit_path)
+    fields = {
+        "schema_version",
+        "zero_q_policy",
+        "identity",
+        "status",
+        "counts",
+        "exclusions",
+    }
+    if not isinstance(audit, Mapping) or set(audit) != fields:
+        raise ValueError("complete calibration force exclusion audit schema mismatch")
+    if audit.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("complete calibration force exclusion audit schema mismatch")
+    if audit.get("zero_q_policy") != ZERO_Q_POLICY:
+        raise ValueError("complete calibration force exclusion audit policy mismatch")
+    audit_identity = audit.get("identity")
+    if not isinstance(audit_identity, Mapping):
+        raise ValueError("complete calibration force exclusion audit identity mismatch")
+    require_identity(audit_identity, identity)
+    if audit.get("status") != "complete":
+        raise ValueError("complete calibration force exclusion audit status mismatch")
+    if canonical_json(audit.get("counts")) != canonical_json(progress["counts"]):
+        raise ValueError("complete calibration force exclusion audit counts mismatch")
+    if canonical_json(audit.get("exclusions")) != canonical_json(
+        progress["exclusions"]
+    ):
+        raise ValueError("complete calibration force exclusion audit entries mismatch")
+    return _complete_identity(identity, progress["counts"], sha256_file(audit_path))
+
+
 def _validate_complete_artifacts(
     artifact_path: Path,
     csv_path: Path,
     diagnostics_path: Path,
+    audit_path: Path,
     identity: Mapping[str, Any],
     progress: Mapping[str, Any],
     ridges: Mapping[str, RidgeRecord],
@@ -400,6 +644,11 @@ def _validate_complete_artifacts(
     for path in (artifact_path, csv_path, diagnostics_path):
         if not path.is_file():
             raise ValueError(f"complete calibration cache is missing {path.name}")
+    if not audit_path.is_file():
+        raise ValueError("complete calibration cache is missing force_exclusions.json")
+    complete_identity = _validate_force_exclusion_audit(
+        audit_path, identity, progress
+    )
     if (
         progress.get("status") != "complete"
         or progress.get("next_index") != target_structures
@@ -413,7 +662,7 @@ def _validate_complete_artifacts(
     artifact = load_torch_artifact(artifact_path)
     if not isinstance(artifact, Mapping):
         raise ValueError("complete calibration artifact must be a mapping")
-    require_identity(artifact.get("identity", {}), identity)
+    require_identity(artifact.get("identity", {}), complete_identity)
     if artifact.get("status") != "complete":
         raise ValueError("complete calibration artifact has an invalid status")
     _validate_record_keys(artifact.get("records"))
@@ -455,7 +704,7 @@ def _validate_complete_artifacts(
         raise ValueError("complete calibration CSV records mismatch")
 
     diagnostics = _load_strict_json(diagnostics_path)
-    _validate_ridge_diagnostics(diagnostics, identity, ridges, spectra)
+    _validate_ridge_diagnostics(diagnostics, complete_identity, ridges, spectra)
 
 
 def _atomic_csv_dump(path: Path, records: list[CalibrationRecord]) -> None:
@@ -578,6 +827,71 @@ def _records_from_progress(
     return records
 
 
+def _sample_elements(batch: Any, atomic_numbers: tuple[int, ...]) -> list[str]:
+    node_attrs = getattr(batch, "node_attrs", None)
+    if (
+        isinstance(node_attrs, Tensor)
+        and node_attrs.ndim == 2
+        and node_attrs.shape[1] == len(atomic_numbers)
+        and node_attrs.shape[0] > 0
+    ):
+        columns = torch.nonzero(
+            torch.any(node_attrs.detach().to(device="cpu") != 0, dim=0),
+            as_tuple=False,
+        ).reshape(-1)
+        if columns.numel() > 0:
+            return sorted(
+                {
+                    chemical_symbols[atomic_numbers[int(column)]]
+                    for column in columns
+                }
+            )
+    if len(atomic_numbers) == 1:
+        return [chemical_symbols[atomic_numbers[0]]]
+    raise ValueError("cannot derive calibration structure elements")
+
+
+def _exclusion_record(
+    sample: Any,
+    indices: Tensor,
+    reference_forces: Tensor,
+    predicted_forces: Tensor,
+    force_residuals: Tensor,
+    force_q_by_variant: Mapping[str, Tensor],
+    decision: ForceCalibrationDecision,
+    atomic_numbers: tuple[int, ...],
+) -> dict[str, Any]:
+    if not decision.exclude_structure or not decision.zero_rows:
+        raise ValueError("force exclusion record requires exact-zero rows")
+    components = []
+    for row in decision.zero_rows:
+        flat_index = int(indices[row])
+        atom_index, direction = divmod(flat_index, 3)
+        components.append(
+            {
+                "flat_index": flat_index,
+                "atom_index": atom_index,
+                "direction": direction,
+                "reference": float(reference_forces[flat_index]),
+                "prediction": float(predicted_forces[flat_index]),
+                "residual": float(force_residuals[row]),
+                "q": {
+                    variant: float(force_q_by_variant[variant][row])
+                    for variant in _VARIANTS
+                },
+            }
+        )
+    components.sort(key=lambda component: component["flat_index"])
+    return {
+        "calibration_index": int(sample.index),
+        "structure_id": str(sample.structure_id),
+        "num_atoms": int(sample.num_atoms),
+        "elements": _sample_elements(sample.batch, atomic_numbers),
+        "force_components_total": int(indices.numel()),
+        "zero_components": components,
+    }
+
+
 def run_calibrate(config: LLPRConfig) -> Path:
     """Calibrate energy and force scales for all three curvature variants."""
     loaded = load_checkpoint(
@@ -614,12 +928,13 @@ def run_calibrate(config: LLPRConfig) -> Path:
     artifact_path = calibration_dir / "calibrations.pt"
     csv_path = calibration_dir / "calibrations.csv"
     diagnostics_path = calibration_dir / "ridge_diagnostics.json"
+    audit_path = calibration_dir / "force_exclusions.json"
     target_structures = dataset.size
     consumer_max_structures = config.runtime.effective_consumer_max_structures
     if consumer_max_structures is not None:
         target_structures = min(target_structures, consumer_max_structures)
 
-    internal_artifacts = (artifact_path, csv_path, diagnostics_path)
+    internal_artifacts = (artifact_path, csv_path, diagnostics_path, audit_path)
     progress: dict[str, Any] | None = None
     if not progress_path.exists() and any(path.exists() for path in internal_artifacts):
         raise ValueError("calibration artifact exists without progress")
@@ -637,6 +952,7 @@ def run_calibrate(config: LLPRConfig) -> Path:
                 artifact_path,
                 csv_path,
                 diagnostics_path,
+                audit_path,
                 identity,
                 candidate,
                 ridges,
@@ -704,32 +1020,91 @@ def run_calibrate(config: LLPRConfig) -> Path:
                 raise ValueError("force Jacobian rows do not match force indices")
             force_residuals = reference_forces[indices] - predicted_forces[indices]
 
-            for variant in _VARIANTS:
-                energy_ratios = _squared_residual_over_q(
+            energy_q_by_variant = {
+                variant: solvers[variant].q(jacobians.g_energy)
+                for variant in _VARIANTS
+            }
+            force_q_by_variant = {
+                variant: solvers[variant].q(jacobians.g_forces)
+                for variant in _VARIANTS
+            }
+            energy_ratios_by_variant = {
+                variant: _squared_residual_over_q(
                     energy_residual,
-                    solvers[variant].q(jacobians.g_energy),
+                    energy_q_by_variant[variant],
                     config.curvature.min_q,
                 )
-                force_ratios = _squared_residual_over_q(
+                for variant in _VARIANTS
+            }
+            decision = classify_force_calibration_structure(
+                jacobians.g_forces,
+                force_q_by_variant,
+                indices,
+            )
+            force_ratios_by_variant = (
+                {}
+                if decision.exclude_structure
+                else {
+                    variant: _squared_residual_over_q(
+                        force_residuals,
+                        force_q_by_variant[variant],
+                        config.curvature.min_q,
+                    )
+                    for variant in _VARIANTS
+                }
+            )
+            exclusion = (
+                _exclusion_record(
+                    sample,
+                    indices,
+                    reference_forces,
+                    predicted_forces,
                     force_residuals,
-                    solvers[variant].q(jacobians.g_forces),
-                    config.curvature.min_q,
+                    force_q_by_variant,
+                    decision,
+                    loaded.identity.atomic_numbers,
                 )
+                if decision.exclude_structure
+                else None
+            )
+
+            for variant in _VARIANTS:
+                energy_ratios = energy_ratios_by_variant[variant]
                 energy_accumulator = progress["accumulators"][variant]["energy"]
                 energy_accumulator["sum"] += float(energy_ratios.sum())
                 energy_accumulator["rows"] += int(energy_ratios.numel())
-                force_accumulator = progress["accumulators"][variant]["forces"]
-                force_accumulator["sum"] += float(force_ratios.sum())
-                force_accumulator["rows"] += int(force_ratios.numel())
+                if not decision.exclude_structure:
+                    force_ratios = force_ratios_by_variant[variant]
+                    force_accumulator = progress["accumulators"][variant]["forces"]
+                    force_accumulator["sum"] += float(force_ratios.sum())
+                    force_accumulator["rows"] += int(force_ratios.numel())
+
+            component_count = int(indices.numel())
+            counts = progress["counts"]
+            counts["energy_structures"] += 1
+            counts["force_components_total"] += component_count
+            if decision.exclude_structure:
+                counts["force_excluded_structures"] += 1
+                counts["force_components_excluded"] += component_count
+                progress["exclusions"].append(exclusion)
+            else:
+                counts["force_used_structures"] += 1
+                counts["force_components_used"] += component_count
 
             progress["next_index"] = sample.index + 1
             progress["structures"] += 1
             if progress["structures"] % config.runtime.save_every_structures == 0:
                 atomic_torch_save(progress_path, progress)
 
+    _validate_progress(progress)
+    audit = _force_exclusion_audit(identity, progress)
+    atomic_json_dump(audit_path, audit)
+    complete_identity = _complete_identity(
+        identity, progress["counts"], sha256_file(audit_path)
+    )
     records = _records_from_progress(progress, ridges)
     artifact = {
-        "identity": identity,
+        "identity": complete_identity,
         "status": "complete",
         "records": [asdict(record) for record in records],
     }
@@ -739,8 +1114,9 @@ def run_calibrate(config: LLPRConfig) -> Path:
         spectra = _compute_spectra(curvature.variants)
     atomic_json_dump(
         diagnostics_path,
-        _ridge_diagnostics(identity, spectra, ridges),
+        _ridge_diagnostics(complete_identity, spectra, ridges),
     )
     progress["status"] = "complete"
+    _validate_progress(progress)
     atomic_torch_save(progress_path, progress)
     return artifact_path

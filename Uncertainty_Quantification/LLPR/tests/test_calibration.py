@@ -21,6 +21,10 @@ from Uncertainty_Quantification.LLPR.llpr.calibration import (
     calibrate_alpha,
     run_calibrate,
 )
+from Uncertainty_Quantification.LLPR.llpr.calibration_policy import (
+    ZERO_Q_POLICY,
+    classify_force_calibration_structure,
+)
 from Uncertainty_Quantification.LLPR.llpr.checkpoint import (
     CheckpointIdentity,
     LoadedCheckpoint,
@@ -348,6 +352,61 @@ def test_alpha_floors_only_positive_tiny_q() -> None:
     ) == pytest.approx(1.0)
 
 
+def test_zero_force_row_excludes_whole_structure() -> None:
+    decision = classify_force_calibration_structure(
+        torch.tensor(
+            [[1.0, 0.0], [0.0, 0.0], [2.0, 1.0]], dtype=torch.float64
+        ),
+        {
+            variant: torch.tensor([1.0, 0.0, 1.0], dtype=torch.float64)
+            for variant in ("he", "hf", "hef")
+        },
+        torch.tensor([0, 7, 8]),
+    )
+
+    assert decision.exclude_structure is True
+    assert decision.zero_components == ((2, 1),)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("negative", "nonfinite", "nonzero_g_zero_q", "variant_mismatch"),
+)
+def test_invalid_force_zero_q_cases_fail_closed(case: str) -> None:
+    gradients = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float64)
+    q_by_variant = {
+        variant: torch.tensor([0.0, 1.0], dtype=torch.float64)
+        for variant in ("he", "hf", "hef")
+    }
+    if case == "negative":
+        q_by_variant["he"][1] = -1.0
+    elif case == "nonfinite":
+        q_by_variant["he"][1] = torch.nan
+    elif case == "nonzero_g_zero_q":
+        for values in q_by_variant.values():
+            values[1] = 0.0
+    else:
+        q_by_variant["hf"][0] = 1.0
+
+    with pytest.raises(ValueError):
+        classify_force_calibration_structure(
+            gradients, q_by_variant, torch.tensor([0, 1])
+        )
+
+
+def test_positive_tiny_force_q_is_not_excluded() -> None:
+    decision = classify_force_calibration_structure(
+        torch.tensor([[1.0, 0.0]], dtype=torch.float64),
+        {
+            variant: torch.tensor([1.0e-320], dtype=torch.float64)
+            for variant in ("he", "hf", "hef")
+        },
+        torch.tensor([5]),
+    )
+
+    assert decision.exclude_structure is False
+    assert decision.zero_components == ()
+
 def test_fixed_singular_system_fails_without_implicit_jitter() -> None:
     with pytest.raises(torch.linalg.LinAlgError):
         CholeskyQuadraticForm(torch.zeros((2, 2), dtype=torch.float64), ridge=0.0)
@@ -373,8 +432,22 @@ def test_run_calibrate_writes_exactly_six_shared_ridge_records(
         "calibrations.csv",
         "ridge_diagnostics.json",
         "progress.pt",
+        "force_exclusions.json",
     }
     artifact = load_torch_artifact(artifact_path)
+    audit = json.loads(
+        (calibration_dir / "force_exclusions.json").read_text(encoding="utf-8")
+    )
+    assert audit["exclusions"] == []
+    assert audit["counts"] == {
+        "energy_structures": 1,
+        "force_used_structures": 1,
+        "force_excluded_structures": 0,
+        "force_components_total": 2,
+        "force_components_used": 2,
+        "force_components_excluded": 0,
+    }
+
     records = artifact["records"]
     assert len(records) == 6
     assert [(row["variant"], row["target"]) for row in records] == [
@@ -704,4 +777,259 @@ def test_run_calibrate_strictly_rejects_invalid_diagnostics_json(
     diagnostics_path.write_text(text, encoding="utf-8")
 
     with pytest.raises(ValueError, match="strict JSON"):
+        run_calibrate(config)
+
+
+def _install_zero_q_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    config: LLPRConfig,
+    *,
+    calls: list[int] | None = None,
+    interrupt_after_exclusion: bool = False,
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import calibration
+
+    _install_fake_pipeline(monkeypatch, config)
+    dataset = DatasetHandle(
+        path=config.calibration.path,
+        sha256="c" * 64,
+        identity=f"calibration-{config.calibration.path.name}",
+        size=2,
+        atomic_numbers=(1,),
+        r_max=6.0,
+        head="default",
+    )
+    samples = (
+        StructureSample(
+            index=0,
+            structure_id="normal-0",
+            num_atoms=1,
+            batch=0,
+            reference_energy_per_atom=torch.tensor(3.0),
+            reference_forces=torch.tensor([[3.0, 4.0, 5.0]]),
+        ),
+        StructureSample(
+            index=1,
+            structure_id="zero-1",
+            num_atoms=1,
+            batch=1,
+            reference_energy_per_atom=torch.tensor(4.0),
+            reference_forces=torch.tensor([[6.0, 7.0, 8.0]]),
+        ),
+    )
+    jacobians = {
+        0: StructureJacobians(
+            energy_per_atom=1.0,
+            forces=torch.tensor([[1.0, 2.0, 3.0]]),
+            g_energy=torch.tensor([1.0, 0.0]),
+            g_forces=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            force_indices=torch.tensor([0, 2]),
+            chunk_size=2,
+        ),
+        1: StructureJacobians(
+            energy_per_atom=1.0,
+            forces=torch.tensor([[1.0, 2.0, 3.0]]),
+            g_energy=torch.tensor([1.0, 0.0]),
+            g_forces=torch.zeros((3, 2)),
+            force_indices=torch.tensor([0, 1, 2]),
+            chunk_size=2,
+        ),
+    }
+
+    def fake_iter_samples(
+        dataset_handle: DatasetHandle,
+        device: torch.device,
+        dtype: torch.dtype,
+        start_index: int = 0,
+        max_structures: int | None = None,
+    ):
+        del dataset_handle, device, dtype
+        selected = samples[start_index:]
+        if max_structures is not None:
+            selected = selected[:max_structures]
+        yield from selected
+        if interrupt_after_exclusion:
+            raise RuntimeError("interrupted after exclusion progress save")
+
+    def fake_compute(**kwargs: object) -> StructureJacobians:
+        index = int(kwargs["batch"])
+        if calls is not None:
+            calls.append(index)
+        return jacobians[index]
+
+    monkeypatch.setattr(
+        calibration,
+        "build_dataset",
+        lambda path, expected_sha256, atomic_numbers, r_max, head: dataset,
+    )
+    monkeypatch.setattr(calibration, "iter_samples", fake_iter_samples)
+    monkeypatch.setattr(calibration, "compute_structure_jacobians", fake_compute)
+
+
+def test_run_calibrate_keeps_energy_and_excludes_whole_force_structure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_zero_q_pipeline(monkeypatch, config)
+
+    artifact_path = run_calibrate(config)
+
+    calibration_dir = artifact_path.parent
+    progress = load_torch_artifact(calibration_dir / "progress.pt")
+    records = load_torch_artifact(artifact_path)["records"]
+    counts = {
+        "energy_structures": 2,
+        "force_used_structures": 1,
+        "force_excluded_structures": 1,
+        "force_components_total": 5,
+        "force_components_used": 2,
+        "force_components_excluded": 3,
+    }
+    assert progress["counts"] == counts
+    assert {
+        variant: {
+            target: progress["accumulators"][variant][target]["rows"]
+            for target in ("energy", "forces")
+        }
+        for variant in ("he", "hf", "hef")
+    } == {
+        variant: {"energy": 2, "forces": 2}
+        for variant in ("he", "hf", "hef")
+    }
+    assert {
+        (record["variant"], record["target"]): record["rows"]
+        for record in records
+    } == {
+        **{(variant, "energy"): 2 for variant in ("he", "hf", "hef")},
+        **{(variant, "forces"): 2 for variant in ("he", "hf", "hef")},
+    }
+
+    audit_path = calibration_dir / "force_exclusions.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["zero_q_policy"] == ZERO_Q_POLICY
+    assert audit["counts"] == counts
+    assert audit["exclusions"] == progress["exclusions"]
+    assert len(audit["exclusions"]) == 1
+    exclusion = audit["exclusions"][0]
+    assert exclusion["calibration_index"] == 1
+    assert exclusion["structure_id"] == "zero-1"
+    assert exclusion["num_atoms"] == 1
+    assert exclusion["elements"] == ["H"]
+    assert exclusion["force_components_total"] == 3
+    assert [
+        (row["atom_index"], row["direction"])
+        for row in exclusion["zero_components"]
+    ] == [(0, 0), (0, 1), (0, 2)]
+    assert all(
+        row["q"] == {"he": 0.0, "hf": 0.0, "hef": 0.0}
+        for row in exclusion["zero_components"]
+    )
+
+    complete_identity = load_torch_artifact(artifact_path)["identity"]
+    assert complete_identity["formula_version"] == FORMULA_VERSION
+    assert complete_identity["zero_q_policy"] == ZERO_Q_POLICY
+    assert complete_identity["calibration_population"] == counts
+    assert complete_identity["force_exclusions"] == {
+        "path": "force_exclusions.json",
+        "sha256": sha256_file(audit_path),
+    }
+
+
+def test_run_calibrate_resume_does_not_duplicate_force_exclusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    calls: list[int] = []
+    _install_zero_q_pipeline(
+        monkeypatch,
+        config,
+        calls=calls,
+        interrupt_after_exclusion=True,
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted after exclusion"):
+        run_calibrate(config)
+
+    progress_path = (
+        run_root(config, "a" * 64)
+        / "calibration"
+        / "deterministic"
+        / "progress.pt"
+    )
+    interrupted = load_torch_artifact(progress_path)
+    assert interrupted["next_index"] == 2
+    assert interrupted["counts"]["force_excluded_structures"] == 1
+    assert len(interrupted["exclusions"]) == 1
+
+    _install_zero_q_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_calibrate(config)
+
+    resumed = load_torch_artifact(progress_path)
+    audit = json.loads(
+        (artifact_path.parent / "force_exclusions.json").read_text(encoding="utf-8")
+    )
+    assert calls == [0, 1]
+    assert len(resumed["exclusions"]) == 1
+    assert audit["exclusions"] == resumed["exclusions"]
+
+
+@pytest.mark.parametrize("tamper", ("missing", "sha", "duplicate", "count"))
+def test_run_calibrate_rejects_force_exclusion_audit_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    config = _config(tmp_path)
+    calls: list[int] = []
+    _install_zero_q_pipeline(monkeypatch, config, calls=calls)
+    artifact_path = run_calibrate(config)
+    audit_path = artifact_path.parent / "force_exclusions.json"
+
+    if tamper == "missing":
+        audit_path.unlink()
+    elif tamper == "duplicate":
+        text = audit_path.read_text(encoding="utf-8")
+        marker = '"zero_q_policy":'
+        audit_path.write_text(
+            text.replace(marker, '"zero_q_policy":"duplicate",' + marker, 1),
+            encoding="utf-8",
+        )
+    else:
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        if tamper == "sha":
+            audit["exclusions"][0]["structure_id"] = "tampered"
+        else:
+            audit["counts"]["force_components_excluded"] += 1
+        audit_path.write_text(
+            json.dumps(audit, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match="calibration|exclusion|audit"):
+        run_calibrate(config)
+    assert calls == [0, 1]
+
+
+def test_run_calibrate_rejects_duplicate_exclusion_in_resume_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_zero_q_pipeline(
+        monkeypatch, config, interrupt_after_exclusion=True
+    )
+    with pytest.raises(RuntimeError, match="interrupted after exclusion"):
+        run_calibrate(config)
+
+    progress_path = (
+        run_root(config, "a" * 64)
+        / "calibration"
+        / "deterministic"
+        / "progress.pt"
+    )
+    progress = load_torch_artifact(progress_path)
+    progress["exclusions"].append(dict(progress["exclusions"][0]))
+    atomic_torch_save(progress_path, progress)
+    _install_zero_q_pipeline(monkeypatch, config)
+
+    with pytest.raises(ValueError, match="duplicate"):
         run_calibrate(config)
