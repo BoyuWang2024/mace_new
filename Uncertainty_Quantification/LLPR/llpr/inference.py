@@ -224,38 +224,37 @@ def _dataset_metadata(dataset: DatasetHandle) -> dict[str, Any]:
 
 
 
-def _load_audit_document(path: Path, expected_sha256: str) -> Mapping[str, Any]:
-    """Read, digest, and strictly parse one stable regular audit object."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _load_secure_json_snapshot(path: Path, source: str) -> tuple[Mapping[str, Any], str]:
+    """Return strictly parsed JSON and SHA from one nonblocking regular-file snapshot."""
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    non_blocking = getattr(os, "O_NONBLOCK", None)
+    if no_follow is None or non_blocking is None:
+        raise ValueError(f"{source} requires safe nonblocking no-follow open")
+    flags = os.O_RDONLY | no_follow | non_blocking
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise ValueError("calibration force exclusion audit SHA mismatch") from error
+        raise ValueError(f"{source} is unavailable") from error
     try:
         with os.fdopen(descriptor, "rb") as handle:
             metadata = os.fstat(handle.fileno())
             if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError("calibration force exclusion audit must be regular")
+                raise ValueError(f"{source} must be regular")
             payload = handle.read()
     except OSError as error:
-        raise ValueError("calibration force exclusion audit is invalid") from error
-    actual_sha256 = hashlib.sha256(payload).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise ValueError("calibration force exclusion audit SHA mismatch")
+        raise ValueError(f"{source} is invalid") from error
+    digest = hashlib.sha256(payload).hexdigest()
 
     def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
             if key in result:
-                raise ValueError("calibration force exclusion audit has duplicate keys")
+                raise ValueError(f"{source} has duplicate keys")
             result[key] = value
         return result
 
     def reject_nonfinite_constant(value: str) -> Any:
-        raise ValueError(
-            "calibration force exclusion audit has a non-finite JSON constant: "
-            + value
-        )
+        raise ValueError(f"{source} has a non-finite JSON constant: {value}")
 
     try:
         document = json.loads(
@@ -264,9 +263,18 @@ def _load_audit_document(path: Path, expected_sha256: str) -> Mapping[str, Any]:
             parse_constant=reject_nonfinite_constant,
         )
     except (UnicodeError, ValueError) as error:
-        raise ValueError("calibration force exclusion audit is invalid") from error
+        raise ValueError(f"{source} is invalid") from error
     if not isinstance(document, Mapping):
-        raise ValueError("calibration force exclusion audit is invalid")
+        raise ValueError(f"{source} is invalid")
+    return document, digest
+
+
+def _load_audit_document(path: Path, expected_sha256: str) -> Mapping[str, Any]:
+    document, actual_sha256 = _load_secure_json_snapshot(
+        path, "calibration force exclusion audit"
+    )
+    if actual_sha256 != expected_sha256:
+        raise ValueError("calibration force exclusion audit SHA mismatch")
     return document
 
 
@@ -506,23 +514,62 @@ def _load_calibrations(
 def _load_cholesky_diagnostics(
     path: Path,
     calibration_identity: Mapping[str, Any],
-) -> dict[str, Mapping[str, Any]]:
-    if not path.exists():
-        raise ValueError("calibration ridge diagnostics are missing")
-    document = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(document, Mapping) or document.get("status") != "complete":
+    calibrations: Mapping[str, Mapping[str, Mapping[str, Any]]],
+) -> tuple[dict[str, Mapping[str, Any]], str]:
+    document, digest = _load_secure_json_snapshot(path, "calibration ridge diagnostics")
+    if (
+        set(document) != {"identity", "status", "variants"}
+        or document.get("status") != "complete"
+    ):
         raise ValueError("ridge diagnostics must be a complete mapping")
     require_identity(document.get("identity", {}), calibration_identity)
     variants = document.get("variants")
     if not isinstance(variants, Mapping) or set(variants) != set(_VARIANTS):
         raise ValueError("ridge diagnostics must contain he, hf, and hef")
+    fields = {
+        "ridge_mode",
+        "ridge",
+        "eigenvalue_min",
+        "eigenvalue_max",
+        "regularized_condition_number",
+    }
     result: dict[str, Mapping[str, Any]] = {}
     for variant in _VARIANTS:
         value = variants[variant]
-        if not isinstance(value, Mapping):
-            raise ValueError("ridge diagnostics variant must be a mapping")
-        result[variant] = value
-    return result
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise ValueError("ridge diagnostics variant schema mismatch")
+        energy = calibrations[variant]["energy"]
+        if value["ridge_mode"] != energy["ridge_mode"]:
+            raise ValueError("ridge diagnostics ridge mode mismatch")
+        for field in ("ridge", "eigenvalue_min", "eigenvalue_max"):
+            number = value[field]
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, (int, float))
+                or not math.isfinite(float(number))
+            ):
+                raise ValueError(f"ridge diagnostics {field} is invalid")
+        if (
+            float(value["ridge"]) < 0.0
+            or float(value["eigenvalue_max"]) < float(value["eigenvalue_min"])
+            or not math.isclose(
+                float(value["ridge"]),
+                float(energy["ridge"]),
+                rel_tol=1.0e-12,
+                abs_tol=1.0e-15,
+            )
+        ):
+            raise ValueError("ridge diagnostics values mismatch")
+        condition = value["regularized_condition_number"]
+        if condition is not None and (
+            isinstance(condition, bool)
+            or not isinstance(condition, (int, float))
+            or not math.isfinite(float(condition))
+            or float(condition) < 0.0
+        ):
+            raise ValueError("ridge diagnostics condition is invalid")
+        result[variant] = dict(value)
+    return result, digest
 
 
 def _evaluation_identity(
@@ -533,7 +580,7 @@ def _evaluation_identity(
     curvature_sha256: str,
     curvature_identity: Mapping[str, Any],
     calibration_path: Path,
-    diagnostics_path: Path,
+    diagnostics_sha256: str,
     calibration_identity: Mapping[str, Any],
     calibration_records: Mapping[str, Mapping[str, Any]],
     dataset: DatasetHandle,
@@ -555,7 +602,7 @@ def _evaluation_identity(
         },
         "calibration": {
             "sha256": sha256_file(calibration_path),
-            "diagnostics_sha256": sha256_file(diagnostics_path),
+            "diagnostics_sha256": diagnostics_sha256,
             "identity": dict(calibration_identity),
             "records": {
                 variant: {
@@ -1307,8 +1354,8 @@ def run_evaluate(config: LLPRConfig) -> Path:
         config,
         curvature_artifact,
     )
-    diagnostics = _load_cholesky_diagnostics(
-        diagnostics_path, calibration_identity
+    diagnostics, diagnostics_sha256 = _load_cholesky_diagnostics(
+        diagnostics_path, calibration_identity, calibrations
     )
     identity = _evaluation_identity(
         config,
@@ -1318,7 +1365,7 @@ def run_evaluate(config: LLPRConfig) -> Path:
         curvature.sha256,
         curvature.identity,
         calibration_path,
-        diagnostics_path,
+        diagnostics_sha256,
         calibration_identity,
         calibrations,
         dataset,

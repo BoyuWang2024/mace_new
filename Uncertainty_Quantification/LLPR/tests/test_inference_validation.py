@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -912,7 +915,7 @@ def test_policy_bound_calibration_rejects_missing_audit(
     calibration_path = _upgrade_policy_bound_calibration(config)
     (calibration_path.parent / "force_exclusions.json").unlink()
 
-    with pytest.raises(ValueError, match="audit SHA mismatch"):
+    with pytest.raises(ValueError, match="audit"):
         run_evaluate(config)
 
 
@@ -1096,6 +1099,72 @@ def test_audit_parser_rejects_duplicate_keys_and_nonfinite_constants(
         path.write_bytes(payload)
         with pytest.raises(ValueError, match="audit"):
             _load_audit_document(path, sha256_file(path))
+
+
+def test_secure_json_snapshot_rejects_fifo_directory_and_symlink_bounded(
+    tmp_path: Path,
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr.inference import _load_audit_document
+
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    with pytest.raises(ValueError, match="audit"):
+        _load_audit_document(directory, "0" * 64)
+
+    regular = tmp_path / "regular.json"
+    regular.write_text("{}", encoding="utf-8")
+    symlink = tmp_path / "audit-link.json"
+    os.symlink(regular, symlink)
+    with pytest.raises(ValueError, match="audit"):
+        _load_audit_document(symlink, sha256_file(regular))
+
+    fifo = tmp_path / "audit.fifo"
+    os.mkfifo(fifo)
+    script = (
+        "from pathlib import Path\n"
+        "from Uncertainty_Quantification.LLPR.llpr.inference import _load_audit_document\n"
+        "try:\n"
+        f" _load_audit_document(Path({str(fifo)!r}), '0' * 64)\n"
+        "except ValueError:\n"
+        " raise SystemExit(0)\n"
+        "raise SystemExit(1)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path.cwd(),
+        capture_output=True,
+        timeout=10.0,
+        check=False,
+    )
+    assert completed.returncode == 0
+
+
+def test_diagnostics_snapshot_rejects_a_sha_b_parse_attack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    evaluation_dir = run_evaluate(config)
+    diagnostics_path = (
+        run_root(config, "a" * 64) / "calibration" / "deterministic"
+        / "ridge_diagnostics.json"
+    )
+    audit_b = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    audit_b["variants"]["he"]["eigenvalue_min"] += 0.125
+    summary_path = evaluation_dir / "he" / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["cholesky_diagnostics"] = audit_b["variants"]["he"]
+    atomic_json_dump(summary_path, summary)
+
+    original_read_text = Path.read_text
+    def read_b_for_diagnostics(self: Path, *args: object, **kwargs: object) -> str:
+        if self == diagnostics_path:
+            return json.dumps(audit_b)
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_b_for_diagnostics)
+    with pytest.raises(ValueError, match="summary does not match"):
+        run_evaluate(config)
 
 
 def test_run_evaluate_rejects_resume_identity_mismatch(
