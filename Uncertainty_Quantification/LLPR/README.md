@@ -173,18 +173,25 @@ smoke calibrate/evaluate 固定 30 分钟；formal calibrate/evaluate 固定
 结构。validate/plot 固定 2 小时。
 
 零 q recovery 配置使用全新 experiment 和绘图根，不会 resume 或覆盖失败的
-`mad_test_madval_alpha_r2scan`、`matpes_train_matpesval_alpha_r2scan` 及旧
-smoke 结果。MAD v2 输入固定为：
-以下计数和 SHA 是在与远端 raw SHA 一致的本地兼容副本上、使用同一 v2 filter
-得到的 candidate；配置暂时绑定这些 candidate 值。GitHub push 与远端 fetch 门禁
-仍被 SSH 22/443 超时阻塞，因此它们尚不是远端 measured 值，必须在门禁恢复后于
-干净远端 worktree 逐字节复现并确认，才能提交任何 recovery 作业。
+`mad_test_madval_alpha_r2scan`、`matpes_train_matpesval_alpha_r2scan`、旧
+smoke 结果或失败的 `smoke_mad_test_madval_alpha_r2scan_zero_q_recovery_v1`。
+MAD label-preserving filter 修复在提交 `094c43d` 经审批后从相同 raw SHA 于
+干净远端 worktree 重新生成全新命名文件；remote measured 身份固定为：
 
-- val：`mad-val.filtered-r6-v2.extxyz`，9503 / 9476 / 27
-  （total / retained / excluded），SHA256
-  `5c730961cb85c960a2cd4942571a7c66656a389664ca96eee63908361f8163c2`；
-- test：`mad-test.filtered-r6-v2.extxyz`，9486 / 9460 / 26，SHA256
-  `71c5e48905176b5132f51f3555bbd2e4fedb4c2f342f24b5f183042c456f7657`。
+- val：`mad-val-compatible-distinct-v2-labeled-v1.xyz`，9503 / 9476 / 27
+  （total / retained / excluded），输出 SHA256
+  `915ecd13652c39b6b7386b61bc7a88dd6fdd5744d7b75875815be13d308c4ec3`，
+  audit SHA256 `faa902d586e22c76abfaa7f5648765d8a52bb500b120c4e3baf28f017dd33221`；
+- test：`mad-test-compatible-distinct-v2-labeled-v1.xyz`，9486 / 9460 / 26，
+  输出 SHA256 `5e6dc382dd238f1773ec08171ae58c929e89f4925647dac3cb6f8e09a56a0020`，
+  audit SHA256 `01ee4d4e59112de532f6d529f04374384df2a28405588ded1880a89319ee44ad`。
+
+远端逐帧验收证明 retained frame 的 calculator 保留 raw 的 `energy`、`forces`
+和可选 `stress`，键、dtype、shape、值均一致；energy/forces 全部有限，force
+shape 精确为 `(natoms, 3)`。旧 `mad-*.filtered-r6-v2.extxyz` 是已确认缺失
+calculator labels 的错误产物，仅作失败证据保留，不再由任何配置消费。作业 11691
+的失败 root、progress 和 stdout/stderr 同样只读保留；本次只准备配置，不提交
+Slurm 作业。
 
 MAD recovery smoke 消费前 86 个 retained 结构，因此跨过被 v2 audit 排除的原始
 `source_index=85`；MATPES recovery smoke 消费前 159 个结构且不截断力分量，
@@ -195,7 +202,7 @@ MAD recovery smoke 消费前 86 个 retained 结构，因此跨过被 v2 audit �
 
 - `plot_carnet_matpes_test.yaml` 读取现有已验证的 MATPES test canonical 结果，镜像到 `Uncertainty_Quantification/Plots/LLPR/matpes_test`；
 - `plot_carnet_mad_test.yaml` 读取正式
-  `mad_test_madval_alpha_r2scan_zero_q_recovery_v1` 结果；
+  `mad_test_madval_alpha_r2scan_zero_q_recovery_v2` 结果；
 - `plot_carnet_matpes_train.yaml` 读取正式
   `matpes_train_matpesval_alpha_r2scan_zero_q_recovery_v1` 结果。
 

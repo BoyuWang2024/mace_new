@@ -269,11 +269,11 @@ def _yaml_config(name: str) -> dict[str, object]:
     [
         (
             "gpu_mad_shared_curvature.yaml",
-            ("../../../data/dataset/mad-val.filtered-r6-v2.extxyz", "5c730961cb85c960a2cd4942571a7c66656a389664ca96eee63908361f8163c2"),
-            ("../../../data/dataset/mad-test.filtered-r6-v2.extxyz", "71c5e48905176b5132f51f3555bbd2e4fedb4c2f342f24b5f183042c456f7657"),
-            "mad_test_madval_alpha_r2scan_zero_q_recovery_v1",
+            ("../../../data/dataset/mad-val-compatible-distinct-v2-labeled-v1.xyz", "915ecd13652c39b6b7386b61bc7a88dd6fdd5744d7b75875815be13d308c4ec3"),
+            ("../../../data/dataset/mad-test-compatible-distinct-v2-labeled-v1.xyz", "5e6dc382dd238f1773ec08171ae58c929e89f4925647dac3cb6f8e09a56a0020"),
+            "mad_test_madval_alpha_r2scan_zero_q_recovery_v2",
             "plot_carnet_mad_test.yaml",
-            "../../Plots/LLPR/mad_test_zero_q_recovery_v1",
+            "../../Plots/LLPR/mad_test_zero_q_recovery_v2",
         ),
         (
             "gpu_matpes_train_shared_curvature.yaml",
@@ -341,8 +341,8 @@ def test_formal_task7_configs_are_semantically_locked(
             "gpu_mad_shared_curvature_smoke.yaml",
             "plot_carnet_mad_test.yaml",
             "plot_carnet_mad_test_smoke.yaml",
-            "smoke_mad_test_madval_alpha_r2scan_zero_q_recovery_v1",
-            "../../Plots/LLPR/smoke_mad_test_zero_q_recovery_v1",
+            "smoke_mad_test_madval_alpha_r2scan_zero_q_recovery_v2",
+            "../../Plots/LLPR/smoke_mad_test_zero_q_recovery_v2",
             86,
             3,
         ),
@@ -404,8 +404,8 @@ def test_plot_configs_use_distinct_dataset_roots_and_mirrors() -> None:
             LLPR_ROOT.parents[0] / "Plots/LLPR/matpes_test",
         ),
         "plot_carnet_mad_test.yaml": (
-            LLPR_ROOT / "outputs/mad_test_madval_alpha_r2scan_zero_q_recovery_v1/8f147ecffa1d/evaluation/deterministic",
-            LLPR_ROOT.parents[0] / "Plots/LLPR/mad_test_zero_q_recovery_v1",
+            LLPR_ROOT / "outputs/mad_test_madval_alpha_r2scan_zero_q_recovery_v2/8f147ecffa1d/evaluation/deterministic",
+            LLPR_ROOT.parents[0] / "Plots/LLPR/mad_test_zero_q_recovery_v2",
         ),
         "plot_carnet_matpes_train.yaml": (
             LLPR_ROOT / "outputs/matpes_train_matpesval_alpha_r2scan_zero_q_recovery_v1/8f147ecffa1d/evaluation/deterministic",

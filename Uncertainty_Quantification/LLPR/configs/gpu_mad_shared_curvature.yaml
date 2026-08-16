@@ -8,11 +8,11 @@ data:
     path: ../../../data/dataset/matpes_train.extxyz
     expected_sha256: 12ff9403254c955537827ba96c140ee1753a7410ada7910f13c42be0aa308cec
   calibration:
-    path: ../../../data/dataset/mad-val.filtered-r6-v2.extxyz
-    expected_sha256: 5c730961cb85c960a2cd4942571a7c66656a389664ca96eee63908361f8163c2
+    path: ../../../data/dataset/mad-val-compatible-distinct-v2-labeled-v1.xyz
+    expected_sha256: 915ecd13652c39b6b7386b61bc7a88dd6fdd5744d7b75875815be13d308c4ec3
   test:
-    path: ../../../data/dataset/mad-test.filtered-r6-v2.extxyz
-    expected_sha256: 71c5e48905176b5132f51f3555bbd2e4fedb4c2f342f24b5f183042c456f7657
+    path: ../../../data/dataset/mad-test-compatible-distinct-v2-labeled-v1.xyz
+    expected_sha256: 5e6dc382dd238f1773ec08171ae58c929e89f4925647dac3cb6f8e09a56a0020
 artifacts:
   curvature:
     path: ../outputs/_shared_matpes_r2scan/8f147ecffa1d/curvature/base_curvature.pt
@@ -31,4 +31,4 @@ runtime:
   resume: true
 output:
   root: ../outputs
-  experiment: mad_test_madval_alpha_r2scan_zero_q_recovery_v1
+  experiment: mad_test_madval_alpha_r2scan_zero_q_recovery_v2

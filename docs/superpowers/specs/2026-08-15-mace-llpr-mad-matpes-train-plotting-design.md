@@ -256,22 +256,28 @@ MAD 原始数据先经过确定性的 6 Å 邻域筛选。邻居必须是不同�
 正式配置使用筛选后的 `mad-val` 作为 calibration，筛选后的 `mad-test` 作为 test，
 共享同一个 canonical curvature，并执行 `calibrate → evaluate → validate → plot`。
 
-v2 使用全新文件名，不覆盖旧 v1 输出：
-下列计数与 SHA 当前是用同一 v2 filter 在 raw SHA 相同的本地兼容副本上得到的
-candidate，并由配置临时绑定；它们尚未在远端 measured。SSH 22/443 网络门禁恢复后，
-必须在干净远端 worktree 逐字节复现并确认，且旧 v1 资产验收通过，才允许启动 recovery
-作业。
+label-preserving recovery 使用全新文件名，不覆盖旧 v1 或错误 v2 输出。提交
+`094c43d` 的修复后，使用相同 raw SHA 和远端共享环境得到以下 remote measured
+身份：
 
-- `mad-val.filtered-r6-v2.extxyz`：9503 / 9476 / 27
+- `mad-val-compatible-distinct-v2-labeled-v1.xyz`：9503 / 9476 / 27
   （total / retained / excluded），输出 SHA256
-  `5c730961cb85c960a2cd4942571a7c66656a389664ca96eee63908361f8163c2`，
-  audit SHA256 `a4d16d69f1ad395d622a1ffb44f5ff58fd84eca448c54c3310c0cc05f2b7eed8`；
-- `mad-test.filtered-r6-v2.extxyz`：9486 / 9460 / 26，输出 SHA256
-  `71c5e48905176b5132f51f3555bbd2e4fedb4c2f342f24b5f183042c456f7657`，
-  audit SHA256 `9d0242569d389f91c8742be2cec3128768a04b0aac4ad1e0e5d62633fde084af`。
+  `915ecd13652c39b6b7386b61bc7a88dd6fdd5744d7b75875815be13d308c4ec3`，
+  audit SHA256 `faa902d586e22c76abfaa7f5648765d8a52bb500b120c4e3baf28f017dd33221`；
+- `mad-test-compatible-distinct-v2-labeled-v1.xyz`：9486 / 9460 / 26，
+  输出 SHA256
+  `5e6dc382dd238f1773ec08171ae58c929e89f4925647dac3cb6f8e09a56a0020`，
+  audit SHA256 `01ee4d4e59112de532f6d529f04374384df2a28405588ded1880a89319ee44ad`。
 
-val audit 的精确排除索引包含原始 `source_index=85`。旧 filtered 文件、audit、
-失败作业进度和输出根保持原样，不原地覆盖或 resume。
+两个输出逐帧保留 raw calculator 的 `energy`、`forces` 和可选 `stress`；
+所有 retained frame 的结果键、dtype、shape、数值与 raw 精确一致，energy/forces
+有限且 force shape 为 `(natoms, 3)`。几何 predicate、source-index 补集和
+ignored self-edge totals 重新推导一致；val audit 排除 `source_index=85`。
+
+修复前错误的 `mad-val.filtered-r6-v2.extxyz`（`5c730961...f8163c2`）和
+`mad-test.filtered-r6-v2.extxyz`（`71c5e489...56f7657`）缺失 calculator labels。
+它们的 audit、作业 11691 的失败 root/progress/stdout/stderr、旧 v1 filtered/audit、
+shared/legacy curvature 和 14 个旧 Alpha 均保持原样，不原地覆盖、删除或 resume。
 
 ### 7.3 MATPES test
 
@@ -289,7 +295,7 @@ Uncertainty_Quantification/LLPR/outputs/
 │   └── 8f147ecffa1d/
 │       ├── curvature/base_curvature.pt
 │       └── curvature/conversion_audit.json
-├── mad_test_madval_alpha_r2scan_zero_q_recovery_v1/
+├── mad_test_madval_alpha_r2scan_zero_q_recovery_v2/
 │   └── 8f147ecffa1d/
 │       ├── inputs/
 │       ├── calibration/deterministic/
@@ -305,6 +311,9 @@ Uncertainty_Quantification/LLPR/outputs/
 现有本地 `legacy_matpes_r2scan` 目录不移动、不改名、不覆盖。失败的
 `mad_test_madval_alpha_r2scan` 和 `matpes_train_matpesval_alpha_r2scan`
 目录也只读保留。
+失败的 `smoke_mad_test_madval_alpha_r2scan_zero_q_recovery_v1` 及作业 11691
+日志也只读保留；新的 MAD smoke/formal/plot roots 统一使用
+`zero_q_recovery_v2`，MATPES 已成功配置继续使用 `zero_q_recovery_v1`。
 
 ## 9. carnet 风格绘图契约
 
@@ -472,7 +481,7 @@ MATPES/MAD 中确定性截取的小集合完成：
 recovery smoke 使用全新 experiment，不得与旧 smoke、失败 formal 或新 formal
 目录共用 progress 或输出：
 
-- MAD smoke 使用 v2 filtered val/test，`consumer_max_structures: 86` 和
+- MAD smoke 使用 labelled distinct-v2 val/test，`consumer_max_structures: 86` 和
   `consumer_max_force_components_per_structure: 3`。前 86 个 retained 结构跨过
   audit 中被排除的原始 `source_index=85`，验收必须证明输出 source-index 序列没有
   85；
