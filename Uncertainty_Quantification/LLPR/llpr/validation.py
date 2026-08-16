@@ -1669,17 +1669,70 @@ def _assert_validation_inputs(
         raise ValueError(message)
 
 
+def _open_validation_lock(lock_path: Path) -> tuple[int, bool]:
+    flags = os.O_RDWR | os.O_NOFOLLOW
+    try:
+        return os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600), True
+    except FileExistsError:
+        return os.open(lock_path, flags), False
+
+
+def _lock_path_matches_descriptor(lock_path: Path, descriptor: int) -> bool:
+    try:
+        descriptor_state = os.fstat(descriptor)
+        path_state = os.stat(lock_path, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(descriptor_state.st_mode)
+        and stat.S_ISREG(path_state.st_mode)
+        and (descriptor_state.st_dev, descriptor_state.st_ino)
+        == (path_state.st_dev, path_state.st_ino)
+    )
+
+
+def _unlink_owned_empty_lock(lock_path: Path, descriptor: int) -> None:
+    try:
+        descriptor_state = os.fstat(descriptor)
+    except OSError:
+        return
+    if descriptor_state.st_size != 0 or not _lock_path_matches_descriptor(
+        lock_path, descriptor
+    ):
+        return
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 @contextmanager
 def _validation_output_lock(root: Path) -> Iterator[None]:
     lock_path = root.parent / f".{root.name}.validation.lock"
-    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
-    descriptor = os.open(lock_path, flags, 0o600)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
+    while True:
+        try:
+            descriptor, created = _open_validation_lock(lock_path)
+        except FileNotFoundError:
+            continue
+        locked = False
+        try:
+            descriptor_state = os.fstat(descriptor)
+            if not stat.S_ISREG(descriptor_state.st_mode):
+                raise ValueError("validation output lock must be regular")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locked = True
+            if not _lock_path_matches_descriptor(lock_path, descriptor):
+                continue
+            try:
+                yield
+            finally:
+                if created:
+                    _unlink_owned_empty_lock(lock_path, descriptor)
+            return
+        finally:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
 
 def _restore_validation_reports(

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -1666,6 +1667,125 @@ def test_validate_publication_root_writes_deterministic_strict_reports(
     assert b"timestamp" not in serialized
     assert b"NaN" not in serialized
     assert b"Infinity" not in serialized
+
+
+def test_validation_of_plot_snapshot_removes_its_owned_lock_on_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    snapshot_root = tmp_path / ".plots.snapshot-success"
+    root.rename(snapshot_root)
+    lock_path = snapshot_root.parent / f".{snapshot_root.name}.validation.lock"
+
+    assert validate_publication_root(snapshot_root)["status"] == "valid"
+
+    assert not lock_path.exists()
+
+
+def test_validation_of_plot_snapshot_removes_its_owned_lock_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    snapshot_root = tmp_path / ".plots.snapshot-failure"
+    root.rename(snapshot_root)
+    (snapshot_root / "he" / "energy.csv").unlink()
+    lock_path = snapshot_root.parent / f".{snapshot_root.name}.validation.lock"
+
+    with pytest.raises(ValueError):
+        validate_publication_root(snapshot_root)
+
+    assert not lock_path.exists()
+
+
+def test_validation_lock_preserves_a_preexisting_or_replaced_inode(
+    tmp_path: Path,
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    root = tmp_path / "publication"
+    root.mkdir()
+    lock_path = root.parent / f".{root.name}.validation.lock"
+    lock_path.write_bytes(b"preexisting")
+    preexisting_inode = lock_path.stat().st_ino
+
+    with validation._validation_output_lock(root):
+        pass
+
+    assert lock_path.read_bytes() == b"preexisting"
+    assert lock_path.stat().st_ino == preexisting_inode
+
+    with lock_path.open("wb"):
+        pass
+    with validation._validation_output_lock(root):
+        replacement = root.parent / ".replacement.validation.lock"
+        replacement.write_bytes(b"other-owner")
+        os.replace(replacement, lock_path)
+
+    assert lock_path.read_bytes() == b"other-owner"
+
+
+def test_validation_lock_cleanup_keeps_waiting_validators_serialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    root = tmp_path / "publication"
+    root.mkdir()
+    lock_path = root.parent / f".{root.name}.validation.lock"
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    waiter_opened = threading.Event()
+    second_entered = threading.Event()
+    failures: list[BaseException] = []
+    real_open = validation.os.open
+
+    def observed_open(
+        path: os.PathLike[str] | str, flags: int, mode: int = 0o777
+    ) -> int:
+        descriptor = real_open(path, flags, mode)
+        if (
+            threading.current_thread().name == "validation-waiter"
+            and Path(path) == lock_path
+        ):
+            waiter_opened.set()
+        return descriptor
+
+    monkeypatch.setattr(validation.os, "open", observed_open)
+
+    def first_validator() -> None:
+        try:
+            with validation._validation_output_lock(root):
+                first_entered.set()
+                if not release_first.wait(timeout=5):
+                    raise AssertionError("timed out waiting to release first validator")
+        except BaseException as error:
+            failures.append(error)
+
+    def second_validator() -> None:
+        try:
+            if not first_entered.wait(timeout=5):
+                raise AssertionError("first validator never acquired the lock")
+            with validation._validation_output_lock(root):
+                second_entered.set()
+        except BaseException as error:
+            failures.append(error)
+
+    first = threading.Thread(target=first_validator, name="validation-owner")
+    second = threading.Thread(target=second_validator, name="validation-waiter")
+    first.start()
+    assert first_entered.wait(timeout=5)
+    second.start()
+    assert waiter_opened.wait(timeout=5)
+    assert not second_entered.is_set()
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not failures
+    assert second_entered.is_set()
+    assert not lock_path.exists()
 
 
 @pytest.mark.parametrize(
