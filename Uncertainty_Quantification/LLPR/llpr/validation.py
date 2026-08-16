@@ -12,7 +12,7 @@ import os
 import stat
 from contextlib import contextmanager
 from pathlib import Path
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory, gettempdir
 from typing import Any, Iterator, Mapping, Sequence
 
 import torch
@@ -1669,70 +1669,162 @@ def _assert_validation_inputs(
         raise ValueError(message)
 
 
-def _open_validation_lock(lock_path: Path) -> tuple[int, bool]:
-    flags = os.O_RDWR | os.O_NOFOLLOW
+def _validation_lock_directory_path() -> Path:
+    return Path(gettempdir()) / f"mace-llpr-validation-locks-{os.getuid()}"
+
+
+def _validation_lock_name(root: Path) -> str:
+    absolute_root = os.path.abspath(os.fspath(root))
+    digest = hashlib.sha256(os.fsencode(absolute_root)).hexdigest()
+    return f"{digest}.lock"
+
+
+def _open_validation_lock_directory() -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory_flag is None:
+        raise ValueError("validation lock directory requires safe no-follow open")
+    flags = os.O_RDONLY | no_follow | directory_flag
+    temporary_root = Path(gettempdir())
+    parent_descriptor = -1
+    directory_descriptor = -1
     try:
-        return os.open(lock_path, flags | os.O_CREAT | os.O_EXCL, 0o600), True
-    except FileExistsError:
-        return os.open(lock_path, flags), False
+        parent_descriptor = os.open(temporary_root, flags)
+        parent_state = os.fstat(parent_descriptor)
+        parent_mode = stat.S_IMODE(parent_state.st_mode)
+        if (
+            not stat.S_ISDIR(parent_state.st_mode)
+            or parent_state.st_uid not in {0, os.getuid()}
+            or (
+                parent_mode & 0o022
+                and not (parent_state.st_mode & stat.S_ISVTX)
+            )
+        ):
+            raise ValueError("validation lock temporary directory is unsafe")
+        directory_name = _validation_lock_directory_path().name
+        try:
+            os.mkdir(directory_name, mode=0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise ValueError("validation lock directory is unavailable") from error
+        try:
+            directory_descriptor = os.open(
+                directory_name,
+                flags,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as error:
+            raise ValueError("validation lock directory is unavailable") from error
+        directory_state = os.fstat(directory_descriptor)
+        path_state = os.stat(
+            directory_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(directory_state.st_mode)
+            or not stat.S_ISDIR(path_state.st_mode)
+            or directory_state.st_uid != os.getuid()
+            or stat.S_IMODE(directory_state.st_mode) != 0o700
+            or (directory_state.st_dev, directory_state.st_ino)
+            != (path_state.st_dev, path_state.st_ino)
+        ):
+            raise ValueError(
+                "validation lock directory must be private and owned by this user"
+            )
+        result = directory_descriptor
+        directory_descriptor = -1
+        return result
+    except OSError as error:
+        raise ValueError("validation lock directory is invalid") from error
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
 
 
-def _lock_path_matches_descriptor(lock_path: Path, descriptor: int) -> bool:
+def _require_private_validation_lock(descriptor: int) -> os.stat_result:
     try:
         descriptor_state = os.fstat(descriptor)
-        path_state = os.stat(lock_path, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("validation output lock is invalid") from error
+    if (
+        not stat.S_ISREG(descriptor_state.st_mode)
+        or descriptor_state.st_uid != os.getuid()
+        or stat.S_IMODE(descriptor_state.st_mode) != 0o600
+        or descriptor_state.st_nlink != 1
+        or descriptor_state.st_size != 0
+    ):
+        raise ValueError(
+            "validation output lock must be an empty private regular file "
+            "owned by this user"
+        )
+    return descriptor_state
+
+
+def _lock_entry_matches_descriptor(
+    directory_descriptor: int,
+    lock_name: str,
+    descriptor_state: os.stat_result,
+) -> bool:
+    try:
+        path_state = os.stat(
+            lock_name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
     except OSError:
         return False
     return (
-        stat.S_ISREG(descriptor_state.st_mode)
-        and stat.S_ISREG(path_state.st_mode)
+        stat.S_ISREG(path_state.st_mode)
         and (descriptor_state.st_dev, descriptor_state.st_ino)
         == (path_state.st_dev, path_state.st_ino)
     )
 
 
-def _unlink_owned_empty_lock(lock_path: Path, descriptor: int) -> None:
+def _open_validation_lock(directory_descriptor: int, lock_name: str) -> int:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    non_blocking = getattr(os, "O_NONBLOCK", None)
+    if no_follow is None or non_blocking is None:
+        raise ValueError("validation output lock requires safe no-follow open")
     try:
-        descriptor_state = os.fstat(descriptor)
-    except OSError:
-        return
-    if descriptor_state.st_size != 0 or not _lock_path_matches_descriptor(
-        lock_path, descriptor
-    ):
-        return
-    try:
-        lock_path.unlink()
-    except FileNotFoundError:
-        pass
+        return os.open(
+            lock_name,
+            os.O_RDWR | os.O_CREAT | no_follow | non_blocking,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as error:
+        raise ValueError("validation output lock is unavailable") from error
 
 
 @contextmanager
 def _validation_output_lock(root: Path) -> Iterator[None]:
-    lock_path = root.parent / f".{root.name}.validation.lock"
-    while True:
-        try:
-            descriptor, created = _open_validation_lock(lock_path)
-        except FileNotFoundError:
-            continue
-        locked = False
-        try:
-            descriptor_state = os.fstat(descriptor)
-            if not stat.S_ISREG(descriptor_state.st_mode):
-                raise ValueError("validation output lock must be regular")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            locked = True
-            if not _lock_path_matches_descriptor(lock_path, descriptor):
-                continue
-            try:
-                yield
-            finally:
-                if created:
-                    _unlink_owned_empty_lock(lock_path, descriptor)
-            return
-        finally:
-            if locked:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
+    directory_descriptor = _open_validation_lock_directory()
+    descriptor = -1
+    locked = False
+    try:
+        lock_name = _validation_lock_name(root)
+        descriptor = _open_validation_lock(directory_descriptor, lock_name)
+        _require_private_validation_lock(descriptor)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        locked = True
+        descriptor_state = _require_private_validation_lock(descriptor)
+        if not _lock_entry_matches_descriptor(
+            directory_descriptor,
+            lock_name,
+            descriptor_state,
+        ):
+            raise ValueError("validation output lock changed while being acquired")
+        yield
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if descriptor >= 0:
             os.close(descriptor)
+        os.close(directory_descriptor)
 
 
 def _restore_validation_reports(

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -1669,88 +1672,219 @@ def test_validate_publication_root_writes_deterministic_strict_reports(
     assert b"Infinity" not in serialized
 
 
-def test_validation_of_plot_snapshot_removes_its_owned_lock_on_success(
+def _isolated_validation_lock_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    lock_temp = tmp_path / "validation-lock-temp"
+    lock_temp.mkdir(mode=0o700)
+    monkeypatch.setattr(tempfile, "tempdir", str(lock_temp))
+    return lock_temp
+
+
+def _expected_validation_lock_path(lock_temp: Path, root: Path) -> Path:
+    root_digest = hashlib.sha256(os.fsencode(os.path.abspath(root))).hexdigest()
+    return (
+        lock_temp
+        / f"mace-llpr-validation-locks-{os.getuid()}"
+        / f"{root_digest}.lock"
+    )
+
+
+def test_validation_of_plot_snapshot_leaves_no_lock_in_result_tree_on_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    lock_temp = _isolated_validation_lock_root(tmp_path, monkeypatch)
     root = _evaluated_publication_root(tmp_path, monkeypatch)
     snapshot_root = tmp_path / ".plots.snapshot-success"
     root.rename(snapshot_root)
-    lock_path = snapshot_root.parent / f".{snapshot_root.name}.validation.lock"
+    adjacent_lock = snapshot_root.parent / f".{snapshot_root.name}.validation.lock"
 
     assert validate_publication_root(snapshot_root)["status"] == "valid"
 
-    assert not lock_path.exists()
+    assert not adjacent_lock.exists()
+    assert not list(snapshot_root.rglob("*.lock"))
+    assert _expected_validation_lock_path(lock_temp, snapshot_root).read_bytes() == b""
 
 
-def test_validation_of_plot_snapshot_removes_its_owned_lock_on_failure(
+def test_validation_of_plot_snapshot_leaves_no_lock_in_result_tree_on_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    lock_temp = _isolated_validation_lock_root(tmp_path, monkeypatch)
     root = _evaluated_publication_root(tmp_path, monkeypatch)
     snapshot_root = tmp_path / ".plots.snapshot-failure"
     root.rename(snapshot_root)
     (snapshot_root / "he" / "energy.csv").unlink()
-    lock_path = snapshot_root.parent / f".{snapshot_root.name}.validation.lock"
+    adjacent_lock = snapshot_root.parent / f".{snapshot_root.name}.validation.lock"
 
     with pytest.raises(ValueError):
         validate_publication_root(snapshot_root)
 
-    assert not lock_path.exists()
+    assert not adjacent_lock.exists()
+    assert not list(snapshot_root.rglob("*.lock"))
+    assert _expected_validation_lock_path(lock_temp, snapshot_root).read_bytes() == b""
 
 
-def test_validation_lock_preserves_a_preexisting_or_replaced_inode(
-    tmp_path: Path,
-) -> None:
-    from Uncertainty_Quantification.LLPR.llpr import validation
-
-    root = tmp_path / "publication"
-    root.mkdir()
-    lock_path = root.parent / f".{root.name}.validation.lock"
-    lock_path.write_bytes(b"preexisting")
-    preexisting_inode = lock_path.stat().st_ino
-
-    with validation._validation_output_lock(root):
-        pass
-
-    assert lock_path.read_bytes() == b"preexisting"
-    assert lock_path.stat().st_ino == preexisting_inode
-
-    with lock_path.open("wb"):
-        pass
-    with validation._validation_output_lock(root):
-        replacement = root.parent / ".replacement.validation.lock"
-        replacement.write_bytes(b"other-owner")
-        os.replace(replacement, lock_path)
-
-    assert lock_path.read_bytes() == b"other-owner"
-
-
-def test_validation_lock_cleanup_keeps_waiting_validators_serialized(
+def test_validation_lock_release_never_unlinks_another_owners_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from Uncertainty_Quantification.LLPR.llpr import validation
 
+    _isolated_validation_lock_root(tmp_path, monkeypatch)
     root = tmp_path / "publication"
     root.mkdir()
-    lock_path = root.parent / f".{root.name}.validation.lock"
+    replacement = tmp_path / "other-owner"
+    replacement.write_bytes(b"other-owner")
+    real_unlink = Path.unlink
+    cleanup_attempts: list[Path] = []
+
+    def replace_during_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name.endswith(".validation.lock") or path.suffix == ".lock":
+            cleanup_attempts.append(path)
+            os.replace(replacement, path)
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", replace_during_cleanup)
+
+    with validation._validation_output_lock(root):
+        pass
+
+    assert cleanup_attempts == []
+    assert replacement.read_bytes() == b"other-owner"
+
+
+def test_validation_lock_has_stable_private_persistent_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    lock_temp = _isolated_validation_lock_root(tmp_path, monkeypatch)
+    first_root = tmp_path / "first" / "publication"
+    second_root = tmp_path / "second" / "publication"
+    first_root.mkdir(parents=True)
+    second_root.mkdir(parents=True)
+    first_lock = _expected_validation_lock_path(lock_temp, first_root)
+    second_lock = _expected_validation_lock_path(lock_temp, second_root)
+
+    with validation._validation_output_lock(first_root):
+        assert first_lock.read_bytes() == b""
+    first_inode = first_lock.stat().st_ino
+    with validation._validation_output_lock(first_root):
+        assert first_lock.stat().st_ino == first_inode
+    with validation._validation_output_lock(second_root):
+        assert second_lock.read_bytes() == b""
+
+    assert first_lock != second_lock
+    assert first_lock.stat().st_mode & 0o777 == 0o600
+    assert first_lock.stat().st_uid == os.getuid()
+    lock_directory = first_lock.parent
+    assert lock_directory.stat().st_mode & 0o777 == 0o700
+    assert lock_directory.stat().st_uid == os.getuid()
+
+
+@pytest.mark.parametrize("unsafe_kind", ["regular", "symlink", "permissions"])
+def test_validation_lock_rejects_unsafe_lock_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_kind: str,
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    lock_temp = _isolated_validation_lock_root(tmp_path, monkeypatch)
+    lock_directory = lock_temp / f"mace-llpr-validation-locks-{os.getuid()}"
+    if unsafe_kind == "regular":
+        lock_directory.write_bytes(b"not-a-directory")
+    elif unsafe_kind == "symlink":
+        target = tmp_path / "attacker-directory"
+        target.mkdir(mode=0o700)
+        lock_directory.symlink_to(target, target_is_directory=True)
+    else:
+        lock_directory.mkdir(mode=0o700)
+        lock_directory.chmod(0o755)
+    root = tmp_path / "publication"
+    root.mkdir()
+
+    with pytest.raises(ValueError, match="lock directory"):
+        with validation._validation_output_lock(root):
+            pytest.fail("unsafe lock directory was accepted")
+
+
+def test_validation_lock_rejects_foreign_owned_lock_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    _isolated_validation_lock_root(tmp_path, monkeypatch)
+    root = tmp_path / "publication"
+    root.mkdir()
+    real_fstat = validation.os.fstat
+    directory_fstats = 0
+
+    def foreign_directory_fstat(descriptor: int) -> os.stat_result:
+        nonlocal directory_fstats
+        state = real_fstat(descriptor)
+        if validation.stat.S_ISDIR(state.st_mode):
+            directory_fstats += 1
+            if directory_fstats == 2:
+                values = list(state)
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+        return state
+
+    monkeypatch.setattr(validation.os, "fstat", foreign_directory_fstat)
+
+    with pytest.raises(ValueError, match="owned by this user"):
+        with validation._validation_output_lock(root):
+            pytest.fail("foreign-owned lock directory was accepted")
+
+
+@pytest.mark.parametrize(
+    "unsafe_kind", ["permissions", "nonempty", "symlink", "fifo"]
+)
+def test_validation_lock_rejects_unsafe_lock_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_kind: str,
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    lock_temp = _isolated_validation_lock_root(tmp_path, monkeypatch)
+    root = tmp_path / "publication"
+    root.mkdir()
+    lock_path = _expected_validation_lock_path(lock_temp, root)
+    lock_path.parent.mkdir(mode=0o700)
+    target = tmp_path / "symlink-target"
+    if unsafe_kind == "permissions":
+        lock_path.write_bytes(b"")
+        lock_path.chmod(0o644)
+    elif unsafe_kind == "nonempty":
+        lock_path.write_bytes(b"not-empty")
+        lock_path.chmod(0o600)
+    elif unsafe_kind == "symlink":
+        target.write_bytes(b"do-not-touch")
+        lock_path.symlink_to(target)
+    else:
+        os.mkfifo(lock_path, mode=0o600)
+
+    with pytest.raises(ValueError, match="validation output lock"):
+        with validation._validation_output_lock(root):
+            pytest.fail("unsafe lock file was accepted")
+
+    if unsafe_kind == "symlink":
+        assert target.read_bytes() == b"do-not-touch"
+
+
+def test_validation_lock_keeps_waiting_threads_serialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    lock_temp = _isolated_validation_lock_root(tmp_path, monkeypatch)
+    root = tmp_path / "publication"
+    root.mkdir()
     first_entered = threading.Event()
     release_first = threading.Event()
-    waiter_opened = threading.Event()
     second_entered = threading.Event()
     failures: list[BaseException] = []
-    real_open = validation.os.open
-
-    def observed_open(
-        path: os.PathLike[str] | str, flags: int, mode: int = 0o777
-    ) -> int:
-        descriptor = real_open(path, flags, mode)
-        if (
-            threading.current_thread().name == "validation-waiter"
-            and Path(path) == lock_path
-        ):
-            waiter_opened.set()
-        return descriptor
-
-    monkeypatch.setattr(validation.os, "open", observed_open)
 
     def first_validator() -> None:
         try:
@@ -1775,7 +1909,6 @@ def test_validation_lock_cleanup_keeps_waiting_validators_serialized(
     first.start()
     assert first_entered.wait(timeout=5)
     second.start()
-    assert waiter_opened.wait(timeout=5)
     assert not second_entered.is_set()
     release_first.set()
     first.join(timeout=5)
@@ -1785,7 +1918,95 @@ def test_validation_lock_cleanup_keeps_waiting_validators_serialized(
     assert not second.is_alive()
     assert not failures
     assert second_entered.is_set()
-    assert not lock_path.exists()
+    assert _expected_validation_lock_path(lock_temp, root).read_bytes() == b""
+
+
+def test_validation_lock_serializes_two_processes_without_split_brain(
+    tmp_path: Path,
+) -> None:
+    lock_temp = tmp_path / "validation-lock-temp"
+    lock_temp.mkdir(mode=0o700)
+    root = tmp_path / "publication"
+    root.mkdir()
+    environment = os.environ.copy()
+    environment["TMPDIR"] = str(lock_temp)
+    environment["PYTHONHASHSEED"] = "random"
+    script = """
+import sys
+from pathlib import Path
+from Uncertainty_Quantification.LLPR.llpr import validation
+
+blocked = Path(sys.argv[3])
+real_flock = validation.fcntl.flock
+
+def observed_flock(descriptor, operation):
+    if operation == validation.fcntl.LOCK_EX:
+        try:
+            return real_flock(
+                descriptor,
+                operation | validation.fcntl.LOCK_NB,
+            )
+        except BlockingIOError:
+            blocked.write_bytes(b"blocked")
+    return real_flock(descriptor, operation)
+
+validation.fcntl.flock = observed_flock
+with validation._validation_output_lock(Path(sys.argv[1])):
+    Path(sys.argv[2]).write_bytes(b"entered")
+    sys.stdin.readline()
+"""
+    repository_root = Path(__file__).resolve().parents[3]
+
+    def start(entered: Path, blocked: Path) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [sys.executable, "-c", script, str(root), str(entered), str(blocked)],
+            cwd=repository_root,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def wait_for(path: Path, process: subprocess.Popen[str]) -> None:
+        deadline = time.monotonic() + 5
+        while not path.exists():
+            if process.poll() is not None:
+                raise AssertionError(process.stderr.read() if process.stderr else "")
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"timed out waiting for {path.name}")
+            time.sleep(0.01)
+
+    first_entered = tmp_path / "first.entered"
+    first_blocked = tmp_path / "first.blocked"
+    second_entered = tmp_path / "second.entered"
+    second_blocked = tmp_path / "second.blocked"
+    first = start(first_entered, first_blocked)
+    second: subprocess.Popen[str] | None = None
+    try:
+        wait_for(first_entered, first)
+        assert not first_blocked.exists()
+        second = start(second_entered, second_blocked)
+        wait_for(second_blocked, second)
+        assert not second_entered.exists()
+        assert first.stdin is not None
+        first.stdin.write("release\n")
+        first.stdin.flush()
+        assert first.wait(timeout=5) == 0
+        wait_for(second_entered, second)
+        assert second.stdin is not None
+        second.stdin.write("release\n")
+        second.stdin.flush()
+        assert second.wait(timeout=5) == 0
+    finally:
+        for process in (first, second):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+    lock_path = _expected_validation_lock_path(lock_temp, root)
+    assert lock_path.read_bytes() == b""
+    assert list(lock_path.parent.glob("*.lock")) == [lock_path]
 
 
 @pytest.mark.parametrize(
