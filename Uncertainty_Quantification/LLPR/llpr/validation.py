@@ -12,7 +12,7 @@ import os
 import stat
 from contextlib import contextmanager
 from pathlib import Path
-from tempfile import NamedTemporaryFile, TemporaryDirectory, gettempdir
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any, Iterator, Mapping, Sequence
 
 import torch
@@ -1669,13 +1669,64 @@ def _assert_validation_inputs(
         raise ValueError(message)
 
 
+_VALIDATION_LOCK_ROOT = Path("/tmp")
+
+
+def _validation_effective_user_id() -> int:
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        raise ValueError("validation output locking requires POSIX effective-user IDs")
+    return os.geteuid()
+
+
+def _canonical_validation_root(root: Path) -> Path:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory_flag is None:
+        raise ValueError("publication root requires safe POSIX directory open")
+    try:
+        canonical_root = Path(root).resolve(strict=True)
+    except OSError as error:
+        raise ValueError("publication root cannot be resolved") from error
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            canonical_root,
+            os.O_RDONLY | no_follow | directory_flag,
+        )
+        descriptor_state = os.fstat(descriptor)
+        path_state = os.stat(canonical_root, follow_symlinks=False)
+        effective_user_id = _validation_effective_user_id()
+        if (
+            not stat.S_ISDIR(descriptor_state.st_mode)
+            or not stat.S_ISDIR(path_state.st_mode)
+            or descriptor_state.st_uid != effective_user_id
+            or path_state.st_uid != effective_user_id
+            or (descriptor_state.st_dev, descriptor_state.st_ino)
+            != (path_state.st_dev, path_state.st_ino)
+        ):
+            raise ValueError(
+                "publication root must be a stable directory owned by the "
+                "current effective user; multi-user publication writers are "
+                "not supported"
+            )
+    except OSError as error:
+        raise ValueError("publication root is unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return canonical_root
+
+
 def _validation_lock_directory_path() -> Path:
-    return Path(gettempdir()) / f"mace-llpr-validation-locks-{os.getuid()}"
+    return (
+        _VALIDATION_LOCK_ROOT
+        / f"mace-llpr-validation-locks-{_validation_effective_user_id()}"
+    )
 
 
 def _validation_lock_name(root: Path) -> str:
-    absolute_root = os.path.abspath(os.fspath(root))
-    digest = hashlib.sha256(os.fsencode(absolute_root)).hexdigest()
+    canonical_root = _canonical_validation_root(root)
+    digest = hashlib.sha256(os.fsencode(os.fspath(canonical_root))).hexdigest()
     return f"{digest}.lock"
 
 
@@ -1685,64 +1736,73 @@ def _open_validation_lock_directory() -> int:
     if no_follow is None or directory_flag is None:
         raise ValueError("validation lock directory requires safe no-follow open")
     flags = os.O_RDONLY | no_follow | directory_flag
-    temporary_root = Path(gettempdir())
+    temporary_root = _VALIDATION_LOCK_ROOT
     parent_descriptor = -1
     directory_descriptor = -1
     try:
-        parent_descriptor = os.open(temporary_root, flags)
-        parent_state = os.fstat(parent_descriptor)
-        parent_mode = stat.S_IMODE(parent_state.st_mode)
-        if (
-            not stat.S_ISDIR(parent_state.st_mode)
-            or parent_state.st_uid not in {0, os.getuid()}
-            or (
-                parent_mode & 0o022
-                and not (parent_state.st_mode & stat.S_ISVTX)
-            )
-        ):
-            raise ValueError("validation lock temporary directory is unsafe")
-        directory_name = _validation_lock_directory_path().name
         try:
-            os.mkdir(directory_name, mode=0o700, dir_fd=parent_descriptor)
-        except FileExistsError:
-            pass
-        except OSError as error:
-            raise ValueError("validation lock directory is unavailable") from error
-        try:
-            directory_descriptor = os.open(
+            parent_descriptor = os.open(temporary_root, flags)
+            parent_state = os.fstat(parent_descriptor)
+            parent_mode = stat.S_IMODE(parent_state.st_mode)
+            effective_user_id = _validation_effective_user_id()
+            if (
+                not stat.S_ISDIR(parent_state.st_mode)
+                or parent_state.st_uid not in {0, effective_user_id}
+                or (
+                    parent_mode & 0o022
+                    and not (parent_state.st_mode & stat.S_ISVTX)
+                )
+            ):
+                raise ValueError("validation lock temporary directory is unsafe")
+            directory_name = _validation_lock_directory_path().name
+            try:
+                os.mkdir(directory_name, mode=0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise ValueError(
+                    "validation lock directory is unavailable"
+                ) from error
+            try:
+                directory_descriptor = os.open(
+                    directory_name,
+                    flags,
+                    dir_fd=parent_descriptor,
+                )
+            except OSError as error:
+                raise ValueError(
+                    "validation lock directory is unavailable"
+                ) from error
+            directory_state = os.fstat(directory_descriptor)
+            path_state = os.stat(
                 directory_name,
-                flags,
                 dir_fd=parent_descriptor,
+                follow_symlinks=False,
             )
+            if (
+                not stat.S_ISDIR(directory_state.st_mode)
+                or not stat.S_ISDIR(path_state.st_mode)
+                or directory_state.st_uid != effective_user_id
+                or path_state.st_uid != effective_user_id
+                or stat.S_IMODE(directory_state.st_mode) != 0o700
+                or stat.S_IMODE(path_state.st_mode) != 0o700
+                or (directory_state.st_dev, directory_state.st_ino)
+                != (path_state.st_dev, path_state.st_ino)
+            ):
+                raise ValueError(
+                    "validation lock directory must be private and owned by "
+                    "this user"
+                )
         except OSError as error:
-            raise ValueError("validation lock directory is unavailable") from error
-        directory_state = os.fstat(directory_descriptor)
-        path_state = os.stat(
-            directory_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISDIR(directory_state.st_mode)
-            or not stat.S_ISDIR(path_state.st_mode)
-            or directory_state.st_uid != os.getuid()
-            or stat.S_IMODE(directory_state.st_mode) != 0o700
-            or (directory_state.st_dev, directory_state.st_ino)
-            != (path_state.st_dev, path_state.st_ino)
-        ):
-            raise ValueError(
-                "validation lock directory must be private and owned by this user"
-            )
-        result = directory_descriptor
-        directory_descriptor = -1
-        return result
-    except OSError as error:
-        raise ValueError("validation lock directory is invalid") from error
-    finally:
-        if parent_descriptor >= 0:
-            os.close(parent_descriptor)
+            raise ValueError("validation lock directory is invalid") from error
+        finally:
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+    except BaseException:
         if directory_descriptor >= 0:
             os.close(directory_descriptor)
+        raise
+    return directory_descriptor
 
 
 def _require_private_validation_lock(descriptor: int) -> os.stat_result:
@@ -1752,7 +1812,7 @@ def _require_private_validation_lock(descriptor: int) -> os.stat_result:
         raise ValueError("validation output lock is invalid") from error
     if (
         not stat.S_ISREG(descriptor_state.st_mode)
-        or descriptor_state.st_uid != os.getuid()
+        or descriptor_state.st_uid != _validation_effective_user_id()
         or stat.S_IMODE(descriptor_state.st_mode) != 0o600
         or descriptor_state.st_nlink != 1
         or descriptor_state.st_size != 0
@@ -1779,6 +1839,10 @@ def _lock_entry_matches_descriptor(
         return False
     return (
         stat.S_ISREG(path_state.st_mode)
+        and path_state.st_uid == _validation_effective_user_id()
+        and stat.S_IMODE(path_state.st_mode) == 0o600
+        and path_state.st_nlink == 1
+        and path_state.st_size == 0
         and (descriptor_state.st_dev, descriptor_state.st_ino)
         == (path_state.st_dev, path_state.st_ino)
     )
@@ -1802,11 +1866,12 @@ def _open_validation_lock(directory_descriptor: int, lock_name: str) -> int:
 
 @contextmanager
 def _validation_output_lock(root: Path) -> Iterator[None]:
+    canonical_root = _canonical_validation_root(root)
     directory_descriptor = _open_validation_lock_directory()
     descriptor = -1
     locked = False
     try:
-        lock_name = _validation_lock_name(root)
+        lock_name = _validation_lock_name(canonical_root)
         descriptor = _open_validation_lock(directory_descriptor, lock_name)
         _require_private_validation_lock(descriptor)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -1820,11 +1885,15 @@ def _validation_output_lock(root: Path) -> Iterator[None]:
             raise ValueError("validation output lock changed while being acquired")
         yield
     finally:
-        if locked:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        if descriptor >= 0:
-            os.close(descriptor)
-        os.close(directory_descriptor)
+        try:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            try:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            finally:
+                os.close(directory_descriptor)
 
 
 def _restore_validation_reports(
@@ -2102,7 +2171,7 @@ def validate_publication_root(
     *,
     identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    root = Path(publication_root)
+    root = _canonical_validation_root(Path(publication_root))
     if not root.is_dir():
         raise ValueError(f"publication root is not a directory: {root}")
     if not (root / "progress.pt").is_file():
