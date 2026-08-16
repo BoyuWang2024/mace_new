@@ -23,6 +23,10 @@ from .artifacts import (
     sha256_file,
 )
 from .calibration import CholeskyQuadraticForm
+from .calibration_policy import (
+    ZERO_Q_POLICY,
+    classify_force_calibration_structure,
+)
 from .checkpoint import CheckpointIdentity, load_checkpoint
 from .config import LLPRConfig
 from .curvature_source import load_curvature_source
@@ -390,6 +394,31 @@ def _evaluation_identity(
                 config.runtime.effective_consumer_max_force_components_per_structure
             ),
         }
+    zero_q_identity_fields = {
+        "zero_q_policy",
+        "calibration_population",
+        "force_exclusions",
+    }
+    present_zero_q_fields = zero_q_identity_fields & set(calibration_identity)
+    if present_zero_q_fields:
+        if present_zero_q_fields != zero_q_identity_fields:
+            raise ValueError("calibration zero-q provenance is incomplete")
+        if calibration_identity["zero_q_policy"] != ZERO_Q_POLICY:
+            raise ValueError("calibration zero-q policy mismatch")
+        population = calibration_identity["calibration_population"]
+        audit = calibration_identity["force_exclusions"]
+        if not isinstance(population, Mapping) or not isinstance(audit, Mapping):
+            raise ValueError("calibration zero-q provenance is invalid")
+        if set(audit) != {"path", "sha256"} or audit.get("path") != "force_exclusions.json":
+            raise ValueError("calibration zero-q audit identity is invalid")
+        audit_sha256 = audit.get("sha256")
+        if not isinstance(audit_sha256, str) or len(audit_sha256) != 64:
+            raise ValueError("calibration zero-q audit SHA is invalid")
+        identity["zero_q"] = {
+            "policy": ZERO_Q_POLICY,
+            "calibration_population": dict(population),
+            "force_exclusions_sha256": audit_sha256,
+        }
     return identity
 
 
@@ -405,12 +434,34 @@ def _new_progress(identity: Mapping[str, Any], writers: Mapping[str, Transaction
         "next_index": 0,
         "structures": 0,
         "csv_offsets": {key: writer.byte_offset for key, writer in writers.items()},
+        "zero_q_rows": 0,
+        "zero_q_zero_residual_rows": 0,
+        "zero_q_nonzero_residual_rows": 0,
     }
 
 
 def _validate_progress(progress: Mapping[str, Any], target_structures: int) -> None:
     if progress.get("status") not in ("in_progress", "complete"):
         raise ValueError("evaluation progress has an invalid status")
+    base_fields = {"identity", "status", "next_index", "structures", "csv_offsets"}
+    zero_fields = {
+        "zero_q_rows",
+        "zero_q_zero_residual_rows",
+        "zero_q_nonzero_residual_rows",
+    }
+    fields = set(progress)
+    if fields not in (base_fields, base_fields | zero_fields):
+        raise ValueError("evaluation progress schema mismatch")
+    if fields == base_fields | zero_fields:
+        for field in zero_fields:
+            value = progress[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"evaluation progress {field} must be non-negative")
+        if progress["zero_q_rows"] != (
+            progress["zero_q_zero_residual_rows"]
+            + progress["zero_q_nonzero_residual_rows"]
+        ):
+            raise ValueError("evaluation progress zero-q counter mismatch")
     for field in ("next_index", "structures"):
         value = progress.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -509,6 +560,9 @@ def _target_summary(rows: Sequence[Mapping[str, str]], variant: str, target: str
     std_values: list[float] = []
     standardized: list[float] = []
     coverage = {"1sigma": 0, "2sigma": 0, "3sigma": 0}
+    zero_q_rows = 0
+    zero_q_zero_residual_rows = 0
+    zero_q_nonzero_residual_rows = 0
     for row in rows:
         if row.get("variant") != variant or row.get("target") != target:
             raise ValueError(f"CSV row does not belong to {variant}/{target}")
@@ -520,17 +574,24 @@ def _target_summary(rows: Sequence[Mapping[str, str]], variant: str, target: str
         q_values.append(q_value)
         variances.append(variance)
         std_values.append(std_value)
+        if q_value == 0.0:
+            zero_q_rows += 1
+            if residual == 0.0:
+                zero_q_zero_residual_rows += 1
+            else:
+                zero_q_nonzero_residual_rows += 1
         absolute = abs(residual)
         for multiplier in (1, 2, 3):
             if absolute <= multiplier * std_value:
                 coverage[f"{multiplier}sigma"] += 1
         if std_value > 0.0:
             standardized.append(residual / std_value)
-        elif residual == 0.0:
-            standardized.append(0.0)
     count = len(rows)
     return {
         "rows": count,
+        "zero_q_rows": zero_q_rows,
+        "zero_q_zero_residual_rows": zero_q_zero_residual_rows,
+        "zero_q_nonzero_residual_rows": zero_q_nonzero_residual_rows,
         "mae": math.fsum(abs(value) for value in residuals) / count if count else None,
         "rmse": (
             math.sqrt(math.fsum(value * value for value in residuals) / count)
@@ -598,13 +659,33 @@ def summarize_variant(
     }
 
 
+def _validated_force_q_by_variant(
+    g_forces: Tensor,
+    indices: Tensor,
+    q_by_variant: Mapping[str, Tensor],
+) -> tuple[dict[str, Tensor], Any]:
+    """Apply the audited force zero-q policy before any CSV mutation."""
+    decision = classify_force_calibration_structure(
+        g_forces, q_by_variant, indices
+    )
+    validated: dict[str, Tensor] = {}
+    for variant in _VARIANTS:
+        values = q_by_variant[variant].detach().to(
+            device="cpu", dtype=torch.float64
+        ).reshape(-1)
+        validated[variant] = torch.where(
+            values == 0.0, values, torch.clamp(values, min=1.0e-30)
+        )
+    return validated, decision
+
+
 def _append_structure(
     writers: Mapping[str, TransactionalCSV],
     sample: Any,
     jacobians: Any,
     solvers: Mapping[str, CholeskyQuadraticForm],
     calibrations: Mapping[str, Mapping[str, Any]],
-) -> None:
+) -> dict[str, int]:
     energy_reference = float(sample.reference_energy_per_atom.detach().cpu())
     energy_prediction = float(jacobians.energy_per_atom)
     energy_residual = energy_reference - energy_prediction
@@ -632,17 +713,21 @@ def _append_structure(
     if not torch.isfinite(force_references).all() or not torch.isfinite(force_predictions).all():
         raise ValueError(f"force values at structure {sample.index} must be finite")
 
+    raw_force_q = {
+        variant: solvers[variant].q(jacobians.g_forces)
+        for variant in _VARIANTS
+    }
+    force_q_by_variant, zero_decision = _validated_force_q_by_variant(
+        jacobians.g_forces, indices, raw_force_q
+    )
+
     for variant in _VARIANTS:
         energy_q = validate_q(
             solvers[variant].q(jacobians.g_energy.reshape(1, -1)),
             structure_index=sample.index,
             target="energy",
         )[0]
-        force_q = validate_q(
-            solvers[variant].q(jacobians.g_forces),
-            structure_index=sample.index,
-            target="forces",
-        )
+        force_q = force_q_by_variant[variant]
         energy_alpha = float(calibrations[variant]["energy"]["alpha"])
         force_alpha = float(calibrations[variant]["forces"]["alpha"])
         energy_variance = energy_alpha**2 * float(energy_q)
@@ -702,6 +787,16 @@ def _append_structure(
         )
 
 
+    zero_residual_rows = sum(
+        float(force_residuals[row]) == 0.0 for row in zero_decision.zero_rows
+    )
+    zero_rows = len(zero_decision.zero_rows)
+    return {
+        "zero_q_rows": zero_rows,
+        "zero_q_zero_residual_rows": zero_residual_rows,
+        "zero_q_nonzero_residual_rows": zero_rows - zero_residual_rows,
+    }
+
 def _csv_integer(row: Mapping[str, str], field: str, source: str) -> int:
     try:
         return int(row[field])
@@ -745,6 +840,7 @@ def _validate_complete_outputs(
 
     energy_baseline: list[tuple[Any, ...]] | None = None
     force_baseline: list[tuple[Any, ...]] | None = None
+    force_zero_baseline: list[tuple[str, int, int, int]] | None = None
     for variant in _VARIANTS:
         energy_rows = csv_rows[(variant, "energy.csv")]
         force_rows = csv_rows[(variant, "force_components.csv")]
@@ -815,6 +911,7 @@ def _validate_complete_outputs(
         if len(force_rows) != len(expected_force_keys):
             raise ValueError(f"{variant} force component count mismatch")
         force_observations: list[tuple[Any, ...]] = []
+        force_zero_keys: list[tuple[str, int, int, int]] = []
         for row, expected_key in zip(force_rows, expected_force_keys):
             source = f"{variant}/force_components.csv"
             actual_key = (
@@ -831,8 +928,14 @@ def _validate_complete_outputs(
                 _finite_float(row[field], f"{source} {field}")
                 for field in ("reference", "prediction", "residual", "q", "variance", "std")
             ]
-            if values[3] <= 0.0 or values[4] < 0.0 or values[5] < 0.0:
+            if values[3] < 0.0 or values[4] < 0.0 or values[5] < 0.0:
                 raise ValueError(f"{source} has invalid uncertainty values")
+            if values[3] == 0.0:
+                if values[4] != 0.0 or values[5] != 0.0:
+                    raise ValueError(f"{source} zero q must have zero variance and std")
+                force_zero_keys.append(actual_key)
+            elif values[4] == 0.0 or values[5] == 0.0:
+                raise ValueError(f"{source} positive q must have positive variance and std")
             force_observations.append((*actual_key, *values[:3]))
 
         counts = summaries[variant].get("counts")
@@ -854,6 +957,10 @@ def _validate_complete_outputs(
             or force_observations != force_baseline
         ):
             raise ValueError("variant alignment mismatch for formal CSV observations")
+        if force_zero_baseline is None:
+            force_zero_baseline = force_zero_keys
+        elif force_zero_keys != force_zero_baseline:
+            raise ValueError("force zero-q rows must match across variants")
 
 
 def run_evaluate(config: LLPRConfig) -> Path:
@@ -931,6 +1038,12 @@ def run_evaluate(config: LLPRConfig) -> Path:
                 "in-progress evaluation exists but runtime.resume is false"
             )
         progress = dict(candidate)
+        for field in (
+            "zero_q_rows",
+            "zero_q_zero_residual_rows",
+            "zero_q_nonzero_residual_rows",
+        ):
+            progress.setdefault(field, 0)
     else:
         existing_formal_outputs = [
             evaluation_dir / variant / filename
@@ -985,7 +1098,7 @@ def run_evaluate(config: LLPRConfig) -> Path:
                         config.runtime.effective_consumer_max_force_components_per_structure
                     ),
                 )
-                _append_structure(
+                zero_counts = _append_structure(
                     writers,
                     sample,
                     jacobians,
@@ -996,6 +1109,8 @@ def run_evaluate(config: LLPRConfig) -> Path:
                 progress["csv_offsets"] = offsets
                 progress["next_index"] = sample.index + 1
                 progress["structures"] += 1
+                for field, value in zero_counts.items():
+                    progress[field] += value
                 atomic_torch_save(progress_path, progress)
         if progress["next_index"] != target_structures:
             raise ValueError("test dataset ended before the configured evaluation limit")

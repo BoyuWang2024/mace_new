@@ -568,6 +568,81 @@ def test_validate_q_clamps_only_positive_tiny_values_to_exact_floor() -> None:
     assert values.tolist() == [1.0e-30, 1.0e-20]
 
 
+def test_run_evaluate_preserves_legal_zero_q_force_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import inference
+
+    config = _config(tmp_path)
+    _install_fake_pipeline(monkeypatch, config)
+    compute = inference.compute_structure_jacobians
+
+    def legal_zero_first_force_row(**kwargs: object) -> StructureJacobians:
+        result = compute(**kwargs)
+        gradients = result.g_forces.clone()
+        gradients[0] = 0.0
+        return replace(result, g_forces=gradients)
+
+    monkeypatch.setattr(
+        inference, "compute_structure_jacobians", legal_zero_first_force_row
+    )
+    evaluation_dir = run_evaluate(config)
+
+    for variant in _VARIANTS:
+        rows = pd.read_csv(evaluation_dir / variant / "force_components.csv")
+        zero_row = rows.iloc[0]
+        assert zero_row["reference"] == pytest.approx(3.0)
+        assert zero_row["prediction"] == pytest.approx(1.0)
+        assert zero_row["residual"] == pytest.approx(2.0)
+        assert zero_row["q"] == 0.0
+        assert zero_row["variance"] == 0.0
+        assert zero_row["std"] == 0.0
+        summary = json.loads((evaluation_dir / variant / "summary.json").read_text())
+        assert summary["forces"]["zero_q_rows"] == 2
+        assert summary["forces"]["zero_q_nonzero_residual_rows"] == 2
+        assert summary["forces"]["zero_q_zero_residual_rows"] == 0
+
+def test_force_q_policy_rejects_illegal_zero_cases() -> None:
+    from Uncertainty_Quantification.LLPR.llpr.inference import (
+        _validated_force_q_by_variant,
+    )
+
+    cases = (
+        (
+            torch.tensor([[1.0, 0.0]]),
+            {variant: torch.tensor([0.0]) for variant in _VARIANTS},
+        ),
+        (
+            torch.tensor([[0.0, 0.0]]),
+            {variant: torch.tensor([1.0]) for variant in _VARIANTS},
+        ),
+        (
+            torch.tensor([[0.0, 0.0]]),
+            {
+                "he": torch.tensor([0.0]),
+                "hf": torch.tensor([1.0]),
+                "hef": torch.tensor([0.0]),
+            },
+        ),
+        (
+            torch.tensor([[0.0, 0.0]]),
+            {variant: torch.tensor([-1.0]) for variant in _VARIANTS},
+        ),
+        (
+            torch.tensor([[0.0, 0.0]]),
+            {variant: torch.tensor([float("nan")]) for variant in _VARIANTS},
+        ),
+    )
+    for gradients, q_by_variant in cases:
+        with pytest.raises(ValueError):
+            _validated_force_q_by_variant(
+                gradients,
+                torch.tensor([0]),
+                q_by_variant,
+            )
+
+
+
 def test_run_evaluate_reuses_one_prediction_for_three_variants_and_writes_formulas(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
