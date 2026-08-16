@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import iread
 from ase.io import read as ase_read
 from ase.io import write as ase_write
@@ -53,6 +54,15 @@ def _is_nonnegative_integer(value: object) -> bool:
     return isinstance(value, Integral) and not isinstance(value, bool) and value >= 0
 
 
+def _copy_atoms_with_calculator_results(atoms: Atoms) -> Atoms:
+    copied_atoms = atoms.copy()
+    if atoms.calc is None:
+        return copied_atoms
+    copied_atoms.calc = SinglePointCalculator(
+        copied_atoms,
+        **atoms.calc.results,
+    )
+    return copied_atoms
 
 
 MAX_STABLE_SOURCE_ATTEMPTS = 3
@@ -102,7 +112,7 @@ def _derive_source_filter_audit(
             continue
         retained_indices.append(source_index)
         if canonical_output is not None:
-            output_atoms = atoms.copy()
+            output_atoms = _copy_atoms_with_calculator_results(atoms)
             output_atoms.info["source_index"] = source_index
             ase_write(
                 canonical_output,

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import read, write
 
 from Uncertainty_Quantification.LLPR.llpr import dataset_filter
@@ -102,6 +105,85 @@ def test_filter_writes_hash_complete_audit(tmp_path: Path) -> None:
             "reason": "missing_neighbor_within_cutoff",
         }
     ]
+
+
+def test_filter_preserves_reference_results_and_structure_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    retained = Atoms("H2", positions=[[0, 0, 0], [1, 0, 0]])
+    retained.info.update(
+        structure_id="labelled-keep",
+        provenance="reference labels must survive verbatim",
+    )
+    retained.new_array("site_id", np.array([17, 23], dtype=np.int64))
+    retained.calc = SinglePointCalculator(
+        retained,
+        energy=-12.345678901234,
+        free_energy=-12.456789012345,
+        forces=np.array(
+            [[0.125, -0.25, 0.375], [-0.125, 0.25, -0.375]],
+            dtype=np.float64,
+        ),
+        stress=np.array([1.25, 2.5, 3.75, 0.125, 0.25, 0.5], dtype=np.float64),
+    )
+    excluded = Atoms("H3", positions=[[0, 0, 0], [1, 0, 0], [20, 0, 0]])
+    excluded.info["structure_id"] = "labelled-drop"
+    excluded.calc = SinglePointCalculator(
+        excluded,
+        energy=99.0,
+        forces=np.full((3, 3), 9.0, dtype=np.float64),
+    )
+    write(source, [retained, excluded], format="extxyz")
+
+    source_bytes = source.read_bytes()
+    source_frames = read(source, ":", format="extxyz")
+    source_info = [deepcopy(atoms.info) for atoms in source_frames]
+    source_arrays = [
+        {name: values.copy() for name, values in atoms.arrays.items()}
+        for atoms in source_frames
+    ]
+    source_results = [
+        {name: np.asarray(value).copy() for name, value in atoms.calc.results.items()}
+        for atoms in source_frames
+    ]
+
+    first_report = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert source.read_bytes() == source_bytes
+    for frame_index, atoms in enumerate(source_frames):
+        assert atoms.info == source_info[frame_index]
+        assert atoms.arrays.keys() == source_arrays[frame_index].keys()
+        for name, expected in source_arrays[frame_index].items():
+            np.testing.assert_array_equal(atoms.arrays[name], expected)
+        assert atoms.calc is not None
+        assert atoms.calc.results.keys() == source_results[frame_index].keys()
+        for name, expected in source_results[frame_index].items():
+            np.testing.assert_array_equal(atoms.calc.results[name], expected)
+
+    filtered = read(output, ":", format="extxyz")
+    assert len(filtered) == 1
+    filtered_atoms = filtered[0]
+    assert filtered_atoms.info["source_index"] == 0
+    assert filtered_atoms.info["structure_id"] == "labelled-keep"
+    assert filtered_atoms.info["provenance"] == retained.info["provenance"]
+    np.testing.assert_array_equal(filtered_atoms.arrays["site_id"], [17, 23])
+    assert filtered_atoms.calc is not None
+    assert filtered_atoms.calc.results.keys() == source_results[0].keys()
+    for name, expected in source_results[0].items():
+        actual = filtered_atoms.calc.results[name]
+        assert np.asarray(actual).dtype.kind == "f"
+        assert np.asarray(actual).shape == expected.shape
+        np.testing.assert_array_equal(actual, expected)
+    assert all(atoms.info["structure_id"] != "labelled-drop" for atoms in filtered)
+
+    def fail_publish(*args: object, **kwargs: object) -> None:
+        raise AssertionError("canonical labelled output must be a strict cache hit")
+
+    monkeypatch.setattr(dataset_filter, "_publish_pair", fail_publish)
+    assert filter_neighborless_extxyz(source, output, audit, cutoff=6.0) == first_report
 
 
 @pytest.mark.parametrize(
