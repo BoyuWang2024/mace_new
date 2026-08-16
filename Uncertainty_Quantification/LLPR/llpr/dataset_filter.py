@@ -27,9 +27,6 @@ def _missing_neighbor_analysis(
 ) -> tuple[tuple[int, ...], int]:
     if cutoff <= 0:
         raise ValueError("cutoff must be positive")
-    if len(atoms) == 1:
-        return (0,), 0
-
     neighbour_atoms = atoms.copy()
     neighbour_atoms.set_cell(neighbour_atoms.cell.complete())
     i_indices, j_indices = neighbour_list("ij", neighbour_atoms, cutoff)
@@ -53,6 +50,33 @@ def missing_neighbor_indices(atoms: Atoms, cutoff: float) -> tuple[int, ...]:
 
 def _is_nonnegative_integer(value: object) -> bool:
     return isinstance(value, Integral) and not isinstance(value, bool) and value >= 0
+
+
+
+def _derive_source_filter_audit(
+    source_path: Path, cutoff: float
+) -> tuple[int, list[int], list[dict[str, Any]], int]:
+    excluded: list[dict[str, Any]] = []
+    retained_indices: list[int] = []
+    ignored_self_image_edges = 0
+    total_structures = 0
+
+    for source_index, atoms in enumerate(iread(source_path, index=":", format="extxyz")):
+        total_structures += 1
+        existing_source_index = atoms.info.get("source_index")
+        if existing_source_index is not None and existing_source_index != source_index:
+            raise ValueError(
+                f"structure {source_index} has conflicting source_index "
+                f"{existing_source_index}"
+            )
+        missing_indices, ignored_edges = _missing_neighbor_analysis(atoms, cutoff)
+        ignored_self_image_edges += ignored_edges
+        if missing_indices:
+            excluded.append(_audit_record(atoms, source_index, missing_indices))
+        else:
+            retained_indices.append(source_index)
+
+    return total_structures, retained_indices, excluded, ignored_self_image_edges
 
 
 def _valid_cached_report(
@@ -152,6 +176,20 @@ def _valid_cached_report(
         excluded_indices.append(int(index))
     if excluded_indices != sorted(set(excluded_indices)):
         return None
+    (
+        expected_total,
+        expected_retained_indices,
+        expected_excluded,
+        expected_ignored_edges,
+    ) = _derive_source_filter_audit(source_path, cutoff)
+    if (
+        total != expected_total
+        or retained != len(expected_retained_indices)
+        or excluded_count != len(expected_excluded)
+        or ignored_edges != expected_ignored_edges
+        or excluded != expected_excluded
+    ):
+        return None
     try:
         retained_atoms = ase_read(output_path, index=":", format="extxyz")
     except Exception:
@@ -167,7 +205,8 @@ def _valid_cached_report(
         return None
     retained_indices = [int(index) for index in retained_indices]
     if (
-        retained_indices != sorted(set(retained_indices))
+        retained_indices != expected_retained_indices
+        or retained_indices != sorted(set(retained_indices))
         or set(retained_indices) | set(excluded_indices) != set(range(total))
         or set(retained_indices) & set(excluded_indices)
     ):

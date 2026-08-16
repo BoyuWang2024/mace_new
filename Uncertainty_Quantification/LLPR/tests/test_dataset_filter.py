@@ -131,7 +131,7 @@ def test_filter_recomputes_when_existing_audit_is_not_a_valid_v2_cache(
     assert report["cutoff"] == 6.0
 
 
-def test_filter_cache_hit_validates_recorded_shas_before_reuse(
+def test_filter_cache_hit_rederives_source_without_republishing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source.extxyz"
@@ -140,14 +140,73 @@ def test_filter_cache_hit_validates_recorded_shas_before_reuse(
     _write_source(source)
     expected = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
 
-    def fail_source_restream(*args: object, **kwargs: object) -> object:
-        raise AssertionError("valid cache hit must not restream the source")
+    def fail_publish(*args: object, **kwargs: object) -> None:
+        raise AssertionError("valid cache hit must not republish artifacts")
 
     monkeypatch.setattr(
-        "Uncertainty_Quantification.LLPR.llpr.dataset_filter.iread",
-        fail_source_restream,
+        "Uncertainty_Quantification.LLPR.llpr.dataset_filter._publish_pair",
+        fail_publish,
     )
     assert filter_neighborless_extxyz(source, output, audit, cutoff=6.0) == expected
+
+
+
+def test_filter_recomputes_after_coordinated_output_and_audit_tampering(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    _write_source(source)
+    filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    forged_output = read(source, ":")[1]
+    forged_output.info["source_index"] = 1
+    write(output, [forged_output], format="extxyz")
+    forged_audit = json.loads(audit.read_text(encoding="utf-8"))
+    forged_audit["output_sha256"] = sha256_file(output)
+    forged_audit["excluded"] = [
+        {
+            "source_index": 0,
+            "structure_id": "keep",
+            "num_atoms": 2,
+            "missing_neighbor_indices": [0],
+            "pbc": [False, False, False],
+            "elements": ["H"],
+            "reason": "missing_neighbor_within_cutoff",
+        }
+    ]
+    audit.write_text(json.dumps(forged_audit), encoding="utf-8")
+
+    report = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert report["excluded"] == [
+        {
+            "source_index": 1,
+            "structure_id": "drop",
+            "num_atoms": 3,
+            "missing_neighbor_indices": [2],
+            "pbc": [False, False, False],
+            "elements": ["H"],
+            "reason": "missing_neighbor_within_cutoff",
+        }
+    ]
+    assert [atoms.info["source_index"] for atoms in read(output, ":")] == [0]
+
+
+def test_filter_audits_periodic_singleton_self_image_edges(tmp_path: Path) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    atoms = Atoms("H", positions=[[0, 0, 0]], cell=[5, 5, 5], pbc=True)
+    write(source, [atoms], format="extxyz")
+
+    report = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert report["retained_structures"] == 0
+    assert report["excluded_structures"] == 1
+    assert report["ignored_self_image_edges"] == 6
+    assert json.loads(audit.read_text(encoding="utf-8"))["ignored_self_image_edges"] == 6
 
 
 def test_filter_recomputes_when_cached_output_sha_is_tampered(tmp_path: Path) -> None:
