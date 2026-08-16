@@ -122,6 +122,9 @@ r_max = 6.0 Å
 8. 三个 variant 统一使用当前正式 `ridge=1e-12`。
 9. 不直接复用旧 MATPES Alpha；使用 `matpes_val.extxyz` 重新计算 Alpha。
 10. 本地只使用 `Plots` 分支，不融合到 `main`；远端从 GitHub 获取 `Plots`。
+11. MATPES 能量 Alpha 使用全部能量可用结构；力 Alpha 按整结构筛选，若结构中任一
+    力分量的 Jacobian 与 q 均精确为零，则该结构的全部力分量不参与三个 variant 的
+    力 Alpha 估计，但该结构仍参与能量 Alpha。
 
 第 9 条是对最初“MATPES train 复用已有 Alpha”设想的明确替代。旧 Alpha 保持原样，
 可以用于数值对照，但不作为正式新结果的输入。
@@ -211,9 +214,34 @@ SHA256，禁止保留示例值。
 执行 `calibrate → evaluate → validate → plot`。本次 calibration 写入自己的 run root，
 不会修改 shared curvature，也不会覆盖旧 Alpha。
 
+MATPES calibration 使用两个显式且可审计的样本集合：
+
+- 能量集合包含所有能量 q 为有限正数的结构；
+- 力集合以结构为单位。对每个结构先计算三个 variant 的全部力 Jacobian 与 q；只要
+  任一力分量出现“Jacobian 逐元素精确为零且三个 variant 的 q 均精确为零”，该结构
+  就从三个 variant 的力 Alpha 中共同排除；其能量仍正常参与能量 Alpha；
+- 排除审计记录 calibration index、structure id、原子数、元素、零 Jacobian 的原子与
+  笛卡尔方向、reference/prediction/residual，以及三个 variant 的 q；
+- `q < 0`、非有限 q、Jacobian 非零但 q 为零，或只有部分 variant 为零时仍立即失败；
+- 不使用 epsilon 伪造正 q。现有 `0 < q < min_q` 的正数 floor 语义保持不变；
+- calibration identity、progress、manifest、summary 和 validation 明确记录公式版本、
+  能量使用结构数、力使用/排除结构数与力分量数，以及排除审计 SHA。
+- 力 Alpha 的估计公式本身不变，只对通过上述结构级门禁的全部力分量执行；不得按
+  variant 或单个分量分别挑选样本。
+
+该规则来自正式作业的实测失败：MATPES val index 158（structure id 304644，单原子
+Ba）的三个力 Jacobian 精确为零。旧实现也跳过了该结构；本设计把这种行为改为显式、
+跨 variant 一致且可验证的结构级力校准规则，而不是静默跳过。
+
+正式 MATPES train evaluation 不使用该 calibration 排除集合删除预测行：仍输出全部
+348,780 个能量结构和全部 8,259,336 个力分量。零 Jacobian 分量写入
+`q = variance = std = 0`，保留原始误差和 coverage 统计；标准化残差与正对数坐标在
+这些行上无定义，因此绘图/相应统计排除并分别计数。负数、非有限值或身份不一致仍失败。
+
 ### 7.2 MAD
 
-MAD 原始数据先经过确定性的 6 Å 邻域筛选。若一个结构中任一原子没有邻居，
+MAD 原始数据先经过确定性的 6 Å 邻域筛选。邻居必须是不同的 base atom；周期自镜像
+（neighbor-list 中 `i == j`）不算邻居。若一个结构中任一原子没有这样的邻居，
 则整条结构从 calibration 或 test 中排除。筛选过程必须：
 
 - 使用与 checkpoint 相同的 cutoff 6.0 Å；
@@ -227,6 +255,9 @@ MAD 原始数据先经过确定性的 6 Å 邻域筛选。若一个结构中任�
 
 正式配置使用筛选后的 `mad-val` 作为 calibration，筛选后的 `mad-test` 作为 test，
 共享同一个 canonical curvature，并执行 `calibrate → evaluate → validate → plot`。
+
+修正周期自镜像规则后必须重新生成两份 filtered MAD 和 audit，并测量新的 SHA；正式
+配置只能在最终 SHA 确定后更新。旧 filtered 文件和失败作业进度保持原样，不原地覆盖。
 
 ### 7.3 MATPES test
 
@@ -364,14 +395,20 @@ Uncertainty_Quantification/Plots/LLPR/
 
 - checkpoint、数据、曲率、配置、公式或 readout 身份不一致时立即失败；
 - shared curvature 不完整、不是常规文件、SHA 不匹配或矩阵验证失败时立即失败；
-- 不允许 predictor 或 calibrator 静默跳过失败结构；
+- 不允许 predictor 或 calibrator 静默跳过失败结构；MATPES 力 Alpha 只能按第 7.1
+  节的显式结构级规则排除并发布审计；
 - 已知 MAD 无邻居结构只能由预处理规则排除并写入审计；
-- q 为零、负数或非有限值时立即失败，不用 epsilon 掩盖；
+- MAD calibration 中 q 为零、负数或非有限值时立即失败；MATPES calibration 只有
+  第 7.1 节定义的精确零 Jacobian/零 q 结构可以从力 Alpha 集合排除；其他零值、负数
+  或非有限值立即失败，且不得用 epsilon 掩盖；
 - 中断时保留 progress，恢复前严格比较完整身份；
 - 已完成且身份一致时直接复用，身份不一致时拒绝覆盖；
 - validation 未通过时禁止绘图和回传；
 - Slurm 下游任务只通过 `afterok` 依赖成功的上游任务；
 - 正式结果不在失败后自动删除，以便诊断和恢复；
+- 本次失败的正式 experiment/progress 和作业日志保持原样。公式版本、MATPES 力校准
+  集合或 MAD filtered SHA 改变后，使用新的 experiment identity 和输出根运行；不得
+  让 resume 把新旧语义混在同一目录；
 - 旧曲率、旧 Alpha、现有 `matpes_test` 结果在执行前后均核对 SHA。
 
 ## 11. 测试设计
@@ -384,6 +421,10 @@ Uncertainty_Quantification/Plots/LLPR/
 - source SHA、checkpoint、readout、build 数据和公式身份拒绝逻辑；
 - 外部 curvature 与 run-local curvature 的等价加载；
 - MAD 元素、邻域筛选、PBC、原始索引和确定性 manifest；
+- MAD 多原子周期结构中“只有自镜像邻居”的原子必须触发整结构排除；
+- MATPES 能量/力校准集合分离、三个 variant 共用结构级力排除集合、排除 audit 和 SHA；
+- 精确零 Jacobian/零 q 可排除，负数、非有限、非零 Jacobian/零 q、variant 不一致均拒绝；
+- evaluation 保留零标准差力行，validation 保证全量行数，标准化指标/对数图显式计数排除；
 - 断点恢复、缓存复用和输出冲突；
 - carnet 四面板的数据过滤、确定性抽样、共享范围、密度轮廓、统计和文件集合；
 - 绘图输入快照和原子发布。
@@ -500,6 +541,7 @@ shared curvature PASS
 2. n20 显式曲率复用全链路通过，并与 run-local 曲率结果一致；
 3. 旧曲率转换 audit 为 PASS，旧文件 SHA 前后不变；
 4. MATPES 和 MAD 两套新 calibration 完整且 ridge 均为 `1e-12`；
+   MATPES calibration 必须同时发布能量全结构计数、力使用/排除结构计数和排除审计；
 5. MAD 两份筛选 manifest 完整，正式结果行数与保留结构一致；
 6. MATPES train evaluation 覆盖全部 348,780 个结构；
 7. MAD 和 MATPES train validation 均为 PASS；
