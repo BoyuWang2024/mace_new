@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import errno
 import fcntl
 import json
 import hashlib
@@ -1137,12 +1138,231 @@ def _cleanup_stale_directories(destination: Path) -> None:
         _best_effort_remove(stale)
 
 
-def _promote_directory(staging: Path, destination: Path) -> None:
-    if destination.exists():
-        _rename_exchange(staging, destination)
-        _best_effort_remove(staging)
-    else:
+_EXCHANGE_FALLBACK_ERRNOS = frozenset(
+    {
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.EXDEV,
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+    }
+)
+
+
+def _directory_identity(state: os.stat_result) -> tuple[int, int]:
+    return state.st_dev, state.st_ino
+
+
+def _directory_path_identity(path: Path, *, role: str) -> tuple[int, int]:
+    try:
+        state = path.lstat()
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{role} changed during plot publication") from error
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+        raise RuntimeError(f"{role} changed during plot publication")
+    return _directory_identity(state)
+
+
+def _optional_directory_path_identity(
+    path: Path, *, role: str
+) -> tuple[int, int] | None:
+    try:
+        state = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+        raise RuntimeError(f"{role} changed during plot publication")
+    return _directory_identity(state)
+
+
+def _open_directory_identity(
+    path: Path, *, role: str
+) -> tuple[int, tuple[int, int]]:
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RuntimeError(f"{role} changed during plot publication") from error
+    try:
+        state = os.fstat(descriptor)
+        if not stat.S_ISDIR(state.st_mode):
+            raise RuntimeError(f"{role} changed during plot publication")
+        identity = _directory_identity(state)
+        if _directory_path_identity(path, role=role) != identity:
+            raise RuntimeError(f"{role} changed during plot publication")
+        return descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _assert_directory_identity(
+    path: Path, expected: tuple[int, int], *, role: str
+) -> None:
+    if _directory_path_identity(path, role=role) != expected:
+        raise RuntimeError(f"{role} changed during plot publication")
+
+
+def _assert_path_missing(path: Path, *, role: str) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise RuntimeError(f"{role} changed during plot publication")
+
+
+def _rollback_backup_promotion(
+    staging: Path,
+    destination: Path,
+    backup: Path,
+    *,
+    staging_identity: tuple[int, int],
+    destination_identity: tuple[int, int],
+) -> None:
+    live_destination = _optional_directory_path_identity(
+        destination, role="plot destination"
+    )
+    if live_destination == staging_identity:
+        if _optional_directory_path_identity(
+            staging, role="plot staging directory"
+        ) is not None:
+            raise RuntimeError(
+                "plot staging directory changed; rollback would overwrite it"
+            )
+        os.replace(destination, staging)
+        _assert_directory_identity(
+            staging, staging_identity, role="plot staging directory"
+        )
+    elif live_destination is not None:
+        raise RuntimeError(
+            "plot destination changed; rollback would overwrite it"
+        )
+
+    _assert_directory_identity(
+        backup, destination_identity, role="plot backup directory"
+    )
+    _assert_path_missing(destination, role="plot destination")
+    os.replace(backup, destination)
+    _assert_directory_identity(
+        destination, destination_identity, role="plot destination"
+    )
+
+
+def _promote_directory_with_backup(
+    staging: Path,
+    destination: Path,
+    *,
+    staging_identity: tuple[int, int],
+    destination_identity: tuple[int, int],
+) -> None:
+    backup_container = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.backup-",
+            dir=destination.parent,
+        )
+    )
+    backup = backup_container / "previous"
+    old_moved = False
+    try:
+        _assert_directory_identity(
+            staging, staging_identity, role="plot staging directory"
+        )
+        _assert_directory_identity(
+            destination, destination_identity, role="plot destination"
+        )
+        os.replace(destination, backup)
+        old_moved = True
+        _assert_directory_identity(
+            backup, destination_identity, role="plot backup directory"
+        )
+        _assert_path_missing(destination, role="plot destination")
+        _assert_directory_identity(
+            staging, staging_identity, role="plot staging directory"
+        )
         os.replace(staging, destination)
+        _assert_directory_identity(
+            destination, staging_identity, role="plot destination"
+        )
+        _assert_path_missing(staging, role="plot staging directory")
+        _assert_directory_identity(
+            backup, destination_identity, role="plot backup directory"
+        )
+    except BaseException:
+        if old_moved:
+            try:
+                _rollback_backup_promotion(
+                    staging,
+                    destination,
+                    backup,
+                    staging_identity=staging_identity,
+                    destination_identity=destination_identity,
+                )
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    "plot fallback publication failed and could not safely "
+                    f"restore the old output; it remains at {backup}"
+                ) from rollback_error
+        _best_effort_remove(backup_container)
+        raise
+    _best_effort_remove(backup_container)
+
+
+def _promote_existing_directory(staging: Path, destination: Path) -> None:
+    if _directory_path_identity(
+        staging.parent, role="plot staging parent"
+    ) != _directory_path_identity(
+        destination.parent, role="plot destination parent"
+    ):
+        raise RuntimeError("plot staging and destination must share one directory")
+    staging_descriptor, staging_identity = _open_directory_identity(
+        staging, role="plot staging directory"
+    )
+    destination_descriptor: int | None = None
+    try:
+        destination_descriptor, destination_identity = _open_directory_identity(
+            destination, role="plot destination"
+        )
+        try:
+            _rename_exchange(staging, destination)
+        except OSError as error:
+            if error.errno not in _EXCHANGE_FALLBACK_ERRNOS:
+                raise
+            _assert_directory_identity(
+                staging, staging_identity, role="plot staging directory"
+            )
+            _assert_directory_identity(
+                destination, destination_identity, role="plot destination"
+            )
+            _promote_directory_with_backup(
+                staging,
+                destination,
+                staging_identity=staging_identity,
+                destination_identity=destination_identity,
+            )
+            return
+        _assert_directory_identity(
+            destination, staging_identity, role="plot destination"
+        )
+        _assert_directory_identity(
+            staging, destination_identity, role="plot staging directory"
+        )
+    finally:
+        try:
+            if destination_descriptor is not None:
+                os.close(destination_descriptor)
+        finally:
+            os.close(staging_descriptor)
+    if staging.exists():
+        _best_effort_remove(staging)
+
+
+def _promote_directory(staging: Path, destination: Path) -> None:
+    if not destination.exists():
+        os.replace(staging, destination)
+        return
+    _promote_existing_directory(staging, destination)
 
 
 def _create_input_snapshot(root: Path, destination: Path) -> Path:

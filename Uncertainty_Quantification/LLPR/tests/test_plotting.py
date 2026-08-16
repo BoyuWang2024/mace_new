@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import multiprocessing as mp
@@ -1035,3 +1036,168 @@ def test_density_staging_rejects_inconsistent_zero_q_categories(
 
     with pytest.raises(RuntimeError, match="zero-q.*inconsistent"):
         plotting._validate_carnet_staging(result)
+
+
+def test_exchange_einval_falls_back_and_publishes_complete_new_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    output = run_plot(
+        root, output_dir=tmp_path / "plots", style="carnet_density"
+    )
+    (output / "old-only.txt").write_text("old", encoding="utf-8")
+
+    def unsupported_exchange(first: Path, second: Path) -> None:
+        del first, second
+        raise OSError(errno.EINVAL, "exchange unsupported")
+
+    monkeypatch.setattr(plotting, "_rename_exchange", unsupported_exchange)
+    result = run_plot(
+        root, output_dir=output, style="carnet_density"
+    )
+
+    assert result == output
+    assert not (output / "old-only.txt").exists()
+    plotting._validate_carnet_staging(output)
+    assert not list(output.parent.glob(f".{output.name}.stale-*"))
+    assert not list(output.parent.glob(f".{output.name}.backup-*"))
+
+
+@pytest.mark.parametrize(
+    "error_number",
+    sorted(
+        {
+            errno.EINVAL,
+            errno.ENOSYS,
+            errno.EXDEV,
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+        }
+    ),
+)
+def test_exchange_capability_errors_use_verified_backup_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    destination = tmp_path / "plots"
+    destination.mkdir()
+    (destination / "value.txt").write_text("old", encoding="utf-8")
+    staging = tmp_path / ".plots.stale-controlled"
+    staging.mkdir()
+    (staging / "value.txt").write_text("new", encoding="utf-8")
+
+    monkeypatch.setattr(
+        plotting,
+        "_rename_exchange",
+        lambda first, second: (_ for _ in ()).throw(
+            OSError(error_number, "exchange unavailable")
+        ),
+    )
+
+    plotting._promote_directory(staging, destination)
+
+    assert (destination / "value.txt").read_text(encoding="utf-8") == "new"
+    assert not staging.exists()
+    assert not list(tmp_path.glob(".plots.backup-*"))
+
+
+def test_exchange_permission_error_does_not_fall_back_or_mutate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    destination = tmp_path / "plots"
+    destination.mkdir()
+    (destination / "value.txt").write_text("old", encoding="utf-8")
+    staging = tmp_path / ".plots.stale-controlled"
+    staging.mkdir()
+    (staging / "value.txt").write_text("new", encoding="utf-8")
+
+    monkeypatch.setattr(
+        plotting,
+        "_rename_exchange",
+        lambda first, second: (_ for _ in ()).throw(
+            OSError(errno.EPERM, "exchange denied")
+        ),
+    )
+
+    with pytest.raises(OSError) as captured:
+        plotting._promote_directory(staging, destination)
+
+    assert captured.value.errno == errno.EPERM
+    assert (destination / "value.txt").read_text(encoding="utf-8") == "old"
+    assert (staging / "value.txt").read_text(encoding="utf-8") == "new"
+    assert not list(tmp_path.glob(".plots.backup-*"))
+
+
+def test_fallback_promotion_failure_rolls_back_old_output_without_backup_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    destination = tmp_path / "plots"
+    destination.mkdir()
+    (destination / "value.txt").write_text("old", encoding="utf-8")
+    staging = tmp_path / ".plots.stale-controlled"
+    staging.mkdir()
+    (staging / "value.txt").write_text("new", encoding="utf-8")
+    real_replace = plotting.os.replace
+
+    monkeypatch.setattr(
+        plotting,
+        "_rename_exchange",
+        lambda first, second: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "exchange unsupported")
+        ),
+    )
+
+    def fail_staging_promotion(source: Path, target: Path) -> None:
+        if Path(source) == staging and Path(target) == destination:
+            raise OSError(errno.EIO, "simulated staged rename failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(plotting.os, "replace", fail_staging_promotion)
+
+    with pytest.raises(OSError) as captured:
+        plotting._promote_directory(staging, destination)
+
+    assert captured.value.errno == errno.EIO
+    assert (destination / "value.txt").read_text(encoding="utf-8") == "old"
+    assert (staging / "value.txt").read_text(encoding="utf-8") == "new"
+    assert not list(tmp_path.glob(".plots.backup-*"))
+
+
+def test_exchange_fallback_rejects_destination_replacement_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    destination = tmp_path / "plots"
+    destination.mkdir()
+    (destination / "value.txt").write_text("old", encoding="utf-8")
+    staging = tmp_path / ".plots.stale-controlled"
+    staging.mkdir()
+    (staging / "value.txt").write_text("new", encoding="utf-8")
+    displaced = tmp_path / "displaced-old"
+
+    def replace_then_report_unsupported(first: Path, second: Path) -> None:
+        del first
+        Path(second).rename(displaced)
+        Path(second).mkdir()
+        (Path(second) / "value.txt").write_text("other", encoding="utf-8")
+        raise OSError(errno.EINVAL, "exchange unsupported")
+
+    monkeypatch.setattr(plotting, "_rename_exchange", replace_then_report_unsupported)
+
+    with pytest.raises(RuntimeError, match="changed"):
+        plotting._promote_directory(staging, destination)
+
+    assert (destination / "value.txt").read_text(encoding="utf-8") == "other"
+    assert (displaced / "value.txt").read_text(encoding="utf-8") == "old"
+    assert (staging / "value.txt").read_text(encoding="utf-8") == "new"
+    assert not list(tmp_path.glob(".plots.backup-*"))
