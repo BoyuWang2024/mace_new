@@ -9,6 +9,7 @@ from ase.io import read, write
 
 from Uncertainty_Quantification.LLPR.llpr.artifacts import sha256_file
 from Uncertainty_Quantification.LLPR.llpr.dataset_filter import (
+    FILTER_PREDICATE_VERSION,
     filter_neighborless_extxyz,
     missing_neighbor_indices,
 )
@@ -43,6 +44,28 @@ def test_missing_neighbor_excludes_periodic_single_atom() -> None:
     assert missing_neighbor_indices(atoms, 6.0) == (0,)
 
 
+def test_multiatom_periodic_self_image_does_not_rescue_isolated_atom() -> None:
+    atoms = Atoms(
+        "H3",
+        positions=[[0, 0, 0], [1, 0, 0], [9, 9, 0]],
+        cell=[2, 20, 20],
+        pbc=[True, False, False],
+    )
+
+    assert missing_neighbor_indices(atoms, 6.0) == (2,)
+
+
+def test_periodic_image_of_different_base_atom_is_a_neighbor() -> None:
+    atoms = Atoms(
+        "H2",
+        positions=[[0, 0, 0], [9, 0, 0]],
+        cell=[10, 20, 20],
+        pbc=[True, False, False],
+    )
+
+    assert missing_neighbor_indices(atoms, 6.0) == ()
+
+
 def test_filter_writes_hash_complete_audit(tmp_path: Path) -> None:
     source = tmp_path / "source.extxyz"
     output = tmp_path / "filtered.extxyz"
@@ -53,6 +76,8 @@ def test_filter_writes_hash_complete_audit(tmp_path: Path) -> None:
 
     assert report["source_sha256"] == sha256_file(source)
     assert report["output_sha256"] == sha256_file(output)
+    assert report["predicate_version"] == FILTER_PREDICATE_VERSION
+    assert report["ignored_self_image_edges"] == 0
     assert report["total_structures"] == (
         report["retained_structures"] + report["excluded_structures"]
     )
@@ -66,6 +91,77 @@ def test_filter_writes_hash_complete_audit(tmp_path: Path) -> None:
     audit_data = json.loads(audit.read_text(encoding="utf-8"))
     assert audit_data == report
     assert audit_data["excluded"] == [
+        {
+            "source_index": 1,
+            "structure_id": "drop",
+            "num_atoms": 3,
+            "missing_neighbor_indices": [2],
+            "pbc": [False, False, False],
+            "elements": ["H"],
+            "reason": "missing_neighbor_within_cutoff",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("predicate_version", "distinct-base-atom-within-cutoff-v1"),
+        ("cutoff", 5.0),
+        ("source_sha256", "0" * 64),
+    ],
+)
+def test_filter_recomputes_when_existing_audit_is_not_a_valid_v2_cache(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    _write_source(source)
+    original = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+    stale_audit = dict(original)
+    stale_audit[field] = value
+    audit.write_text(json.dumps(stale_audit), encoding="utf-8")
+
+    report = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert report == json.loads(audit.read_text(encoding="utf-8"))
+    assert report["source_sha256"] == sha256_file(source)
+    assert report["predicate_version"] == FILTER_PREDICATE_VERSION
+    assert report["cutoff"] == 6.0
+
+
+def test_filter_cache_hit_validates_recorded_shas_before_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    _write_source(source)
+    expected = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    def fail_source_restream(*args: object, **kwargs: object) -> object:
+        raise AssertionError("valid cache hit must not restream the source")
+
+    monkeypatch.setattr(
+        "Uncertainty_Quantification.LLPR.llpr.dataset_filter.iread",
+        fail_source_restream,
+    )
+    assert filter_neighborless_extxyz(source, output, audit, cutoff=6.0) == expected
+
+
+def test_filter_recomputes_when_cached_output_sha_is_tampered(tmp_path: Path) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    _write_source(source)
+    filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+    output.write_text("tampered output", encoding="utf-8")
+
+    report = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    assert report["output_sha256"] == sha256_file(output)
+    assert report["excluded"] == [
         {
             "source_index": 1,
             "structure_id": "drop",
