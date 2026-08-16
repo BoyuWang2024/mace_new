@@ -2609,6 +2609,57 @@ def test_standalone_validation_rolls_back_reports_when_progress_changes_at_publi
 
 
 
+def test_standalone_validation_rejects_invalid_valid_invalid_aba(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import validation
+
+    root, _ = _policy_bound_publication_root(tmp_path, monkeypatch)
+    energy_path = root / "he" / "energy.csv"
+    progress_path = root / "progress.pt"
+    valid_energy = energy_path.read_bytes()
+    valid_progress = progress_path.read_bytes()
+
+    energy = pd.read_csv(energy_path)
+    energy.loc[0, "prediction"] += 0.125
+    _replace_committed_csv(root, "he/energy.csv", energy)
+    invalid_energy = energy_path.read_bytes()
+    invalid_progress = progress_path.read_bytes()
+    assert invalid_energy != valid_energy
+
+    def atomic_replace_bytes(path: Path, payload: bytes) -> None:
+        temporary = path.with_name(f".{path.name}.aba")
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+
+    read_csv = validation._read_csv
+    replaced = False
+
+    def parse_valid_then_restore_invalid(*args: object, **kwargs: object):
+        nonlocal replaced
+        if replaced:
+            return read_csv(*args, **kwargs)
+        atomic_replace_bytes(energy_path, valid_energy)
+        atomic_replace_bytes(progress_path, valid_progress)
+        rows = read_csv(*args, **kwargs)
+        atomic_replace_bytes(energy_path, invalid_energy)
+        atomic_replace_bytes(progress_path, invalid_progress)
+        replaced = True
+        return rows
+
+    monkeypatch.setattr(validation, "_read_csv", parse_valid_then_restore_invalid)
+
+    with pytest.raises(ValueError, match="residual|input changed during snapshot"):
+        validate_publication_root(root)
+
+    assert energy_path.read_bytes() == invalid_energy
+    assert not (root / "manifest.json").exists()
+    assert not (root / "validation.json").exists()
+    assert not list(
+        root.parent.glob(f".{root.name}.validation-snapshot-*")
+    )
+
+
 @pytest.mark.parametrize("case", ("missing", "extra", "bool", "negative", "sum"))
 def test_standalone_validation_rejects_invalid_policy_progress_schema_or_counts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str

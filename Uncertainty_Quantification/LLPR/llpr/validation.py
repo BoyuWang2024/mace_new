@@ -1520,39 +1520,151 @@ def _canonical_file_hashes(root: Path) -> dict[str, str]:
     }
 
 
-def _validation_input_snapshots(root: Path) -> dict[str, bytes]:
-    relative_paths = ["progress.pt"]
-    relative_paths.extend(
+def _validation_relative_paths() -> tuple[str, ...]:
+    return ("progress.pt",) + tuple(
         f"{variant}/{filename}"
         for variant in _VARIANTS
         for filename in _CANONICAL_FILES
     )
-    snapshots = {
-        relative_path: _regular_file_snapshot(
-            root / relative_path, f"validation input {relative_path}"
+
+
+def _stream_regular_file(
+    path: Path,
+    source: str,
+    destination: Path | None = None,
+) -> tuple[str, int]:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    non_blocking = getattr(os, "O_NONBLOCK", None)
+    if no_follow is None or non_blocking is None:
+        raise ValueError(f"{source} requires safe nonblocking no-follow open")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | no_follow | non_blocking)
+    except OSError as error:
+        raise ValueError(f"{source} is unavailable") from error
+    destination_handle = None
+    destination_descriptor = -1
+    try:
+        metadata_before = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata_before.st_mode):
+            raise ValueError(f"{source} must be regular")
+        if destination is not None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination_descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow,
+                0o600,
+            )
+            destination_handle = os.fdopen(destination_descriptor, "wb")
+            destination_descriptor = -1
+        digest = hashlib.sha256()
+        size = 0
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                if destination_handle is not None:
+                    destination_handle.write(chunk)
+            metadata_after = os.fstat(handle.fileno())
+        if destination_handle is not None:
+            destination_handle.flush()
+            os.fsync(destination_handle.fileno())
+            destination_handle.close()
+            destination_handle = None
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(
+            getattr(metadata_before, field) != getattr(metadata_after, field)
+            for field in stable_fields
+        ) or size != metadata_before.st_size:
+            raise ValueError(f"{source} changed while being read")
+        return digest.hexdigest(), size
+    except (OSError, ValueError) as error:
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        if isinstance(error, ValueError):
+            raise
+        raise ValueError(f"{source} is invalid") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if destination_handle is not None:
+            destination_handle.close()
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+
+
+def _stable_snapshot_file(live: Path, snapshot: Path, source: str) -> str:
+    before, _ = _stream_regular_file(live, source)
+    copied, copied_size = _stream_regular_file(live, source, snapshot)
+    after, _ = _stream_regular_file(live, source)
+    snapshot_sha256, snapshot_size = _stream_regular_file(
+        snapshot, f"private snapshot {source}"
+    )
+    if (
+        before != copied
+        or copied != after
+        or after != snapshot_sha256
+        or copied_size != snapshot_size
+    ):
+        snapshot.unlink(missing_ok=True)
+        raise ValueError("publication input changed during snapshot")
+    return snapshot_sha256
+
+
+def _create_validation_snapshot(root: Path, snapshot: Path) -> dict[str, str]:
+    hashes = {
+        relative_path: _stable_snapshot_file(
+            root / relative_path,
+            snapshot / relative_path,
+            f"validation input {relative_path}",
         )
-        for relative_path in relative_paths
+        for relative_path in _validation_relative_paths()
     }
-    for relative_path, payload in snapshots.items():
-        if relative_path.endswith(".csv") and not payload.endswith(b"\n"):
+    for relative_path in _validation_relative_paths():
+        if not relative_path.endswith(".csv"):
+            continue
+        csv_path = snapshot / relative_path
+        try:
+            with csv_path.open("rb") as handle:
+                handle.seek(-1, os.SEEK_END)
+                complete = handle.read(1) == b"\n"
+        except (OSError, ValueError):
+            complete = False
+        if not complete:
             raise ValueError(
-                f"trusted evaluation progress CSV offset requires complete final row: "
+                "trusted evaluation progress CSV offset requires complete final row: "
                 f"{relative_path}"
             )
-    return snapshots
-
-
-def _validation_input_hashes(snapshots: Mapping[str, bytes]) -> dict[str, str]:
-    return {
-        relative_path: hashlib.sha256(payload).hexdigest()
-        for relative_path, payload in snapshots.items()
-    }
+    manifest_path = root / "manifest.json"
+    if os.path.lexists(manifest_path):
+        _stable_snapshot_file(
+            manifest_path,
+            snapshot / "manifest.json",
+            "validation identity manifest.json",
+        )
+    _assert_validation_inputs(
+        root, hashes, "publication input changed during snapshot"
+    )
+    return hashes
 
 
 def _assert_validation_inputs(
     root: Path, expected_hashes: Mapping[str, str], message: str
 ) -> None:
-    current = _validation_input_hashes(_validation_input_snapshots(root))
+    if set(expected_hashes) != set(_validation_relative_paths()):
+        raise ValueError("validation input hash schema mismatch")
+    try:
+        current = {
+            relative_path: _stream_regular_file(
+                root / relative_path, f"validation input {relative_path}"
+            )[0]
+            for relative_path in _validation_relative_paths()
+        }
+    except ValueError as error:
+        raise ValueError(message) from error
     if current != expected_hashes:
         raise ValueError(message)
 
@@ -1667,7 +1779,9 @@ def _validate_existing_manifest(
 
 
 def _validate_publication_root_locked(
-    publication_root: Path,
+    snapshot_root: Path,
+    live_root: Path,
+    input_hashes: Mapping[str, str],
     *,
     identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1676,7 +1790,7 @@ def _validate_publication_root_locked(
     Statistical quality metrics are diagnostics only. Structural, identity,
     hash, and numerical-integrity violations raise ``ValueError``.
     """
-    root = Path(publication_root)
+    root = Path(snapshot_root)
     if not root.is_dir():
         raise ValueError(f"publication root is not a directory: {root}")
     (
@@ -1686,8 +1800,6 @@ def _validate_publication_root_locked(
         progress_sha256,
         progress,
     ) = _publication_identities(root, identity)
-    input_snapshots = _validation_input_snapshots(root)
-    input_hashes = _validation_input_hashes(input_snapshots)
     calibration_records = trusted_identity["calibration"]["records"]
     policy_bound = "zero_q" in trusted_identity
     consumer_limits = trusted_identity.get(
@@ -1782,7 +1894,7 @@ def _validate_publication_root_locked(
                 "canonical CSV and identity"
             )
         for relative_path, offset in progress["csv_offsets"].items():
-            if offset != len(input_snapshots[relative_path]):
+            if offset != (root / relative_path).stat().st_size:
                 raise ValueError(
                     f"trusted evaluation progress CSV offset mismatch: {relative_path}"
                 )
@@ -1796,11 +1908,13 @@ def _validate_publication_root_locked(
         for relative_path in input_hashes
         if relative_path != "progress.pt"
     }
-    current_progress_sha256 = hashlib.sha256(
-        _regular_file_snapshot(root / "progress.pt", "trusted evaluation progress")
-    ).hexdigest()
-    if current_progress_sha256 != progress_sha256:
-        raise ValueError("trusted evaluation progress changed during validation")
+    if input_hashes["progress.pt"] != progress_sha256:
+        raise ValueError("trusted evaluation progress snapshot mismatch")
+    _assert_validation_inputs(
+        live_root,
+        input_hashes,
+        "trusted evaluation progress changed during validation",
+    )
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "formula_version": FORMULA_VERSION,
@@ -1834,7 +1948,7 @@ def _validate_publication_root_locked(
         },
         "diagnostics": diagnostics,
     }
-    _publish_validation_reports(root, manifest, report, input_hashes)
+    _publish_validation_reports(live_root, manifest, report, input_hashes)
     return report
 
 
@@ -1846,8 +1960,21 @@ def validate_publication_root(
     root = Path(publication_root)
     if not root.is_dir():
         raise ValueError(f"publication root is not a directory: {root}")
+    if not (root / "progress.pt").is_file():
+        raise ValueError("trusted evaluation progress identity is missing")
     with _validation_output_lock(root):
-        return _validate_publication_root_locked(root, identity=identity)
+        with TemporaryDirectory(
+            prefix=f".{root.name}.validation-snapshot-",
+            dir=root.parent,
+        ) as directory:
+            snapshot_root = Path(directory)
+            input_hashes = _create_validation_snapshot(root, snapshot_root)
+            return _validate_publication_root_locked(
+                snapshot_root,
+                root,
+                input_hashes,
+                identity=identity,
+            )
 
 
 def run_validate(config: LLPRConfig) -> dict[str, Any]:
