@@ -54,14 +54,18 @@ def _is_nonnegative_integer(value: object) -> bool:
 
 
 def _derive_source_filter_audit(
-    source_path: Path, cutoff: float
-) -> tuple[int, list[int], list[dict[str, Any]], int]:
+    source_path: Path,
+    cutoff: float,
+    canonical_output: Path | None = None,
+) -> tuple[int, list[int], list[dict[str, Any]], int, str | None]:
     excluded: list[dict[str, Any]] = []
     retained_indices: list[int] = []
     ignored_self_image_edges = 0
     total_structures = 0
 
-    for source_index, atoms in enumerate(iread(source_path, index=":", format="extxyz")):
+    for source_index, atoms in enumerate(
+        iread(source_path, index=":", format="extxyz")
+    ):
         total_structures += 1
         existing_source_index = atoms.info.get("source_index")
         if existing_source_index is not None and existing_source_index != source_index:
@@ -73,10 +77,36 @@ def _derive_source_filter_audit(
         ignored_self_image_edges += ignored_edges
         if missing_indices:
             excluded.append(_audit_record(atoms, source_index, missing_indices))
-        else:
-            retained_indices.append(source_index)
+            continue
+        retained_indices.append(source_index)
+        if canonical_output is not None:
+            output_atoms = atoms.copy()
+            output_atoms.info["source_index"] = source_index
+            ase_write(
+                canonical_output,
+                output_atoms,
+                format="extxyz",
+                append=len(retained_indices) > 1,
+            )
 
-    return total_structures, retained_indices, excluded, ignored_self_image_edges
+    canonical_output_sha = None
+    if canonical_output is not None:
+        if not retained_indices:
+            canonical_output.touch()
+        verified_structures = sum(
+            1 for _ in iread(canonical_output, index=":", format="extxyz")
+        )
+        if verified_structures != len(retained_indices):
+            raise ValueError("temporary extxyz verification count mismatch")
+        canonical_output_sha = sha256_file(canonical_output)
+
+    return (
+        total_structures,
+        retained_indices,
+        excluded,
+        ignored_self_image_edges,
+        canonical_output_sha,
+    )
 
 
 def _valid_cached_report(
@@ -176,42 +206,50 @@ def _valid_cached_report(
         excluded_indices.append(int(index))
     if excluded_indices != sorted(set(excluded_indices)):
         return None
-    (
-        expected_total,
-        expected_retained_indices,
-        expected_excluded,
-        expected_ignored_edges,
-    ) = _derive_source_filter_audit(source_path, cutoff)
-    if (
-        total != expected_total
-        or retained != len(expected_retained_indices)
-        or excluded_count != len(expected_excluded)
-        or ignored_edges != expected_ignored_edges
-        or excluded != expected_excluded
-    ):
-        return None
+    canonical_output = _temporary_path(output_path)
     try:
-        retained_atoms = ase_read(output_path, index=":", format="extxyz")
-    except Exception:
-        return None
-    retained_indices = [atoms.info.get("source_index") for atoms in retained_atoms]
-    if (
-        len(retained_indices) != retained
-        or any(
-            not isinstance(index, Integral) or isinstance(index, bool)
-            for index in retained_indices
-        )
-    ):
-        return None
-    retained_indices = [int(index) for index in retained_indices]
-    if (
-        retained_indices != expected_retained_indices
-        or retained_indices != sorted(set(retained_indices))
-        or set(retained_indices) | set(excluded_indices) != set(range(total))
-        or set(retained_indices) & set(excluded_indices)
-    ):
-        return None
-    return report
+        (
+            expected_total,
+            expected_retained_indices,
+            expected_excluded,
+            expected_ignored_edges,
+            expected_output_sha,
+        ) = _derive_source_filter_audit(source_path, cutoff, canonical_output)
+        if (
+            total != expected_total
+            or retained != len(expected_retained_indices)
+            or excluded_count != len(expected_excluded)
+            or ignored_edges != expected_ignored_edges
+            or excluded != expected_excluded
+            or report["output_sha256"] != expected_output_sha
+            or sha256_file(output_path) != expected_output_sha
+        ):
+            return None
+        try:
+            retained_atoms = ase_read(output_path, index=":", format="extxyz")
+        except Exception:
+            return None
+        retained_indices = [atoms.info.get("source_index") for atoms in retained_atoms]
+        if (
+            len(retained_indices) != retained
+            or any(
+                not isinstance(index, Integral) or isinstance(index, bool)
+                for index in retained_indices
+            )
+        ):
+            return None
+        retained_indices = [int(index) for index in retained_indices]
+        if (
+            retained_indices != expected_retained_indices
+            or retained_indices != sorted(set(retained_indices))
+            or set(retained_indices) | set(excluded_indices) != set(range(total))
+            or set(retained_indices) & set(excluded_indices)
+            or sha256_file(output_path) != expected_output_sha
+        ):
+            return None
+        return report
+    finally:
+        canonical_output.unlink(missing_ok=True)
 
 
 def _temporary_path(path: Path) -> Path:
@@ -304,49 +342,23 @@ def filter_neighborless_extxyz(
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = _temporary_path(output_path)
     temporary_audit = _temporary_path(audit_path)
-    excluded: list[dict[str, Any]] = []
-    total_structures = 0
-    retained_structures = 0
-    ignored_self_image_edges = 0
-
     try:
-        for source_index, atoms in enumerate(
-            iread(source_path, index=":", format="extxyz")
-        ):
-            total_structures += 1
-            existing_source_index = atoms.info.get("source_index")
-            if existing_source_index is not None and existing_source_index != source_index:
-                raise ValueError(
-                    f"structure {source_index} has conflicting source_index {existing_source_index}"
-                )
-            missing_indices, ignored_edges = _missing_neighbor_analysis(atoms, cutoff)
-            ignored_self_image_edges += ignored_edges
-            if missing_indices:
-                excluded.append(_audit_record(atoms, source_index, missing_indices))
-                continue
-            output_atoms = atoms.copy()
-            output_atoms.info["source_index"] = source_index
-            ase_write(
-                temporary_output,
-                output_atoms,
-                format="extxyz",
-                append=retained_structures > 0,
-            )
-            retained_structures += 1
-
-        if retained_structures == 0:
-            temporary_output.touch()
-        verified_structures = sum(
-            1 for _ in iread(temporary_output, index=":", format="extxyz")
-        )
-        if verified_structures != retained_structures:
-            raise ValueError("temporary extxyz verification count mismatch")
+        (
+            total_structures,
+            retained_indices,
+            excluded,
+            ignored_self_image_edges,
+            canonical_output_sha,
+        ) = _derive_source_filter_audit(source_path, cutoff, temporary_output)
+        if canonical_output_sha is None:
+            raise AssertionError("canonical output SHA is required for publication")
+        retained_structures = len(retained_indices)
 
         report: dict[str, Any] = {
             "audit_schema_version": FILTER_AUDIT_SCHEMA_VERSION,
             "predicate_version": FILTER_PREDICATE_VERSION,
             "source_sha256": sha256_file(source_path),
-            "output_sha256": sha256_file(temporary_output),
+            "output_sha256": canonical_output_sha,
             "cutoff": cutoff,
             "ignored_self_image_edges": ignored_self_image_edges,
             "total_structures": total_structures,

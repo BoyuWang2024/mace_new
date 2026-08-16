@@ -7,6 +7,7 @@ import pytest
 from ase import Atoms
 from ase.io import read, write
 
+from Uncertainty_Quantification.LLPR.llpr import dataset_filter
 from Uncertainty_Quantification.LLPR.llpr.artifacts import sha256_file
 from Uncertainty_Quantification.LLPR.llpr.dataset_filter import (
     FILTER_PREDICATE_VERSION,
@@ -139,6 +140,17 @@ def test_filter_cache_hit_rederives_source_without_republishing(
     audit = tmp_path / "audit.json"
     _write_source(source)
     expected = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+    output_mtime_ns = output.stat().st_mtime_ns
+    original_iread = dataset_filter.iread
+    source_restreams = 0
+
+    def count_source_restream(*args: object, **kwargs: object) -> object:
+        nonlocal source_restreams
+        if args[0] == source:
+            source_restreams += 1
+        return original_iread(*args, **kwargs)
+
+    monkeypatch.setattr(dataset_filter, "iread", count_source_restream)
 
     def fail_publish(*args: object, **kwargs: object) -> None:
         raise AssertionError("valid cache hit must not republish artifacts")
@@ -192,6 +204,30 @@ def test_filter_recomputes_after_coordinated_output_and_audit_tampering(
         }
     ]
     assert [atoms.info["source_index"] for atoms in read(output, ":")] == [0]
+
+
+
+def test_filter_recomputes_after_retained_content_and_audit_tampering(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.extxyz"
+    output = tmp_path / "filtered.extxyz"
+    audit = tmp_path / "audit.json"
+    _write_source(source)
+    filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    tampered_output = read(output, ":")[0]
+    tampered_output.positions[1, 0] = 4.0
+    write(output, [tampered_output], format="extxyz")
+    tampered_audit = json.loads(audit.read_text(encoding="utf-8"))
+    tampered_audit["output_sha256"] = sha256_file(output)
+    audit.write_text(json.dumps(tampered_audit), encoding="utf-8")
+
+    report = filter_neighborless_extxyz(source, output, audit, cutoff=6.0)
+
+    restored = read(output, ":")
+    assert restored[0].positions[1, 0] == 1.0
+    assert report["output_sha256"] == sha256_file(output)
 
 
 def test_filter_audits_periodic_singleton_self_image_edges(tmp_path: Path) -> None:
