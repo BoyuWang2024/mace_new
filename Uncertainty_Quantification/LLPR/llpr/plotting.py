@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import tempfile
+import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -1144,13 +1145,20 @@ def _best_effort_remove(path: Path) -> None:
 def _best_effort_remove_owned_directory(
     path: Path, expected_identity: tuple[int, int]
 ) -> None:
-    quarantine = Path(
-        tempfile.mkdtemp(prefix=f"{path.name}.cleanup-", dir=path.parent)
-    )
-    quarantine.rmdir()
-    try:
-        _rename_noreplace(path, quarantine)
-    except OSError:
+    quarantine: Path | None = None
+    for _ in range(16):
+        candidate = path.parent / (
+            f"{path.name}.cleanup-{secrets.token_hex(16)}"
+        )
+        try:
+            _rename_noreplace(path, candidate)
+        except FileExistsError:
+            continue
+        except OSError:
+            return
+        quarantine = candidate
+        break
+    if quarantine is None:
         return
     try:
         if (

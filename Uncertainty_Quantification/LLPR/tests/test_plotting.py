@@ -1297,3 +1297,27 @@ def test_owned_cleanup_quarantines_before_removing(
 
     assert (staging / "value.txt").read_text(encoding="utf-8") == "foreign"
     assert not list(tmp_path.glob(".*.cleanup-*"))
+
+
+def test_owned_cleanup_retries_without_deleting_name_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    staging = tmp_path / ".plots.stale-controlled"
+    staging.mkdir()
+    (staging / "value.txt").write_text("owned", encoding="utf-8")
+    identity = plotting._directory_path_identity(
+        staging, role="plot staging directory"
+    )
+    collision = tmp_path / f"{staging.name}.cleanup-collision"
+    collision.mkdir()
+    (collision / "value.txt").write_text("foreign", encoding="utf-8")
+    tokens = iter(("collision", "success"))
+    monkeypatch.setattr(plotting.secrets, "token_hex", lambda size: next(tokens))
+
+    plotting._best_effort_remove_owned_directory(staging, identity)
+
+    assert not staging.exists()
+    assert (collision / "value.txt").read_text(encoding="utf-8") == "foreign"
+    assert not (tmp_path / f"{staging.name}.cleanup-success").exists()
