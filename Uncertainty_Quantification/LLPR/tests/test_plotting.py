@@ -1334,4 +1334,4 @@ def test_owned_cleanup_retries_without_deleting_name_collision(
     assert not staging.exists()
     assert (collision / "value.txt").read_text(encoding="utf-8") == "foreign"
     retired = tmp_path / f"{retired_prefix}success"
-    assert retired.is_dir() and not any(retired.iterdir())
+    assert (retired / "value.txt").read_text(encoding="utf-8") == "owned"

@@ -1142,22 +1142,10 @@ def _best_effort_remove(path: Path) -> None:
         return
 
 def _clear_directory_descriptor(descriptor: int) -> None:
-    for name in os.listdir(descriptor):
-        state = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        if stat.S_ISDIR(state.st_mode):
-            flags = os.O_RDONLY | os.O_DIRECTORY
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            child = os.open(name, flags, dir_fd=descriptor)
-            try:
-                if _directory_identity(os.fstat(child)) != _directory_identity(state):
-                    continue
-                _clear_directory_descriptor(child)
-            finally:
-                os.close(child)
-            os.rmdir(name, dir_fd=descriptor)
-        else:
-            os.unlink(name, dir_fd=descriptor)
+    """Keep cleanup anchored to the owned fd; never unlink by a raced name."""
+
+    del descriptor
+
 
 
 def _clear_owned_directory_contents(
