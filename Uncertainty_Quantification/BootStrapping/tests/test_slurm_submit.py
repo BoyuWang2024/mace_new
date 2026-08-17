@@ -7,6 +7,8 @@ import subprocess
 
 def test_completed_inference_slurm_invokes_python_modules_without_extra_arguments() -> None:
     script = Path(__file__).parents[1] / "run" / "submit_completed_inference.slurm"
+    assert b"\r\n" not in script.read_bytes()
+    assert "#SBATCH --error=mace-bootstrap-uq-%A_%a.err" in script.read_text()
     env = os.environ.copy()
     env.update(
         {
