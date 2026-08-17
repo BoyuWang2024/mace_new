@@ -167,6 +167,7 @@ def generate_prediction_payload(
     configurations: Sequence[Any],
     *,
     compute_stress: bool,
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """Run committed raw members for an explicit ordered configuration sequence."""
     data_config = config.section("data")
@@ -187,7 +188,9 @@ def generate_prediction_payload(
             configurations,
             atomic_numbers=atomic_numbers,
             cutoff=_model_value(model, "r_max"),
-            batch_size=prediction_config["batch_size"],
+            batch_size=(
+                prediction_config["batch_size"] if batch_size is None else batch_size
+            ),
             shuffle=False,
             heads=list(getattr(model, "heads", [data_config["head_name"]])),
         )
