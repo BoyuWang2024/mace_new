@@ -49,6 +49,7 @@ def test_store_rejects_request_identity_drift(tmp_path: Path) -> None:
 
 def test_reusable_chunk_rejects_shape_and_nonfinite_values(tmp_path: Path) -> None:
     store = InferenceStore(tmp_path / "request", request=REQUEST)
-    store.write_chunk(member=0, chunk=0, arrays={"energy": np.asarray([np.nan]), "forces": np.zeros((1, 3))})
+    with pytest.raises(HardFailure, match="non-finite"):
+        store.write_chunk(member=0, chunk=0, arrays={"energy": np.asarray([np.nan]), "forces": np.zeros((1, 3))})
     assert not store.reusable_chunk(member=0, chunk=0, expected={"energy": (1,), "forces": (1, 3)})
     assert not store.reusable_chunk(member=0, chunk=0, expected={"energy": (2,), "forces": (1, 3)})
