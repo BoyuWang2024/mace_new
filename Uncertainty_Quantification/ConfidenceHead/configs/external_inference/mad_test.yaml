@@ -1,0 +1,19 @@
+schema_version: 1
+dataset:
+  name: mad_test
+  path: /home/bywang/code/UQ/mace_new/data/dataset/mad-test-compatible.xyz
+  expected_sha256: d9a1280246a7a678f699e7654aebd29e4273ab6dcd1dfb4f74334a9b15edb66b
+  expected_structures: 9486
+  expected_atoms: 258586
+  source_index_path: /home/bywang/code/UQ/mace_new/data/dataset/mad-test-source-index.csv
+production_config_dir: ..
+output_root: /home/bywang/code/UQ/mace_new/Uncertainty_Quantification/ConfidenceHead/outputs/external
+plot_root: /home/bywang/code/UQ/mace_new/Uncertainty_Quantification/Plots/ConfidenceHead
+cache:
+  split: inference
+  build_batch_size: 32
+  shard_max_atoms: 100000
+  resume: true
+runtime:
+  device: cuda
+  head_batch_size: 32

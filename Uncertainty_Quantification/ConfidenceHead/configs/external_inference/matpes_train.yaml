@@ -1,0 +1,19 @@
+schema_version: 1
+dataset:
+  name: matpes_train
+  path: /home/bywang/code/UQ/mace_new/data/dataset/matpes_train.extxyz
+  expected_sha256: 12ff9403254c955537827ba96c140ee1753a7410ada7910f13c42be0aa308cec
+  expected_structures: 348780
+  expected_atoms: 2753112
+  source_index_path: null
+production_config_dir: ..
+output_root: /home/bywang/code/UQ/mace_new/Uncertainty_Quantification/ConfidenceHead/outputs/external
+plot_root: /home/bywang/code/UQ/mace_new/Uncertainty_Quantification/Plots/ConfidenceHead
+cache:
+  split: inference
+  build_batch_size: 32
+  shard_max_atoms: 100000
+  resume: true
+runtime:
+  device: cuda
+  head_batch_size: 32
