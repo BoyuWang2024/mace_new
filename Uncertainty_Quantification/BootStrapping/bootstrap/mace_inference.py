@@ -34,10 +34,19 @@ def load_member_model(
     digest = sha256_file(source)
     if digest != expected_sha256:
         raise HardFailure(f"member model SHA-256 mismatch: expected {expected_sha256}, got {digest}")
+    original_jit_load = torch.jit.load
+
+    def load_embedded_jit_on_cpu(value: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs["map_location"] = torch.device("cpu")
+        return original_jit_load(value, *args, **kwargs)
+
+    torch.jit.load = load_embedded_jit_on_cpu
     try:
         model = torch.load(source, map_location="cpu", weights_only=False)
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         raise HardFailure(f"could not load trusted member model {source}: {error}") from error
+    finally:
+        torch.jit.load = original_jit_load
     if not isinstance(model, nn.Module):
         raise HardFailure("trusted member model is not a torch.nn.Module")
     try:

@@ -148,6 +148,39 @@ def test_load_member_model_verifies_hash_and_configures_module(
     assert all(not parameter.requires_grad for parameter in model.parameters())
 
 
+def test_load_member_model_remaps_embedded_jit_modules_to_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "raw_best.model"
+    path.write_bytes(b"trusted model placeholder")
+    model = FakeModel(_output())
+    jit_map_locations: list[object] = []
+
+    def fake_jit_load(source: object, map_location: object = None) -> object:
+        del source
+        jit_map_locations.append(map_location)
+        return object()
+
+    def fake_load(source: Path, *, map_location: object, weights_only: object) -> torch.nn.Module:
+        del source, map_location, weights_only
+        torch.jit.load(object())
+        return model
+
+    monkeypatch.setattr(torch.jit, "load", fake_jit_load)
+    monkeypatch.setattr(torch, "load", fake_load)
+
+    loaded = load_member_model(
+        path,
+        expected_sha256=sha256_file(path),
+        device="cpu",
+        dtype=torch.float64,
+    )
+
+    assert loaded is model
+    assert jit_map_locations == [torch.device("cpu")]
+    assert torch.jit.load is fake_jit_load
+
+
 def test_load_member_model_rejects_hash_mismatch_and_non_module(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
