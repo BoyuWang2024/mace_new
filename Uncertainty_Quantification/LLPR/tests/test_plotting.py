@@ -1271,3 +1271,29 @@ def test_plot_failure_does_not_remove_replaced_staging_directory(
 
     assert replacement is not None
     assert (replacement / "value.txt").read_text(encoding="utf-8") == "other"
+
+
+def test_owned_cleanup_quarantines_before_removing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    staging = tmp_path / ".plots.stale-controlled"
+    staging.mkdir()
+    (staging / "value.txt").write_text("owned", encoding="utf-8")
+    identity = plotting._directory_path_identity(
+        staging, role="plot staging directory"
+    )
+    real_rmtree = plotting.shutil.rmtree
+
+    def replace_original_at_cleanup(quarantine: Path) -> None:
+        staging.mkdir()
+        (staging / "value.txt").write_text("foreign", encoding="utf-8")
+        real_rmtree(quarantine)
+
+    monkeypatch.setattr(plotting.shutil, "rmtree", replace_original_at_cleanup)
+
+    plotting._best_effort_remove_owned_directory(staging, identity)
+
+    assert (staging / "value.txt").read_text(encoding="utf-8") == "foreign"
+    assert not list(tmp_path.glob(".*.cleanup-*"))

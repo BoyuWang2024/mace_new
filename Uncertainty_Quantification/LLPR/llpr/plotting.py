@@ -1144,12 +1144,27 @@ def _best_effort_remove(path: Path) -> None:
 def _best_effort_remove_owned_directory(
     path: Path, expected_identity: tuple[int, int]
 ) -> None:
+    quarantine = Path(
+        tempfile.mkdtemp(prefix=f"{path.name}.cleanup-", dir=path.parent)
+    )
+    quarantine.rmdir()
     try:
-        if _optional_directory_path_identity(
-            path, role="plot staging directory"
-        ) != expected_identity:
+        _rename_noreplace(path, quarantine)
+    except OSError:
+        return
+    try:
+        if (
+            _directory_path_identity(
+                quarantine, role="plot cleanup directory"
+            )
+            != expected_identity
+        ):
+            try:
+                _rename_noreplace(quarantine, path)
+            except OSError:
+                pass
             return
-        shutil.rmtree(path)
+        shutil.rmtree(quarantine)
     except Exception:
         return
 
@@ -1284,6 +1299,9 @@ def _promote_directory_with_backup(
             dir=destination.parent,
         )
     )
+    backup_container_identity = _directory_path_identity(
+        backup_container, role="plot backup container"
+    )
     backup = backup_container / "previous"
     old_moved = False
     try:
@@ -1325,9 +1343,13 @@ def _promote_directory_with_backup(
                     "plot fallback publication failed and could not safely "
                     f"restore the old output; it remains at {backup}"
                 ) from rollback_error
-        _best_effort_remove(backup_container)
+        _best_effort_remove_owned_directory(
+            backup_container, backup_container_identity
+        )
         raise
-    _best_effort_remove(backup_container)
+    _best_effort_remove_owned_directory(
+        backup_container, backup_container_identity
+    )
 
 
 def _promote_existing_directory(staging: Path, destination: Path) -> None:
