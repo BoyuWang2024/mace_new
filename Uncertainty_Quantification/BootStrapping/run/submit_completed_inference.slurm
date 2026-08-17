@@ -2,6 +2,7 @@
 #SBATCH --job-name=mace-bootstrap-uq
 #SBATCH --output=mace-bootstrap-uq-%A_%a.out
 #SBATCH --error=mace-bootstrap-uq-%A_%a.err
+#SBATCH --partition=ai
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
