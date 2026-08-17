@@ -630,20 +630,18 @@ def test_post_exchange_cleanup_failure_keeps_complete_new_output(
     root = _publication_root(tmp_path / "publication", monkeypatch)
     output = run_plot(root, output_dir=tmp_path / "plots")
     (output / "old-only.txt").write_text("old", encoding="utf-8")
-    real_rmtree = plotting.shutil.rmtree
+    def fail_stale_cleanup(descriptor: int) -> None:
+        raise OSError("simulated stale cleanup failure")
 
-    def fail_stale_cleanup(path: Path, *args: object, **kwargs: object) -> None:
-        if f".{output.name}.stale-" in Path(path).name or ".backup-" in Path(path).name:
-            raise OSError("simulated stale cleanup failure")
-        real_rmtree(path, *args, **kwargs)
-
-    monkeypatch.setattr(plotting.shutil, "rmtree", fail_stale_cleanup)
+    monkeypatch.setattr(
+        plotting, "_clear_directory_descriptor", fail_stale_cleanup
+    )
     result = run_plot(root, output_dir=output)
 
     assert result == output
     assert not (output / "old-only.txt").exists()
     assert (output / "plotting_manifest.json").is_file()
-    stale = list(output.parent.glob(f".{output.name}.stale-*"))
+    stale = list(output.parent.glob(".mace-llpr-retired-plots.stale-*"))
     assert len(stale) == 1
     assert (stale[0] / "old-only.txt").read_text(encoding="utf-8") == "old"
 
@@ -1284,19 +1282,33 @@ def test_owned_cleanup_quarantines_before_removing(
     identity = plotting._directory_path_identity(
         staging, role="plot staging directory"
     )
-    real_rmtree = plotting.shutil.rmtree
+    real_open = plotting._open_directory_identity
+    foreign: Path | None = None
+    owned_away: Path | None = None
 
-    def replace_original_at_cleanup(quarantine: Path) -> None:
-        staging.mkdir()
-        (staging / "value.txt").write_text("foreign", encoding="utf-8")
-        real_rmtree(quarantine)
+    def replace_quarantine_before_open(
+        path: Path, *, role: str
+    ) -> tuple[int, tuple[int, int]]:
+        nonlocal foreign, owned_away
+        if ".mace-llpr-retired-" in path.name:
+            owned_away = path.with_name(f"{path.name}.owned-away")
+            path.rename(owned_away)
+            path.mkdir()
+            (path / "value.txt").write_text("foreign", encoding="utf-8")
+            foreign = path
+        return real_open(path, role=role)
 
-    monkeypatch.setattr(plotting.shutil, "rmtree", replace_original_at_cleanup)
+    monkeypatch.setattr(
+        plotting, "_open_directory_identity", replace_quarantine_before_open
+    )
 
     plotting._best_effort_remove_owned_directory(staging, identity)
 
-    assert (staging / "value.txt").read_text(encoding="utf-8") == "foreign"
-    assert not list(tmp_path.glob(".*.cleanup-*"))
+    assert foreign is not None
+    assert owned_away is not None
+    assert (foreign / "value.txt").read_text(encoding="utf-8") == "foreign"
+    assert (owned_away / "value.txt").read_text(encoding="utf-8") == "owned"
+    assert not staging.exists()
 
 
 def test_owned_cleanup_retries_without_deleting_name_collision(
@@ -1310,7 +1322,8 @@ def test_owned_cleanup_retries_without_deleting_name_collision(
     identity = plotting._directory_path_identity(
         staging, role="plot staging directory"
     )
-    collision = tmp_path / f"{staging.name}.cleanup-collision"
+    retired_prefix = f".mace-llpr-retired-{staging.name.lstrip('.')}-"
+    collision = tmp_path / f"{retired_prefix}collision"
     collision.mkdir()
     (collision / "value.txt").write_text("foreign", encoding="utf-8")
     tokens = iter(("collision", "success"))
@@ -1320,4 +1333,5 @@ def test_owned_cleanup_retries_without_deleting_name_collision(
 
     assert not staging.exists()
     assert (collision / "value.txt").read_text(encoding="utf-8") == "foreign"
-    assert not (tmp_path / f"{staging.name}.cleanup-success").exists()
+    retired = tmp_path / f"{retired_prefix}success"
+    assert retired.is_dir() and not any(retired.iterdir())

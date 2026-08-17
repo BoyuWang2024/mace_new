@@ -1141,6 +1141,43 @@ def _best_effort_remove(path: Path) -> None:
     except Exception:
         return
 
+def _clear_directory_descriptor(descriptor: int) -> None:
+    for name in os.listdir(descriptor):
+        state = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(state.st_mode):
+            flags = os.O_RDONLY | os.O_DIRECTORY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            child = os.open(name, flags, dir_fd=descriptor)
+            try:
+                if _directory_identity(os.fstat(child)) != _directory_identity(state):
+                    continue
+                _clear_directory_descriptor(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
+
+
+def _clear_owned_directory_contents(
+    path: Path, expected_identity: tuple[int, int]
+) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor, identity = _open_directory_identity(
+            path, role="plot cleanup directory"
+        )
+        if identity != expected_identity:
+            return
+        _clear_directory_descriptor(descriptor)
+    except Exception:
+        return
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 
 def _best_effort_remove_owned_directory(
     path: Path, expected_identity: tuple[int, int]
@@ -1148,7 +1185,7 @@ def _best_effort_remove_owned_directory(
     quarantine: Path | None = None
     for _ in range(16):
         candidate = path.parent / (
-            f"{path.name}.cleanup-{secrets.token_hex(16)}"
+            f".mace-llpr-retired-{path.name.lstrip('.')}-{secrets.token_hex(16)}"
         )
         try:
             _rename_noreplace(path, candidate)
@@ -1172,7 +1209,7 @@ def _best_effort_remove_owned_directory(
             except OSError:
                 pass
             return
-        shutil.rmtree(quarantine)
+        _clear_owned_directory_contents(quarantine, expected_identity)
     except Exception:
         return
 
