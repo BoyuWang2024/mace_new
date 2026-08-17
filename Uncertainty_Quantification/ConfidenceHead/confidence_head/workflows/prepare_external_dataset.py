@@ -12,11 +12,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import ase.io
-import numpy as np
 from ase import Atoms
 
 from ..artifacts import atomic_json_dump
-from ..data import ENERGY_KEY, FORCES_KEY, structure_id
+from ..data import _reference_values, structure_id
+from ..errors import DataContractError
 from ..identity import sha256_file
 
 
@@ -71,14 +71,10 @@ def _structures(path: Path) -> list[Atoms]:
     for index, atoms in enumerate(values):
         if not len(atoms):
             raise PreparedDatasetError(f"source structure {index} contains no atoms")
-        if ENERGY_KEY not in atoms.info or FORCES_KEY not in atoms.arrays:
-            raise PreparedDatasetError(f"source structure {index} is missing labels")
-        energy = np.asarray(atoms.info[ENERGY_KEY])
-        forces = np.asarray(atoms.arrays[FORCES_KEY])
-        if energy.shape != () or forces.shape != (len(atoms), 3):
-            raise PreparedDatasetError(f"source structure {index} label shape differs")
-        if not np.isfinite(energy).all() or not np.isfinite(forces).all():
-            raise PreparedDatasetError(f"source structure {index} labels are non-finite")
+        try:
+            _reference_values(atoms, context=f"source structure {index}")
+        except DataContractError as error:
+            raise PreparedDatasetError(str(error)) from error
     return values
 
 
