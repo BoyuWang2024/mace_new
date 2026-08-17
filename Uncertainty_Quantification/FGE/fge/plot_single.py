@@ -134,24 +134,40 @@ def _uncertainty_figure(uncertainty, residual, title: str, unit: str, config: Pl
 
 
 def _risk_figure(branch: PlotBranch, title: str) -> Figure:
-    figure, axes = plt.subplots(1, 2, figsize=(9.5, 4.1), constrained_layout=True)
-    for axis, metric, label in zip(
-        axes,
-        ("energy_per_atom_std", "force_component_std"),
-        ("Energy", "Force"),
-        strict=True,
-    ):
+    panels = [
+        ("energy_per_atom_std", "Energy"),
+        ("force_component_std", "Force"),
+    ]
+    if branch.has_stress:
+        panels.append(("stress_component_std", "Stress"))
+    figure, axes = plt.subplots(
+        1,
+        len(panels),
+        figsize=(4.7 * len(panels), 4.1),
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes)
+    for axis, (metric, label) in zip(axes, panels, strict=True):
         rows = [row for row in branch.risk_coverage if row.get("metric") == metric]
         if not rows:
             raise HardFailure(f"risk-coverage rows are missing for {metric}")
         try:
-            points = sorted((float(row["coverage"]), float(row["risk"])) for row in rows)
+            points = sorted(
+                (float(row["coverage"]), float(row["risk"])) for row in rows
+            )
         except (KeyError, TypeError, ValueError) as exc:
             raise HardFailure(f"invalid risk-coverage values for {metric}") from exc
         if not np.isfinite(points).all():
             raise HardFailure(f"risk-coverage contains NaN or Inf for {metric}")
         coverage, risk = zip(*points, strict=True)
-        axis.plot(coverage, risk, color=ORANGE, marker="o", markersize=3.5, linewidth=1.6)
+        axis.plot(
+            coverage,
+            risk,
+            color=ORANGE,
+            marker="o",
+            markersize=3.5,
+            linewidth=1.6,
+        )
         axis.set_title(label)
         axis.set_xlabel("Coverage")
         axis.set_ylabel("RMSE of retained samples")
@@ -168,27 +184,116 @@ def render_single_run(
     for branch_name, branch in run.branches.items():
         destination = Path(output_root) / run.name / branch_name
         title_suffix = branch_name.replace("_", " ").title()
-        specifications = (
-            ("energy_parity", _parity_figure(branch.energy_reference, branch.energy_prediction, f"Energy parity — {title_suffix}", "(eV/atom)", config), None),
-            ("force_parity", _parity_figure(branch.force_reference, branch.force_prediction, f"Force parity — {title_suffix}", "(eV/Å)", config), None),
-        )
+        specifications = [
+            (
+                "energy_parity",
+                _parity_figure(
+                    branch.energy_reference,
+                    branch.energy_prediction,
+                    f"Energy parity - {title_suffix}",
+                    "(eV/atom)",
+                    config,
+                ),
+                None,
+            ),
+            (
+                "force_parity",
+                _parity_figure(
+                    branch.force_reference,
+                    branch.force_prediction,
+                    f"Force parity - {title_suffix}",
+                    "(eV/Angstrom)",
+                    config,
+                ),
+                None,
+            ),
+        ]
+        if branch.has_stress:
+            specifications.append(
+                (
+                    "stress_parity",
+                    _parity_figure(
+                        branch.stress_reference,
+                        branch.stress_prediction,
+                        f"Stress parity - {title_suffix}",
+                        "(eV/Angstrom^3)",
+                        config,
+                    ),
+                    None,
+                )
+            )
         for logical_name, figure, excluded in specifications:
             png, pdf = _save_pair(figure, destination / logical_name, config)
             plt.close(figure)
-            records.append(FigureRecord(run.name, branch_name, logical_name, png, pdf, excluded))
+            records.append(
+                FigureRecord(
+                    run.name,
+                    branch_name,
+                    logical_name,
+                    png,
+                    pdf,
+                    excluded,
+                )
+            )
 
-        for logical_name, values in (
-            ("energy_uncertainty_residual", (branch.energy_uncertainty, branch.energy_residual, "Energy uncertainty vs residual", "(eV/atom)")),
-            ("force_uncertainty_residual", (branch.force_uncertainty, branch.force_residual, "Force uncertainty vs residual", "(eV/Å)")),
-        ):
+        uncertainty_specs = [
+            (
+                "energy_uncertainty_residual",
+                (
+                    branch.energy_uncertainty,
+                    branch.energy_residual,
+                    "Energy uncertainty vs residual",
+                    "(eV/atom)",
+                ),
+            ),
+            (
+                "force_uncertainty_residual",
+                (
+                    branch.force_uncertainty,
+                    branch.force_residual,
+                    "Force uncertainty vs residual",
+                    "(eV/Angstrom)",
+                ),
+            ),
+        ]
+        if branch.has_stress:
+            uncertainty_specs.append(
+                (
+                    "stress_uncertainty_residual",
+                    (
+                        branch.stress_uncertainty,
+                        branch.stress_residual,
+                        "Stress uncertainty vs residual",
+                        "(eV/Angstrom^3)",
+                    ),
+                )
+            )
+        for logical_name, values in uncertainty_specs:
             figure, excluded = _uncertainty_figure(*values, config)
-            figure.axes[0].set_title(f"{values[2]} — {title_suffix}")
+            figure.axes[0].set_title(f"{values[2]} - {title_suffix}")
             png, pdf = _save_pair(figure, destination / logical_name, config)
             plt.close(figure)
-            records.append(FigureRecord(run.name, branch_name, logical_name, png, pdf, excluded))
+            records.append(
+                FigureRecord(
+                    run.name,
+                    branch_name,
+                    logical_name,
+                    png,
+                    pdf,
+                    excluded,
+                )
+            )
 
-        figure = _risk_figure(branch, f"Risk–coverage — {title_suffix}")
+        figure = _risk_figure(branch, f"Risk-coverage - {title_suffix}")
         png, pdf = _save_pair(figure, destination / "risk_coverage", config)
         plt.close(figure)
-        records.append(FigureRecord(run.name, branch_name, "risk_coverage", png, pdf))
+        records.append(
+            FigureRecord(
+                run.name,
+                branch_name,
+                "risk_coverage",
+                png,
+                pdf,
+            )
+        )
     return tuple(records)
