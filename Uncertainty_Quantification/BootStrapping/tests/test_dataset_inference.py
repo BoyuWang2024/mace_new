@@ -16,7 +16,7 @@ from Uncertainty_Quantification.BootStrapping.bootstrap.errors import HardFailur
 
 def _dataset(path: Path, *, stress_flags: tuple[bool, ...]) -> Path:
     structures = []
-    for index, (count, with_stress) in enumerate(zip((2, 2, 1), stress_flags, strict=True)):
+    for index, (count, with_stress) in enumerate(zip((2, 2, 1), stress_flags)):
         atoms = Atoms(
             "H" * count,
             positions=np.arange(count * 3, dtype=float).reshape(count, 3) * 0.1,
