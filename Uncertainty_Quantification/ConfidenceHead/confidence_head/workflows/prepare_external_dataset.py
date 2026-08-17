@@ -16,7 +16,7 @@ import numpy as np
 from ase import Atoms
 
 from ..artifacts import atomic_json_dump
-from ..data import ENERGY_KEY, FORCES_KEY
+from ..data import ENERGY_KEY, FORCES_KEY, structure_id
 from ..identity import sha256_file
 
 
@@ -187,15 +187,16 @@ def prepare_compatible_dataset(
         raise PreparedDatasetError("unsupported atomic numbers must be positive")
     outputs = _paths(output_path)
     evidence = tuple(path.exists() for path in outputs)
-    if any(evidence):
-        if not all(evidence):
-            raise PreparedDatasetError("compatible dataset evidence is partial")
+    if all(evidence):
         return _reuse(
             outputs,
             source_path=source,
             source_sha256=source_sha,
             unsupported=unsupported,
         )
+    dataset_only = evidence == (True, False, False, False)
+    if any(evidence) and not dataset_only:
+        raise PreparedDatasetError("compatible dataset evidence is partial")
 
     structures = _structures(source)
     unsupported_set = set(unsupported)
@@ -222,7 +223,16 @@ def prepare_compatible_dataset(
         raise PreparedDatasetError("filter removed every source structure")
 
     dataset, exclusions_path, source_index_path, manifest_path = outputs
-    _atomic_extxyz(dataset, compatible)
+    if dataset_only:
+        existing = _structures(dataset)
+        if (
+            len(existing) != len(compatible)
+            or tuple(structure_id(atoms) for atoms in existing)
+            != tuple(structure_id(atoms) for atoms in compatible)
+        ):
+            raise PreparedDatasetError("existing compatible dataset content differs")
+    else:
+        _atomic_extxyz(dataset, compatible)
     _atomic_bytes(
         exclusions_path,
         _csv_bytes(
