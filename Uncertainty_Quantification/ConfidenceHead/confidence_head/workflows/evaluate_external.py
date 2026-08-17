@@ -25,7 +25,6 @@ from .evaluate import (
     evaluation_input_hashes,
     load_evaluation_inputs,
 )
-from .train import _feature_dtype
 
 
 class ExternalEvaluationInputError(RuntimeError):
@@ -42,6 +41,20 @@ def resolve_head_config(
         if suffix.isdigit() and int(suffix) in config.energy_configs:
             return config.energy_configs[int(suffix)]
     raise ExternalEvaluationInputError(f"unsupported head key: {head_key}")
+
+
+def external_feature_dtype(
+    cache: CacheManifest, split: str, batch_size: int
+) -> torch.dtype:
+    """Read the persisted feature dtype from the requested external split."""
+    try:
+        batch = next(iter(iter_cache_batches(cache, split, batch_size)))
+    except StopIteration as error:
+        raise ExternalEvaluationInputError("external cache split is empty") from error
+    dtype = batch.scalar_features.dtype
+    if dtype not in {torch.float32, torch.float64}:
+        raise ExternalEvaluationInputError("external cache feature dtype is unsupported")
+    return dtype
 
 
 def _paths(config: ExternalInferenceConfig, head_key: str) -> EvaluationPaths:
@@ -147,7 +160,7 @@ def run_evaluate_external(
     )
     if validate_or_reuse_evaluation(paths, inputs.identity, input_hashes):
         return paths.manifest
-    dtype = _feature_dtype(cache, config.head_batch_size)
+    dtype = external_feature_dtype(cache, config.cache.split, config.head_batch_size)
     model = _load_best_model(inputs, dtype)
     predictions = _collect(
         inputs,
