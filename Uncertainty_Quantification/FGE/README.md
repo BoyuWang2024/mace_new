@@ -48,3 +48,46 @@ python -m Uncertainty_Quantification.FGE.scripts.plot \
 ```
 
 成功后原子发布 43 张逻辑图（43 PNG、43 PDF）及远端审计文件 `plot_audit.json`。`outputs/` 已被 Git 忽略；对外传输时只复制 PNG/PDF，不复制审计、张量、模型、CSV 或日志。
+
+## 远端数据集推理、UQ 与绘图
+
+本流程只读使用四组已经完成并通过验证的正式 FGE 结果。正式结果目录中的模型、训练 manifest、canonical prediction、evaluation 和 result_manifest.json 均不得改写；新结果统一写入 outputs/inference/{experiment}/{dataset}/。本流程不重新训练，也不重新预测既有正式结果，只对以下显式 extxyz 输入执行新的 prediction、UQ 和绘图：
+
+- matpes_test.extxyz：energy、force、stress；
+- mad-test.xyz：energy、force，不要求 stress；
+- matpes_train.extxyz：energy、force、stress。
+
+输入只需满足 extxyz 字段合同，不绑定文件身份、旧仓库路径或旧来源标识。派生 manifest 不记录输入绝对路径或输入内容哈希。使用以下四个正式配置：
+
+- mace_fge_full_gpu_b64.yaml
+- mace_fge_full_gpu_b64_lr1e-7_1e-6.yaml
+- mace_fge_full_gpu_b64_lr1e-6_1e-5.yaml
+- mace_fge_full_gpu_b64_lr1e-5_1e-4.yaml
+
+远端使用现有 mace conda 环境；若仓库尚未 editable 安装，在远端仓库根目录执行 python -m pip install -e .，不要克隆 conda 环境。
+
+单个实验、单个数据集可以按阶段运行。以下示例中的路径必须替换为远端实际路径：
+
+~~~bash
+conda run -n mace python -m Uncertainty_Quantification.FGE.scripts.predict_dataset   --config Uncertainty_Quantification/FGE/configs/mace_fge_full_gpu_b64.yaml   --dataset-label matpes_test   --data data/dataset/matpes_test.extxyz   --outputs-root Uncertainty_Quantification/FGE/outputs   --batch-size 64   --shard-size 256   --compute-stress
+
+conda run -n mace python -m Uncertainty_Quantification.FGE.scripts.evaluate_dataset   --config Uncertainty_Quantification/FGE/configs/mace_fge_full_gpu_b64.yaml   --dataset-label matpes_test   --outputs-root Uncertainty_Quantification/FGE/outputs
+~~~
+
+prediction shard 通过签名、SHA-256、shape、dtype、finite 和结构映射校验后才可恢复复用。任务中断后直接重新运行同一条 predict_dataset 命令；已验证 shard 会跳过，部分存在、损坏或签名不一致的 shard 会硬失败，不会静默覆盖。
+
+完整的四实验乘三数据集流程严格串行执行 12 次 prediction、12 次 evaluation 和 3 次 plot：
+
+~~~bash
+conda run -n mace python -m Uncertainty_Quantification.FGE.scripts.run_dataset_pipeline   --config-dir Uncertainty_Quantification/FGE/configs   --data-dir data/dataset   --outputs-root Uncertainty_Quantification/FGE/outputs   --figures-root Uncertainty_Quantification/FGE/outputs/figures   --batch-size 64   --shard-size 256
+~~~
+
+equal-weight 方差分母为 K-1。validation-weighted 方差分母为 1-sum(w^2)；stress 复用 force validation weights。stress tensor 为 [K,S,3,3]，绘图按 component 展平，单位为 eV/Angstrom^3。低或未定义相关性、较弱 RMSE 和 log 图零值排除只产生 warning；模型加载/forward、缺失文件、hash、mapping、shape、dtype、finite 或图集合同失败会立即抛出 error 并停止后续阶段。
+
+每个数据集的图集按原子目录发布：
+
+- mad_test：43 张逻辑图，即 43 PNG + 43 PDF；
+- matpes_test：59 张逻辑图，即 59 PNG + 59 PDF；
+- matpes_train：59 张逻辑图，即 59 PNG + 59 PDF。
+
+W&B 功能沿用每个正式配置的 wandb section，只记录 prediction/evaluation/plot 的有限标量状态，不上传模型、prediction shard、evaluation tensor 或图片 artifact。outputs/、_work/wandb/、CSV、audit、tensor 和日志均不进入发布。远端完成后仅将最终 PNG/PDF 拉取到本地，不拉取全量预测、UQ 结果、模型、checkpoint、日志或 W&B 文件。
