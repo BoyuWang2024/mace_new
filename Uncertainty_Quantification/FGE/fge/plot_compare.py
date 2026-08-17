@@ -42,25 +42,48 @@ def _correlation(run: PlotRun, branch: str, metric: str, coefficient: str) -> fl
     return _finite_float(rows[0].get(coefficient), f"{metric} {coefficient}")
 
 
+def _comparison_panels(runs: Mapping[str, PlotRun]) -> list[tuple[str, str, str]]:
+    modes = {run.has_stress for run in runs.values()}
+    if len(modes) != 1:
+        raise HardFailure("all four experiments must expose the same observables")
+    panels = [
+        ("energy_per_atom", "Energy", "eV/atom"),
+        ("force_component", "Force", "eV/Angstrom"),
+    ]
+    if modes == {True}:
+        panels.append(("stress_component", "Stress", "eV/Angstrom^3"))
+    return panels
+
+
 def _rmse_figure(runs: Mapping[str, PlotRun]):
     labels = tuple(runs)
     x = np.arange(len(labels), dtype=float)
     width = 0.36
-    figure, axes = plt.subplots(1, 2, figsize=(10.2, 4.2), constrained_layout=True)
-    for axis, metric, title, unit in zip(
-        axes,
-        ("energy_per_atom", "force_component"),
-        ("Energy RMSE", "Force RMSE"),
-        ("eV/atom", "eV/Å"),
-        strict=True,
-    ):
+    panels = _comparison_panels(runs)
+    figure, axes = plt.subplots(
+        1,
+        len(panels),
+        figsize=(5.1 * len(panels), 4.2),
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes)
+    for axis, (metric, observable, unit) in zip(axes, panels, strict=True):
         for offset, branch in zip((-width / 2, width / 2), BRANCHES, strict=True):
             values = [
-                _finite_float(runs[label].branches[branch].metrics[metric]["rmse"], f"{label} {metric} RMSE")
+                _finite_float(
+                    runs[label].branches[branch].metrics[metric]["rmse"],
+                    f"{label} {metric} RMSE",
+                )
                 for label in labels
             ]
-            axis.bar(x + offset, values, width, label=branch.replace("_", " ").title(), color=COLORS[branch])
-        axis.set_title(title)
+            axis.bar(
+                x + offset,
+                values,
+                width,
+                label=branch.replace("_", " ").title(),
+                color=COLORS[branch],
+            )
+        axis.set_title(f"{observable} RMSE")
         axis.set_ylabel(unit)
         axis.set_xticks(x, labels, rotation=18, ha="right")
         _style_axis(axis)
@@ -71,16 +94,38 @@ def _rmse_figure(runs: Mapping[str, PlotRun]):
 def _correlation_figure(runs: Mapping[str, PlotRun]):
     labels = tuple(runs)
     x = np.arange(len(labels), dtype=float)
-    figure, axes = plt.subplots(2, 2, figsize=(10.2, 7.5), constrained_layout=True, sharex=True)
-    for row, (metric, observable) in enumerate(
-        (("energy_per_atom_std", "Energy"), ("force_component_std", "Force"))
-    ):
+    panels = _comparison_panels(runs)
+    figure, axes = plt.subplots(
+        len(panels),
+        2,
+        figsize=(10.2, 3.7 * len(panels)),
+        constrained_layout=True,
+        sharex=True,
+        squeeze=False,
+    )
+    for row, (metric, observable, _unit) in enumerate(panels):
+        uncertainty_metric = f"{metric}_std"
         for column, coefficient in enumerate(("pearson", "spearman")):
             axis = axes[row, column]
             for branch in BRANCHES:
-                values = [_correlation(runs[label], branch, metric, coefficient) for label in labels]
-                axis.plot(x, values, marker="o", linewidth=1.5, color=COLORS[branch], label=branch.replace("_", " ").title())
-            axis.set_title(f"{observable} — {coefficient.title()}")
+                values = [
+                    _correlation(
+                        runs[label],
+                        branch,
+                        uncertainty_metric,
+                        coefficient,
+                    )
+                    for label in labels
+                ]
+                axis.plot(
+                    x,
+                    values,
+                    marker="o",
+                    linewidth=1.5,
+                    color=COLORS[branch],
+                    label=branch.replace("_", " ").title(),
+                )
+            axis.set_title(f"{observable} - {coefficient.title()}")
             axis.set_ylim(-1.05, 1.05)
             axis.set_xticks(x, labels, rotation=18, ha="right")
             _style_axis(axis)
@@ -89,20 +134,30 @@ def _correlation_figure(runs: Mapping[str, PlotRun]):
 
 
 def _risk_figure(runs: Mapping[str, PlotRun]):
-    figure, axes = plt.subplots(1, 2, figsize=(10.2, 4.2), constrained_layout=True)
+    panels = _comparison_panels(runs)
+    figure, axes = plt.subplots(
+        1,
+        len(panels),
+        figsize=(5.1 * len(panels), 4.2),
+        constrained_layout=True,
+    )
+    axes = np.atleast_1d(axes)
     linestyles = {"equal_weight": "-", "validation_weighted": "--"}
     palette = plt.get_cmap("tab10")
-    for axis, metric, observable in zip(
-        axes,
-        ("energy_per_atom_std", "force_component_std"),
-        ("Energy", "Force"),
-        strict=True,
-    ):
+    for axis, (metric, observable, _unit) in zip(axes, panels, strict=True):
+        uncertainty_metric = f"{metric}_std"
         for run_index, (label, run) in enumerate(runs.items()):
             for branch in BRANCHES:
-                rows = [row for row in run.branches[branch].risk_coverage if row.get("metric") == metric]
+                rows = [
+                    row
+                    for row in run.branches[branch].risk_coverage
+                    if row.get("metric") == uncertainty_metric
+                ]
                 if not rows:
-                    raise HardFailure(f"risk-coverage rows are missing for {label} {metric}")
+                    raise HardFailure(
+                        f"risk-coverage rows are missing for "
+                        f"{label} {uncertainty_metric}"
+                    )
                 points = sorted(
                     (
                         _finite_float(row.get("coverage"), f"{label} coverage"),
@@ -117,14 +172,19 @@ def _risk_figure(runs: Mapping[str, PlotRun]):
                     linestyle=linestyles[branch],
                     color=palette(run_index),
                     linewidth=1.5,
-                    label=f"{label} — {branch.replace('_', ' ')}",
+                    label=f"{label} - {branch.replace('_', ' ')}",
                 )
         axis.set_title(observable)
         axis.set_xlabel("Coverage")
         axis.set_ylabel("RMSE of retained samples")
         axis.set_xlim(0.0, 1.02)
         _style_axis(axis)
-    axes[1].legend(frameon=False, fontsize=7, bbox_to_anchor=(1.02, 1.0), loc="upper left")
+    axes[-1].legend(
+        frameon=False,
+        fontsize=7,
+        bbox_to_anchor=(1.02, 1.0),
+        loc="upper left",
+    )
     return figure
 
 
