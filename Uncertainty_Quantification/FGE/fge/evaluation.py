@@ -16,7 +16,12 @@ from torch import Tensor
 from .aggregation import validation_error_weights, weighted_mean
 from .artifacts import atomic_torch_save, atomic_write_json, sibling_temporary_path
 from .errors import HardFailure
-from .metrics import compute_correlations, compute_errors, compute_risk_coverage
+from .metrics import (
+    compute_correlations,
+    compute_errors,
+    compute_risk_coverage,
+    compute_stress_errors,
+)
 from .uncertainty import (
     reduce_atoms_by_structure,
     scalar_gmd,
@@ -349,3 +354,43 @@ def evaluate_prediction(config: Any, run_dir: Path) -> dict[str, Any]:
     )
     _atomic_text(evaluation_root / "report.md", report)
     return {"equal_weight": equal, "validation_weighted": weighted, "warnings": warnings}
+
+
+def _stress_outputs(
+    prediction: Mapping[str, Any], stress_weights: Tensor | None
+) -> tuple[dict[str, Tensor], dict[str, Tensor], dict[str, Tensor]]:
+    """Build stress ensemble, component STD, and component residual tensors."""
+    members = prediction.get("stress_members")
+    reference = prediction.get("stress_reference")
+    if (
+        not isinstance(members, Tensor)
+        or members.ndim != 4
+        or members.shape[2:] != (3, 3)
+    ):
+        raise HardFailure("stress_members must have shape [K, S, 3, 3]")
+    if (
+        not isinstance(reference, Tensor)
+        or tuple(reference.shape) != tuple(members.shape[1:])
+    ):
+        raise HardFailure("stress_reference must have shape [S, 3, 3]")
+    if members.dtype != torch.float64 or reference.dtype != torch.float64:
+        raise HardFailure("stress tensors must use float64")
+    if (
+        not torch.isfinite(members).all().item()
+        or not torch.isfinite(reference).all().item()
+    ):
+        raise HardFailure("stress tensors contain NaN or Inf")
+    member_count = int(members.shape[0])
+    stored = (
+        torch.full((member_count,), 1.0 / member_count, dtype=torch.float64)
+        if stress_weights is None
+        else stress_weights.detach().to(device="cpu", dtype=torch.float64)
+    )
+    stress = weighted_mean(members, stress_weights).to(
+        device="cpu", dtype=torch.float64
+    )
+    return (
+        {"stress": stress, "stress_weights": stored},
+        {"stress_component_std": unbiased_std(members, stress_weights)},
+        compute_stress_errors(stress, reference),
+    )

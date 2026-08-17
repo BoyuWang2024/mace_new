@@ -169,3 +169,21 @@ def compute_errors(
         "force_structure_max": reduced["max"],
         "force_structure_q95": reduced["q95"],
     }
+
+
+def compute_stress_errors(
+    stress_prediction: Tensor, stress_reference: Tensor
+) -> dict[str, Tensor]:
+    """Compute component-wise absolute stress errors for [S, 3, 3] tensors."""
+    if not isinstance(stress_reference, Tensor) or stress_reference.ndim != 3:
+        raise HardFailure("stress_reference must have shape [S, 3, 3]")
+    shape = tuple(stress_reference.shape)
+    if len(shape) != 3 or shape[0] < 1 or shape[1:] != (3, 3):
+        raise HardFailure("stress_reference must have shape [S, 3, 3]")
+    prediction = _aligned_prediction_tensor(
+        stress_prediction, shape, "stress_prediction"
+    )
+    reference = _aligned_prediction_tensor(
+        stress_reference, shape, "stress_reference"
+    )
+    return {"stress_component": (prediction - reference).abs()}
