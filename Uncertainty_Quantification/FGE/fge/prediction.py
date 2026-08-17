@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -161,23 +161,17 @@ def _infer_one(
     return result
 
 
-def _generate_prediction_payload(config: Any, manifest: Mapping[str, Any]) -> dict[str, Any]:
-    paths = config.section("paths")
+def generate_prediction_payload(
+    config: Any,
+    manifest: Mapping[str, Any],
+    configurations: Sequence[Any],
+    *,
+    compute_stress: bool,
+) -> dict[str, Any]:
+    """Run committed raw members for an explicit ordered configuration sequence."""
     data_config = config.section("data")
     prediction_config = config.section("prediction")
     training_config = config.section("training")
-    keys = {
-        "energy": data_config["energy_key"],
-        "forces": data_config["forces_key"],
-        "stress": data_config["stress_key"],
-        "head": data_config["head_name"],
-    }
-    configurations = load_extxyz(
-        Path(paths["test_data"]),
-        keys=keys,
-        required={"energy", "forces"},
-        head_name=data_config["head_name"],
-    )
     device = torch.device(training_config["device"])
     results: list[dict[str, Tensor]] = []
     member_ids: list[str] = []
@@ -197,10 +191,15 @@ def _generate_prediction_payload(config: Any, manifest: Mapping[str, Any]) -> di
             shuffle=False,
             heads=list(getattr(model, "heads", [data_config["head_name"]])),
         )
-        results.append(_infer_one(model, loader, device, prediction_config["compute_stress"]))
+        results.append(_infer_one(model, loader, device, compute_stress))
+    if not results:
+        raise HardFailure("training manifest contains no members")
     first = results[0]
+    reference_names = ["energy_reference", "forces_reference", "n_atoms"]
+    if compute_stress:
+        reference_names.append("stress_reference")
     for result in results[1:]:
-        for name in ("energy_reference", "forces_reference", "n_atoms"):
+        for name in reference_names:
             if not torch.equal(result[name], first[name]):
                 raise HardFailure("member prediction references are not aligned")
     n_atoms = first["n_atoms"]
@@ -220,12 +219,37 @@ def _generate_prediction_payload(config: Any, manifest: Mapping[str, Any]) -> di
         "atom_to_structure": atom_to_structure,
         "structure_ptr": structure_ptr,
     }
-    if prediction_config["compute_stress"]:
+    if compute_stress:
         payload["observables"].append("stress")
         payload["stress_members"] = torch.stack([result["stress"] for result in results])
         payload["stress_reference"] = first["stress_reference"]
     return payload
 
+
+def _generate_prediction_payload(config: Any, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    paths = config.section("paths")
+    data_config = config.section("data")
+    prediction_config = config.section("prediction")
+    compute_stress = bool(prediction_config["compute_stress"])
+    keys = {
+        "energy": data_config["energy_key"],
+        "forces": data_config["forces_key"],
+        "stress": data_config["stress_key"],
+        "head": data_config["head_name"],
+    }
+    required = {"energy", "forces", "stress"} if compute_stress else {"energy", "forces"}
+    configurations = load_extxyz(
+        Path(paths["test_data"]),
+        keys=keys,
+        required=required,
+        head_name=data_config["head_name"],
+    )
+    return generate_prediction_payload(
+        config,
+        manifest,
+        configurations,
+        compute_stress=compute_stress,
+    )
 
 def predict_members(config: Any) -> Path:
     """Run only raw committed members and write one canonical prediction artifact."""
