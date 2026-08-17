@@ -1100,7 +1100,7 @@ def _output_lock(destination: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
-def _rename_exchange(first: Path, second: Path) -> None:
+def _renameat2(first: Path, second: Path, *, flags: int) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = libc.renameat2
     renameat2.argtypes = [
@@ -1116,11 +1116,19 @@ def _rename_exchange(first: Path, second: Path) -> None:
         os.fsencode(first),
         -100,
         os.fsencode(second),
-        2,
+        flags,
     )
     if result != 0:
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number))
+
+
+def _rename_exchange(first: Path, second: Path) -> None:
+    _renameat2(first, second, flags=2)
+
+
+def _rename_noreplace(first: Path, second: Path) -> None:
+    _renameat2(first, second, flags=1)
 
 
 def _best_effort_remove(path: Path) -> None:
@@ -1129,6 +1137,19 @@ def _best_effort_remove(path: Path) -> None:
             path.unlink()
         elif path.exists():
             shutil.rmtree(path)
+    except Exception:
+        return
+
+
+def _best_effort_remove_owned_directory(
+    path: Path, expected_identity: tuple[int, int]
+) -> None:
+    try:
+        if _optional_directory_path_identity(
+            path, role="plot staging directory"
+        ) != expected_identity:
+            return
+        shutil.rmtree(path)
     except Exception:
         return
 
@@ -1231,7 +1252,7 @@ def _rollback_backup_promotion(
             raise RuntimeError(
                 "plot staging directory changed; rollback would overwrite it"
             )
-        os.replace(destination, staging)
+        _rename_noreplace(destination, staging)
         _assert_directory_identity(
             staging, staging_identity, role="plot staging directory"
         )
@@ -1244,7 +1265,7 @@ def _rollback_backup_promotion(
         backup, destination_identity, role="plot backup directory"
     )
     _assert_path_missing(destination, role="plot destination")
-    os.replace(backup, destination)
+    _rename_noreplace(backup, destination)
     _assert_directory_identity(
         destination, destination_identity, role="plot destination"
     )
@@ -1272,7 +1293,7 @@ def _promote_directory_with_backup(
         _assert_directory_identity(
             destination, destination_identity, role="plot destination"
         )
-        os.replace(destination, backup)
+        _rename_noreplace(destination, backup)
         old_moved = True
         _assert_directory_identity(
             backup, destination_identity, role="plot backup directory"
@@ -1281,7 +1302,7 @@ def _promote_directory_with_backup(
         _assert_directory_identity(
             staging, staging_identity, role="plot staging directory"
         )
-        os.replace(staging, destination)
+        _rename_noreplace(staging, destination)
         _assert_directory_identity(
             destination, staging_identity, role="plot destination"
         )
@@ -1354,13 +1375,16 @@ def _promote_existing_directory(staging: Path, destination: Path) -> None:
                 os.close(destination_descriptor)
         finally:
             os.close(staging_descriptor)
-    if staging.exists():
-        _best_effort_remove(staging)
+    if (
+        _optional_directory_path_identity(staging, role="plot staging directory")
+        is not None
+    ):
+        _best_effort_remove_owned_directory(staging, destination_identity)
 
 
 def _promote_directory(staging: Path, destination: Path) -> None:
     if not destination.exists():
-        os.replace(staging, destination)
+        _rename_noreplace(staging, destination)
         return
     _promote_existing_directory(staging, destination)
 
@@ -1412,6 +1436,9 @@ def _run_plot_locked(
     staging = Path(
         tempfile.mkdtemp(prefix=f".{destination.name}.stale-", dir=destination.parent)
     )
+    staging_identity = _directory_path_identity(
+        staging, role="plot staging directory"
+    )
     try:
         _render_all_figures(data, shared_limits, selected_paths, staging, dpi)
         _write_statistics(staging / "plotting_statistics.csv", data, shared_limits)
@@ -1448,7 +1475,7 @@ def _run_plot_locked(
             raise ValueError("publication input changed during plotting")
         _promote_directory(staging, destination)
     finally:
-        _best_effort_remove(staging)
+        _best_effort_remove_owned_directory(staging, staging_identity)
     return destination
 
 
@@ -1529,6 +1556,7 @@ def run_plot(
         _cleanup_stale_directories(destination)
         snapshot: Path | None = None
         staging: Path | None = None
+        staging_identity: tuple[int, int] | None = None
         try:
             snapshot = _create_input_snapshot(root, destination)
             snapshot_source_hashes = _snapshot_source_hashes(snapshot)
@@ -1539,6 +1567,9 @@ def run_plot(
                     prefix=f".{destination.name}.stale-",
                     dir=destination.parent,
                 )
+            )
+            staging_identity = _directory_path_identity(
+                staging, role="plot staging directory"
             )
             statistics, limits = render_carnet_density(
                 panels, staging, dpi=render_dpi
@@ -1590,5 +1621,5 @@ def run_plot(
         finally:
             if snapshot is not None:
                 _best_effort_remove(snapshot)
-            if staging is not None:
-                _best_effort_remove(staging)
+            if staging is not None and staging_identity is not None:
+                _best_effort_remove_owned_directory(staging, staging_identity)

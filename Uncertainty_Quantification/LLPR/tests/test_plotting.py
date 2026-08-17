@@ -1146,7 +1146,7 @@ def test_fallback_promotion_failure_rolls_back_old_output_without_backup_leak(
     staging = tmp_path / ".plots.stale-controlled"
     staging.mkdir()
     (staging / "value.txt").write_text("new", encoding="utf-8")
-    real_replace = plotting.os.replace
+    real_noreplace = plotting._rename_noreplace
 
     monkeypatch.setattr(
         plotting,
@@ -1159,9 +1159,9 @@ def test_fallback_promotion_failure_rolls_back_old_output_without_backup_leak(
     def fail_staging_promotion(source: Path, target: Path) -> None:
         if Path(source) == staging and Path(target) == destination:
             raise OSError(errno.EIO, "simulated staged rename failure")
-        real_replace(source, target)
+        real_noreplace(source, target)
 
-    monkeypatch.setattr(plotting.os, "replace", fail_staging_promotion)
+    monkeypatch.setattr(plotting, "_rename_noreplace", fail_staging_promotion)
 
     with pytest.raises(OSError) as captured:
         plotting._promote_directory(staging, destination)
@@ -1201,3 +1201,73 @@ def test_exchange_fallback_rejects_destination_replacement_before_mutation(
     assert (displaced / "value.txt").read_text(encoding="utf-8") == "old"
     assert (staging / "value.txt").read_text(encoding="utf-8") == "new"
     assert not list(tmp_path.glob(".plots.backup-*"))
+
+
+def test_fallback_never_overwrites_destination_created_during_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    destination = tmp_path / "plots"
+    destination.mkdir()
+    (destination / "value.txt").write_text("old", encoding="utf-8")
+    staging = tmp_path / ".plots.stale-controlled"
+    staging.mkdir()
+    (staging / "value.txt").write_text("new", encoding="utf-8")
+    real_noreplace = plotting._rename_noreplace
+    injected = False
+
+    monkeypatch.setattr(
+        plotting,
+        "_rename_exchange",
+        lambda first, second: (_ for _ in ()).throw(
+            OSError(errno.EINVAL, "exchange unsupported")
+        ),
+    )
+
+    def create_destination_before_promotion(source: Path, target: Path) -> None:
+        nonlocal injected
+        if Path(source) == staging and Path(target) == destination and not injected:
+            injected = True
+            destination.mkdir()
+            (destination / "value.txt").write_text("other", encoding="utf-8")
+        real_noreplace(source, target)
+
+    monkeypatch.setattr(plotting, "_rename_noreplace", create_destination_before_promotion)
+
+    with pytest.raises(RuntimeError, match="could not safely restore"):
+        plotting._promote_directory(staging, destination)
+
+    assert (destination / "value.txt").read_text(encoding="utf-8") == "other"
+    assert (staging / "value.txt").read_text(encoding="utf-8") == "new"
+    backups = list(tmp_path.glob(".plots.backup-*/previous/value.txt"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "old"
+
+
+def test_plot_failure_does_not_remove_replaced_staging_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr import plotting
+
+    root = _publication_root(tmp_path / "publication", monkeypatch)
+    output = tmp_path / "plots"
+    replacement: Path | None = None
+
+    def replace_staging_then_fail(staging: Path, destination: Path) -> None:
+        nonlocal replacement
+        del destination
+        owned = staging.with_name(f"{staging.name}.owned")
+        staging.rename(owned)
+        staging.mkdir()
+        (staging / "value.txt").write_text("other", encoding="utf-8")
+        replacement = staging
+        raise RuntimeError("simulated unsafe rollback")
+
+    monkeypatch.setattr(plotting, "_promote_directory", replace_staging_then_fail)
+
+    with pytest.raises(RuntimeError, match="simulated unsafe rollback"):
+        run_plot(root, output_dir=output, style="carnet_density")
+
+    assert replacement is not None
+    assert (replacement / "value.txt").read_text(encoding="utf-8") == "other"
