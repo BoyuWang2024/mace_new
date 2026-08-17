@@ -51,4 +51,5 @@ dist/
 # LLPR publication mirrors contain generated plot packages.
 /Uncertainty_Quantification/Plots/LLPR/**
 !/Uncertainty_Quantification/Plots/LLPR/.gitignore
+/Uncertainty_Quantification/Plots/BootStrapping/**
 /Uncertainty_Quantification/LLPR/llpr-stage-*.err
