@@ -115,8 +115,22 @@ def test_generate_prediction_payload_accepts_explicit_configurations(
         ]
     }
     models = [
-        SimpleNamespace(atomic_numbers=torch.tensor([1]), r_max=5.0, heads=["Default"]),
-        SimpleNamespace(atomic_numbers=torch.tensor([1]), r_max=5.0, heads=["Default"]),
+        SimpleNamespace(
+            atomic_numbers=torch.tensor([1]),
+            r_max=5.0,
+            heads=["Default"],
+            parameters=lambda: iter(
+                (torch.nn.Parameter(torch.ones(1, dtype=torch.float64)),)
+            ),
+        ),
+        SimpleNamespace(
+            atomic_numbers=torch.tensor([1]),
+            r_max=5.0,
+            heads=["Default"],
+            parameters=lambda: iter(
+                (torch.nn.Parameter(torch.ones(1, dtype=torch.float64)),)
+            ),
+        ),
     ]
     results = [_member_result(0.0), _member_result(1.0)]
     monkeypatch.setattr(prediction, "_load_model", lambda *_args: models.pop(0))
@@ -149,7 +163,14 @@ def test_generate_prediction_payload_checks_stress_reference_alignment(
     }
     results = [_member_result(0.0), _member_result(1.0)]
     results[1]["stress_reference"] = torch.ones((2, 3, 3), dtype=torch.float64)
-    model = SimpleNamespace(atomic_numbers=torch.tensor([1]), r_max=5.0, heads=["Default"])
+    model = SimpleNamespace(
+            atomic_numbers=torch.tensor([1]),
+            r_max=5.0,
+            heads=["Default"],
+            parameters=lambda: iter(
+                (torch.nn.Parameter(torch.ones(1, dtype=torch.float64)),)
+            ),
+        )
     monkeypatch.setattr(prediction, "_load_model", lambda *_args: model)
     monkeypatch.setattr(prediction, "build_mace_loaders", lambda configurations, **_kwargs: configurations)
     monkeypatch.setattr(prediction, "_infer_one", lambda *_args: results.pop(0))

@@ -11,6 +11,8 @@ from typing import Any, Mapping, Sequence
 import torch
 from torch import Tensor, nn
 
+from mace.tools.torch_tools import default_dtype
+
 from .artifacts import ExperimentLayout, atomic_torch_save, atomic_write_json
 from .data import build_mace_loaders, load_extxyz
 from .errors import HardFailure
@@ -184,16 +186,22 @@ def generate_prediction_payload(
         model_path = Path(config.output_dir) / member["raw"]["path"]
         model = _load_model(model_path, str(device))
         atomic_numbers = [int(value) for value in model.atomic_numbers.detach().cpu().tolist()]
-        loader = build_mace_loaders(
-            configurations,
-            atomic_numbers=atomic_numbers,
-            cutoff=_model_value(model, "r_max"),
-            batch_size=(
-                prediction_config["batch_size"] if batch_size is None else batch_size
-            ),
-            shuffle=False,
-            heads=list(getattr(model, "heads", [data_config["head_name"]])),
-        )
+        first_parameter = next(model.parameters(), None)
+        if first_parameter is None or not first_parameter.is_floating_point():
+            raise HardFailure("member model has no floating parameters")
+        with default_dtype(first_parameter.dtype):
+            loader = build_mace_loaders(
+                configurations,
+                atomic_numbers=atomic_numbers,
+                cutoff=_model_value(model, "r_max"),
+                batch_size=(
+                    prediction_config["batch_size"]
+                    if batch_size is None
+                    else batch_size
+                ),
+                shuffle=False,
+                heads=list(getattr(model, "heads", [data_config["head_name"]])),
+            )
         results.append(_infer_one(model, loader, device, compute_stress))
     if not results:
         raise HardFailure("training manifest contains no members")

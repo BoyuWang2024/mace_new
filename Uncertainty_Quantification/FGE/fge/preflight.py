@@ -19,10 +19,20 @@ def _path(config: Any, name: str) -> Path:
 
 
 def _load_model(path: Path, device: str = "cpu") -> torch.nn.Module:
+    target = torch.device(device)
+    original_jit_load = torch.jit.load
+
+    def load_embedded_jit_on_target(value: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs["map_location"] = target
+        return original_jit_load(value, *args, **kwargs)
+
+    torch.jit.load = load_embedded_jit_on_target
     try:
         model = torch.load(path, map_location=device, weights_only=False)
     except Exception as exc:
         raise HardFailure(f"model cannot be loaded: {path}") from exc
+    finally:
+        torch.jit.load = original_jit_load
     if not isinstance(model, torch.nn.Module):
         raise HardFailure("checkpoint does not contain a complete torch model")
     return model
