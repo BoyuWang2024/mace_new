@@ -87,6 +87,10 @@ def test_compute_density_grid_has_160_grid_normalized_positive_ascending_thresho
     x = torch.logspace(-3, 1, 500)
     result = compute_density_grid(x, x * 2, grid_size=160, sigma=1.2)
     assert result.density.shape == (160, 160)
+    assert result.x_centers.shape == (160,)
+    assert result.y_centers.shape == (160,)
+    assert np.isfinite(result.x_centers).all()
+    assert np.isfinite(result.y_centers).all()
     assert result.density.sum() == pytest.approx(1.0)
     assert np.isfinite(result.density).all() and (result.density >= 0).all()
     assert len(result.contour_levels) == 5
