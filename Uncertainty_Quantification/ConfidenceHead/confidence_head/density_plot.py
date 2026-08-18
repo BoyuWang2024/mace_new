@@ -217,7 +217,7 @@ def render_density_plot(output_stem: str | Path, pairs: ErrorPairs, density: Den
                 bbox={"facecolor": "white", "edgecolor": "0.75", "alpha": 0.9})
         fig.tight_layout()
         fig.savefig(temporary[0], dpi=settings.dpi, format="png")
-        fig.savefig(temporary[1], format="pdf")
+        fig.savefig(temporary[1], format="pdf", metadata={"CreationDate": None, "ModDate": None})
         if any(path.stat().st_size == 0 for path in temporary):
             raise DensityPlotError("rendered temporary output is empty")
         os.replace(temporary[0], png)
