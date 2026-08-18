@@ -43,6 +43,28 @@ def test_build_error_pairs_force_filters_pairwise_and_preserves_metadata() -> No
     }
 
 
+def test_build_error_pairs_filters_mixed_invalid_pairs_and_keeps_metadata_aligned() -> None:
+    result = build_error_pairs(
+        expected=torch.tensor([0.1, -0.2, 0.3, 0.4]),
+        actual=torch.tensor([0.2, 0.3, -0.4, 0.5]),
+        sample_ids=["s0", "s1", "s2", "s3"],
+        atom_indices=[10, 11, 12, 13],
+        unit="eV/A",
+        task="force",
+        order=None,
+    )
+    assert result.expected.tolist() == pytest.approx([0.1, 0.4])
+    assert result.actual.tolist() == pytest.approx([0.2, 0.5])
+    assert result.sample_ids == ["s0", "s3"]
+    assert result.atom_indices == [10, 13]
+    assert result.audit == {
+        "total_count": 4,
+        "valid_count": 2,
+        "excluded_nonfinite": 0,
+        "excluded_nonpositive": 2,
+    }
+
+
 def test_build_error_pairs_energy_uses_none_atom_indices_and_order_metadata() -> None:
     result = build_error_pairs(
         expected=torch.tensor([0.1, 0.2]),
@@ -184,6 +206,10 @@ def test_compute_density_grid_has_160_grid_normalized_positive_ascending_thresho
     y_log = torch.log10(y).numpy()
     x_margin = 0.05 * (x_log.max() - x_log.min())
     y_margin = 0.05 * (y_log.max() - y_log.min())
+    x_edges = np.linspace(x_log.min() - x_margin, x_log.max() + x_margin, 161)
+    y_edges = np.linspace(y_log.min() - y_margin, y_log.max() + y_margin, 161)
+    expected_x_centers = (x_edges[:-1] + x_edges[1:]) / 2
+    expected_y_centers = (y_edges[:-1] + y_edges[1:]) / 2
     assert result.density.shape == (160, 160)
     assert result.x_centers.shape == (160,)
     assert result.y_centers.shape == (160,)
@@ -191,6 +217,8 @@ def test_compute_density_grid_has_160_grid_normalized_positive_ascending_thresho
     assert np.isfinite(result.y_centers).all()
     assert np.all(np.diff(result.x_centers) > 0)
     assert np.all(np.diff(result.y_centers) > 0)
+    assert np.allclose(result.x_centers, expected_x_centers)
+    assert np.allclose(result.y_centers, expected_y_centers)
     assert x_log.min() - x_margin <= result.x_centers[0] <= x_log.min()
     assert x_log.max() <= result.x_centers[-1] <= x_log.max() + x_margin
     assert y_log.min() - y_margin <= result.y_centers[0] <= y_log.min()
