@@ -33,8 +33,8 @@ from ..density_plot import (
 from ..evaluation_artifacts import validate_prediction_payload
 from ..external_config import ExternalInferenceConfig
 from ..identity import code_identity, sha256_file
-from .evaluate import load_evaluation_inputs, run_evaluate
-from .evaluate_external import _paths, resolve_head_config, run_evaluate_external
+from .evaluate import load_evaluation_inputs
+from .evaluate_external import _paths, resolve_head_config
 from .production_matrix import discover_production_matrix
 
 
@@ -216,7 +216,7 @@ def run_external_density_suite(config: ExternalInferenceConfig, repo_root: Path)
         inputs = load_evaluation_inputs(training)
         paths = _paths(config, key)
         _require_outputs(paths)
-        manifest = run_evaluate_external(config, key)
+        manifest = paths.manifest
         predictions = validate_prediction_payload(
             load_torch_artifact(paths.predictions), expected_identity=inputs.identity
         )
@@ -242,7 +242,7 @@ def run_test_density_suite(
         inputs = load_evaluation_inputs(config)
         paths = type("Paths", (), {"outputs": (inputs.run_dir / "test_predictions.pt", inputs.run_dir / "test_metrics.json", inputs.run_dir / "evaluation_manifest.json")})
         _require_outputs(paths)
-        manifest = run_evaluate(config)
+        manifest = inputs.run_dir / "evaluation_manifest.json"
         predictions = validate_prediction_payload(
             load_torch_artifact(inputs.run_dir / "test_predictions.pt"),
             expected_identity=inputs.identity,
