@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from Uncertainty_Quantification.LLPR.llpr import observables
 from Uncertainty_Quantification.LLPR.llpr.checkpoint import load_checkpoint
 from Uncertainty_Quantification.LLPR.llpr.config import PathIdentity
 from Uncertainty_Quantification.LLPR.llpr.data import build_dataset, iter_samples
@@ -33,6 +34,7 @@ class AnalyticModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.readouts = torch.nn.ModuleList([AnalyticReadout()])
+        self.compute_force_calls: list[bool] = []
 
     def forward(
         self,
@@ -41,8 +43,11 @@ class AnalyticModel(torch.nn.Module):
         compute_force: bool = True,
     ) -> dict[str, torch.Tensor | None]:
         del data
+        self.compute_force_calls.append(compute_force)
         theta = self.readouts[0].theta
         energy = torch.tensor([1.0, 2.0, 3.0]) @ theta
+        if not compute_force:
+            return {"energy": energy.reshape(1)}
         coefficients = torch.tensor(
             [
                 [1.0, 0.0, 0.0],
@@ -56,22 +61,105 @@ class AnalyticModel(torch.nn.Module):
         forces = (coefficients @ theta).reshape(2, 3)
         if not training:
             forces = forces.detach()
-        return {
-            "energy": energy.reshape(1),
-            "forces": forces if compute_force else None,
-        }
+        return {"energy": energy.reshape(1), "forces": forces}
+
+
+class MissingEnergyModel(AnalyticModel):
+    def forward(
+        self,
+        data: dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+    ) -> dict[str, torch.Tensor | None]:
+        del data, training
+        self.compute_force_calls.append(compute_force)
+        return {}
+
+
+class NonFiniteEnergyModel(AnalyticModel):
+    def __init__(self, energy_value: float) -> None:
+        super().__init__()
+        self.energy_value = energy_value
+
+    def forward(
+        self,
+        data: dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+    ) -> dict[str, torch.Tensor | None]:
+        del data, training
+        self.compute_force_calls.append(compute_force)
+        theta = self.readouts[0].theta
+        energy = theta.sum() * 0.0 + torch.tensor(self.energy_value)
+        return {"energy": energy.reshape(1)}
 
 
 class AnalyticBatch:
-    num_nodes = 2
+    def __init__(self, num_nodes: int) -> None:
+        self.num_nodes = num_nodes
 
     def to_dict(self) -> dict[str, torch.Tensor]:
         return {}
 
 
 def analytic_batch(num_atoms: int) -> AnalyticBatch:
-    assert num_atoms == 2
-    return AnalyticBatch()
+    return AnalyticBatch(num_atoms)
+
+
+def test_energy_only_matches_full_jacobian_without_requesting_forces() -> None:
+    model = AnalyticModel()
+    layout = discover_readout_layout(model)
+    batch = analytic_batch(num_atoms=2)
+
+    energy_only = observables.compute_energy_jacobian(model, batch, layout)
+    full = compute_structure_jacobians(
+        model=model,
+        batch=batch,
+        layout=layout,
+        force_component_chunk_size=2,
+        max_force_components=None,
+    )
+
+    assert model.compute_force_calls == [False, True]
+    assert energy_only.energy_total == pytest.approx(23.0)
+    assert energy_only.energy_per_atom == pytest.approx(11.5)
+    assert energy_only.g_energy.tolist() == pytest.approx([0.5, 1.0, 1.5])
+    assert energy_only.energy_per_atom == pytest.approx(full.energy_per_atom)
+    torch.testing.assert_close(energy_only.g_energy, full.g_energy)
+    assert energy_only.g_energy.device.type == "cpu"
+    assert energy_only.g_energy.dtype == torch.float64
+
+
+@pytest.mark.parametrize("num_atoms", [0, -1])
+def test_energy_only_rejects_non_positive_num_atoms(num_atoms: int) -> None:
+    model = AnalyticModel()
+    layout = discover_readout_layout(model)
+
+    with pytest.raises(ValueError, match="num_atoms must be positive"):
+        observables.compute_energy_jacobian(
+            model, analytic_batch(num_atoms=num_atoms), layout
+        )
+
+
+def test_energy_only_requires_model_energy() -> None:
+    model = MissingEnergyModel()
+    layout = discover_readout_layout(model)
+
+    with pytest.raises(ValueError, match="model did not return energy"):
+        observables.compute_energy_jacobian(model, analytic_batch(2), layout)
+
+    assert model.compute_force_calls == [False]
+
+
+@pytest.mark.parametrize(
+    "energy_value", [float("nan"), float("inf"), float("-inf")]
+)
+def test_energy_only_rejects_non_finite_energy(energy_value: float) -> None:
+    model = NonFiniteEnergyModel(energy_value)
+    layout = discover_readout_layout(model)
+
+    with pytest.raises(ValueError, match="model energy must be finite"):
+        observables.compute_energy_jacobian(model, analytic_batch(2), layout)
 
 
 def test_energy_is_per_atom_and_force_is_per_component() -> None:

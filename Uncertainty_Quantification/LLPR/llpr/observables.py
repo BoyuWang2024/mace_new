@@ -20,6 +20,13 @@ class StructureJacobians:
     chunk_size: int
 
 
+@dataclass
+class EnergyJacobian:
+    energy_total: float
+    energy_per_atom: float
+    g_energy: Tensor
+
+
 def flatten_grads(
     gradients: tuple[Tensor | None, ...],
     parameters: tuple[nn.Parameter, ...],
@@ -32,6 +39,41 @@ def flatten_grads(
     if not pieces:
         return torch.empty(0, dtype=torch.float64)
     return torch.cat(pieces).detach().to(device="cpu", dtype=torch.float64)
+
+
+def compute_energy_jacobian(
+    model: nn.Module,
+    batch: object,
+    layout: ReadoutLayout,
+) -> EnergyJacobian:
+    """Compute energy totals and the energy-per-atom readout Jacobian."""
+    num_atoms = int(batch.num_nodes)
+    if num_atoms <= 0:
+        raise ValueError("num_atoms must be positive")
+    output = model(batch.to_dict(), training=True, compute_force=False)
+    if "energy" not in output or output["energy"] is None:
+        raise ValueError("model did not return energy")
+    energy = output["energy"]
+    energy_total = energy.reshape(-1).sum()
+    if (
+        not torch.isfinite(energy).all() or not torch.isfinite(energy_total)
+    ):
+        raise ValueError("model energy must be finite")
+    energy_per_atom = energy_total / num_atoms
+    g_energy = flatten_grads(
+        torch.autograd.grad(
+            energy_per_atom,
+            layout.parameters,
+            allow_unused=True,
+        ),
+        layout.parameters,
+    )
+
+    return EnergyJacobian(
+        energy_total=float(energy_total.detach().item()),
+        energy_per_atom=float(energy_per_atom.detach().item()),
+        g_energy=g_energy,
+    )
 
 
 def compute_structure_jacobians(
