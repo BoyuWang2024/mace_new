@@ -34,6 +34,18 @@ _DATASET_KEYS = {
 }
 _CACHE_KEYS = {"split", "build_batch_size", "shard_max_atoms", "resume"}
 _RUNTIME_KEYS = {"device", "head_batch_size"}
+_E0_TOP_KEYS = {
+    "schema_version",
+    "validation_config",
+    "test_config",
+    "output_root",
+    "plot_root",
+    "methods",
+    "atomization_energy_key",
+    "build_missing_inputs",
+}
+_E0_METHODS = ("e0_replace", "e0_reestimate")
+_FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class ExternalConfigError(ValueError):
@@ -70,6 +82,20 @@ class ExternalInferenceConfig:
     head_batch_size: int
     force_config: ConfidenceHeadConfig
     energy_configs: dict[int, ConfidenceHeadConfig]
+
+
+@dataclass(frozen=True)
+class E0PostprocessConfig:
+    """Two immutable external datasets and their derived E0 outputs."""
+
+    source_path: Path
+    validation: ExternalInferenceConfig
+    test: ExternalInferenceConfig
+    output_root: Path
+    plot_root: Path
+    methods: tuple[str, ...]
+    atomization_energy_key: str
+    build_missing_inputs: bool
 
 
 def _mapping(value: object, keys: set[str], where: str) -> dict[str, Any]:
@@ -182,4 +208,52 @@ def load_external_config(path: Path) -> ExternalInferenceConfig:
         ),
         force_config=force,
         energy_configs=energy,
+    )
+
+def load_e0_postprocess_config(path: Path) -> E0PostprocessConfig:
+    """Load a strict validation/test E0 postprocessing experiment."""
+    source = Path(path).expanduser().resolve()
+    try:
+        document = yaml.safe_load(source.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise ExternalConfigError(f"could not read E0 config: {error}") from error
+    top = _mapping(document, _E0_TOP_KEYS, "E0 postprocess config")
+    if top["schema_version"] != 1:
+        raise ExternalConfigError("E0 schema_version must be 1")
+
+    base = source.parent
+    validation_path = _path(
+        top["validation_config"], base, "validation_config"
+    )
+    test_path = _path(top["test_config"], base, "test_config")
+    if validation_path == test_path:
+        raise ExternalConfigError("validation and test configs must differ")
+    validation = load_external_config(validation_path)
+    test = load_external_config(test_path)
+    if validation.dataset.name == test.dataset.name:
+        raise ExternalConfigError("validation and test dataset names must differ")
+    if validation.force_config.checkpoint != test.force_config.checkpoint:
+        raise ExternalConfigError("validation and test checkpoint differs")
+    if validation.config_dir != test.config_dir:
+        raise ExternalConfigError("validation and test production matrix differs")
+
+    raw_methods = top["methods"]
+    if type(raw_methods) is not list or tuple(raw_methods) != _E0_METHODS:
+        raise ExternalConfigError(f"methods must equal {list(_E0_METHODS)}")
+    field = top["atomization_energy_key"]
+    if not isinstance(field, str) or _FIELD_NAME.fullmatch(field) is None:
+        raise ExternalConfigError("atomization_energy_key is invalid")
+    build_missing_inputs = top["build_missing_inputs"]
+    if type(build_missing_inputs) is not bool:
+        raise ExternalConfigError("build_missing_inputs must be a boolean")
+
+    return E0PostprocessConfig(
+        source_path=source,
+        validation=validation,
+        test=test,
+        output_root=_path(top["output_root"], base, "output_root"),
+        plot_root=_path(top["plot_root"], base, "plot_root"),
+        methods=_E0_METHODS,
+        atomization_energy_key=field,
+        build_missing_inputs=build_missing_inputs,
     )
