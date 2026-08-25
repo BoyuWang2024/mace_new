@@ -116,14 +116,17 @@ Uncertainty_Quantification/FGE/postprocessing/e0_correction/
 
 ### 4.1 读取与对齐
 
-`labels.py` 使用标准 ASE/extxyz 回退逻辑读取 `calc.results` 与 `atoms.info`，同时读取 `energy`、`atomization_energy`、`forces` 和元素计数。它按 prediction shard 的结构顺序流式消费输入，核对：
+`labels.py` 复用 `fge/extxyz_fields.py` 与 `fge/extxyz_standard.py` 的标准 ASE/extxyz 回退逻辑，优先从 ASE `atoms.calc.results` 读取标准 `energy`/`forces`，再按既有契约检查 `atoms.info`/`atoms.arrays`；不得再次直接把只看 info/arrays 的 `config_from_atoms` 当成 reference reader。它同时读取 `atomization_energy` 和元素计数，并按 prediction shard 的结构顺序流式消费输入，核对：
 
 - 结构数、每结构原子数、原子累计范围与 `structure_ptr`；
 - 元素计数矩阵与 shard 顺序；
 - reference 的 dtype、shape 和有限性；
 - 支持元素过滤后的闭包。
+- val/test 的 `configuration_id`；缺少稳定 ID 时使用来源中立的规范化结构指纹，确认两个 split 没有重复结构。
 
 结果 manifest 只记录逻辑数据集标签和必要校准摘要，不写旧仓库路径、绝对输入路径、输入内容哈希或旧来源身份。用于幂等检查的来源中立签名只包含方法/schema 版本、逻辑标签、member ID、observable、结构/原子范围、shape 和校准参数。
+
+远端非发布 integrity audit 可以记录 extxyz 内容哈希和 raw artifact 哈希，用于证明输入未漂移、输出未覆盖；该 audit 不进入来源中立 manifest、不拉取到本地，也不作为发布结果。这样把计算完整性检查与发布 provenance 分离。
 
 ### 4.2 MACE E0 提取
 
@@ -179,9 +182,11 @@ Uncertainty_Quantification/Plots/FGE/mad_r2scan_e0/
 
 现有基于零 reference 生成的 MAD-r2SCAN 图片暂不删除，但必须标记为无效且不得发布；新图只进入上述独立目录。
 
+方法标签不能只存在于旁车文件：方法一的 metrics/report、plot audit、图标题或图内副标题必须直接显示 `Direct test-informed E0`；方法二显示 `Model-aware val-calibrated E0`。任何横向比较图也必须保留该区别，不能把两者并列成同等的独立 test 泛化结果。
+
 ## 6. UQ、权重与不变量
 
-- corrected `energy_members` 重新计算 ensemble mean、等权 STD、原有 validation-error weighted mean/STD 和 risk-coverage；权重沿用正式 FGE manifest 已确定的 member validation weights，不用 test 标签重选权重。
+- corrected `energy_members` 重新计算 ensemble mean、等权 STD、原有 validation-error weighted mean/STD 和 risk-coverage；两种方法都严格沿用正式 FGE manifest 中由 MatPES validation 确定的 member weights。MAD val 只拟合 `Delta_E0`，不重新校准 ensemble weights，test 标签也不参与选权。
 - `forces_members` 和 force UQ 逐值复用；force reference 从 extxyz 正确重建。E0 是 composition-only 项，不改变位置导数，因此两种方法的 force prediction、force residual 和 force uncertainty 必须相同。
 - 若成员 E0 完全相同，方法一的 energy 校正是共同平移，energy STD/GMD 应保持不变；若成员 E0 有差异，必须重新计算 energy UQ，不能预设不变。
 - 方法二按 member 独立拟合，energy UQ 必须从 corrected members 重新计算。
@@ -196,6 +201,8 @@ Uncertainty_Quantification/Plots/FGE/mad_r2scan_e0/
 
 - prediction shard、manifest、SHA、shape、dtype、结构映射或 finite 校验失败；
 - extxyz 缺少必需字段、结构/原子顺序不对齐或过滤闭包不一致；
+- 标准 extxyz reader 读到非零标签，但 corrected payload 的整套 energy reference 或 force reference 仍为全零；
+- MAD-r2SCAN val/test 存在重复 `configuration_id` 或规范化结构指纹，导致方法二 test 不再独立；
 - 方法一 test 缺少 `energy` 或 `atomization_energy`；
 - 任一 member 缺少所需元素 E0、head 不一致或 checkpoint 无法只读加载；
 - 方法二 val 缺少校准能量、test correction 不可识别，或误读 test 标签参与拟合；
@@ -225,6 +232,7 @@ Uncertainty_Quantification/Plots/FGE/mad_r2scan_e0/
 - corrected energy 改变而 force/mapping 不变；
 - equal-weight K-1 STD 与原有 validation-weighted 分支正确复算；
 - raw prediction/evaluation 文件哈希在后处理前后不变。
+- val/test 重复结构检测，以及 published manifest 与 internal integrity audit 的字段隔离。
 
 ### 8.2 远端小数据 CPU 闭环
 
