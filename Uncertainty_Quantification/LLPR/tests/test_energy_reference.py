@@ -146,3 +146,17 @@ def test_energy_alpha_uses_corrected_per_atom_residuals() -> None:
     )
 
     assert alpha == pytest.approx(np.sqrt(0.625))
+
+
+def test_energy_alpha_rejects_zero_q() -> None:
+    from Uncertainty_Quantification.LLPR.llpr.energy_reference import (
+        calibrate_energy_alpha,
+    )
+
+    with pytest.raises(ValueError, match="q must contain only positive values"):
+        calibrate_energy_alpha(
+            reference_total=np.array([1.0]),
+            prediction_total=np.array([0.0]),
+            num_atoms=np.array([1.0]),
+            q=np.array([0.0]),
+        )

@@ -149,8 +149,8 @@ def calibrate_energy_alpha(
         raise ValueError("energy calibration vectors must not be empty")
     if np.any(atoms <= 0.0):
         raise ValueError("num_atoms must contain only positive values")
-    if np.any(q_values < 0.0):
-        raise ValueError("q must contain only non-negative values")
+    if np.any(q_values <= 0.0):
+        raise ValueError("q must contain only positive values")
     floor = float(min_q)
     if not np.isfinite(floor) or floor <= 0.0:
         raise ValueError("min_q must be finite and positive")
