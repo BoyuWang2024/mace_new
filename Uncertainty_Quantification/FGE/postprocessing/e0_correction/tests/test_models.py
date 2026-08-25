@@ -332,6 +332,14 @@ def test_nested_correction_schema_is_exact() -> None:
         validate_correction_manifest(payload)
 
 
+def test_nested_non_string_key_is_a_hard_failure() -> None:
+    payload = _correction_manifest()
+    payload["shape"] = {1: 2}
+
+    with pytest.raises(HardFailure):
+        validate_correction_manifest(payload)
+
+
 @pytest.mark.parametrize(
     "leaked_source",
     [

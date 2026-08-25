@@ -422,7 +422,8 @@ def _require_hash_mapping(value: Any, path: str) -> Mapping[str, Any]:
 
 def _reject_public_source_leaks(value: Any, path: str = "manifest") -> None:
     if isinstance(value, Mapping):
-        for key, item in value.items():
+        mapping = _require_mapping(value, path)
+        for key, item in mapping.items():
             if "sha256" in key.lower():
                 _fail(f"{path}.{key}", "published manifests cannot contain hashes")
             _reject_public_source_leaks(item, f"{path}.{key}")
