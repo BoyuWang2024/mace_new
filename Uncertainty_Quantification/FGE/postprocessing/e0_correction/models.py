@@ -394,8 +394,15 @@ _RANGE_KEYS = frozenset({"start", "stop"})
 _CALIBRATION_SUMMARY_KEYS = frozenset(
     {"rank_min", "rank_max", "residual_rmse_max"}
 )
+_DIRECT_CALIBRATION_SUMMARY_KEYS = frozenset(
+    {"mad_baseline_min", "mad_baseline_mean", "mad_baseline_max"}
+)
 _WARNING_KEYS = frozenset({"code", "message"})
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z", re.IGNORECASE)
+_SHA256_TOKEN = re.compile(
+    r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", re.IGNORECASE
+)
+_ABSOLUTE_PATH_TOKEN = re.compile(r"(?<![a-z0-9_.-])/[^\s]+", re.IGNORECASE)
 
 
 def _require_unique_strings(value: Any, path: str) -> tuple[str, ...]:
@@ -431,14 +438,13 @@ def _reject_public_source_leaks(value: Any, path: str = "manifest") -> None:
     if isinstance(value, str):
         normalized = value.replace("\\", "/").lower()
         segments = tuple(part for part in normalized.split("/") if part)
-        is_absolute = normalized.startswith("/") or re.match(
-            r"^[a-z]:/", normalized
-        )
+        has_absolute_path = _ABSOLUTE_PATH_TOKEN.search(normalized) is not None
+        has_sha256 = _SHA256_TOKEN.search(value) is not None
         is_legacy = "mace/ensemble" in normalized
         is_raw_path = "/" in normalized and any(
             part in {"raw", "checkpoint", "checkpoints"} for part in segments
         )
-        if is_absolute or is_legacy or is_raw_path or _SHA256.fullmatch(value):
+        if has_absolute_path or has_sha256 or is_legacy or is_raw_path:
             _fail(path, "published manifest contains source-specific data")
         return
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
@@ -547,16 +553,36 @@ def validate_correction_manifest(raw: Mapping[str, Any]) -> dict[str, Any]:
     stop = _require_int(structure_range["stop"], "structure_range.stop", minimum=1)
     if stop <= start or stop - start != s:
         _fail("structure_range", "must be increasing and match shape.S")
-    calibration = _require_exact_keys(
-        values["calibration"], _CALIBRATION_SUMMARY_KEYS, "calibration"
-    )
-    rank_min = _require_int(calibration["rank_min"], "calibration.rank_min", minimum=1)
-    rank_max = _require_int(calibration["rank_max"], "calibration.rank_max", minimum=1)
-    if rank_min > rank_max:
-        _fail("calibration", "rank_min cannot exceed rank_max")
-    _require_finite_number(
-        calibration["residual_rmse_max"], "calibration.residual_rmse_max"
-    )
+    if method.machine_name == "direct_test_e0":
+        calibration = _require_exact_keys(
+            values["calibration"], _DIRECT_CALIBRATION_SUMMARY_KEYS, "calibration"
+        )
+        baseline_min = _require_any_finite_number(
+            calibration["mad_baseline_min"], "calibration.mad_baseline_min"
+        )
+        baseline_mean = _require_any_finite_number(
+            calibration["mad_baseline_mean"], "calibration.mad_baseline_mean"
+        )
+        baseline_max = _require_any_finite_number(
+            calibration["mad_baseline_max"], "calibration.mad_baseline_max"
+        )
+        if not baseline_min <= baseline_mean <= baseline_max:
+            _fail("calibration", "MAD baseline summary must be ordered")
+    else:
+        calibration = _require_exact_keys(
+            values["calibration"], _CALIBRATION_SUMMARY_KEYS, "calibration"
+        )
+        rank_min = _require_int(
+            calibration["rank_min"], "calibration.rank_min", minimum=1
+        )
+        rank_max = _require_int(
+            calibration["rank_max"], "calibration.rank_max", minimum=1
+        )
+        if rank_min > rank_max:
+            _fail("calibration", "rank_min cannot exceed rank_max")
+        _require_finite_number(
+            calibration["residual_rmse_max"], "calibration.residual_rmse_max"
+        )
     warnings = _require_sequence(values["warnings"], "warnings")
     for index, warning in enumerate(warnings):
         item = _require_exact_keys(warning, _WARNING_KEYS, f"warnings[{index}]")

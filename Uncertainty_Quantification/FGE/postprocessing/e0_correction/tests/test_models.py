@@ -104,6 +104,25 @@ def _correction_manifest() -> dict[str, Any]:
     }
 
 
+def _direct_correction_manifest() -> dict[str, Any]:
+    payload = _correction_manifest()
+    payload.update(
+        {
+            "method": "direct_test_e0",
+            "title": "Direct test-informed E0",
+            "calibration_split": "test",
+            "uses_test_reference_labels": True,
+            "evaluation_role": "transductive_diagnostic",
+        }
+    )
+    payload["calibration"] = {
+        "mad_baseline_min": -100.0,
+        "mad_baseline_mean": -60.0,
+        "mad_baseline_max": -10.0,
+    }
+    return payload
+
+
 def _integrity_audit() -> dict[str, Any]:
     return {
         "schema_version": INTEGRITY_SCHEMA_VERSION,
@@ -346,6 +365,9 @@ def test_nested_non_string_key_is_a_hard_failure() -> None:
         "/HOME/private/datasets/test.xyz",
         "mace/Ensemble/outputs/legacy-run",
         "outputs/raw/checkpoints/member_01.model",
+        "loaded from /HOME/private/test.xyz",
+        r"loaded from C:\private\test.xyz",
+        "digest " + "e" * 64,
     ],
 )
 def test_published_correction_manifest_is_source_neutral(
@@ -389,3 +411,36 @@ def test_public_reader_returns_only_validated_correction_manifest(
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     assert load_correction_manifest(path) == payload
+
+
+def test_direct_manifest_accepts_mad_baseline_summary() -> None:
+    payload = _direct_correction_manifest()
+
+    assert validate_correction_manifest(payload) == payload
+
+
+def test_direct_manifest_rejects_model_aware_summary() -> None:
+    payload = _direct_correction_manifest()
+    payload["calibration"] = _correction_manifest()["calibration"]
+
+    with pytest.raises(HardFailure):
+        validate_correction_manifest(payload)
+
+
+def test_model_aware_manifest_rejects_mad_baseline_summary() -> None:
+    payload = _correction_manifest()
+    payload["calibration"] = _direct_correction_manifest()["calibration"]
+
+    with pytest.raises(HardFailure):
+        validate_correction_manifest(payload)
+
+
+@pytest.mark.parametrize("mean", [float("nan"), -101.0, -9.0])
+def test_direct_mad_baseline_summary_requires_finite_ordered_values(
+    mean: float,
+) -> None:
+    payload = _direct_correction_manifest()
+    payload["calibration"]["mad_baseline_mean"] = mean
+
+    with pytest.raises(HardFailure):
+        validate_correction_manifest(payload)
