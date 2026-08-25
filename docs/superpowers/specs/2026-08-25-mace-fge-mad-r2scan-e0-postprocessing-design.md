@@ -117,6 +117,8 @@ Uncertainty_Quantification/FGE/postprocessing/e0_correction/
 
 ### 4.1 读取与对齐
 
+运行时必须先完成第 4.2 节的全部 member checkpoint 审计，得到经验证的 head、共同 atomic_numbers 列顺序、member E0 和支持元素闭包；随后才能执行整结构过滤、composition 构造、reference 读取和 prediction shard 对齐。不得从数据内容猜测 composition 列顺序，也不得只用第一个 member 的支持元素。
+
 `labels.py` 复用 `fge/extxyz_fields.py` 与 `fge/extxyz_standard.py` 的标准 ASE/extxyz 回退逻辑，优先从 ASE `atoms.calc.results` 读取标准 `energy`/`forces`，再按既有契约检查 `atoms.info`/`atoms.arrays`；不得再次直接把只看 info/arrays 的 `config_from_atoms` 当成 reference reader。它同时读取 `atomization_energy` 和元素计数，并按 prediction shard 的结构顺序流式消费输入，核对：
 
 - 结构数、每结构原子数、原子累计范围与 `structure_ptr`；
@@ -134,6 +136,8 @@ Uncertainty_Quantification/FGE/postprocessing/e0_correction/
 远端非发布 integrity audit 可以记录 extxyz 内容哈希和 raw artifact 哈希，用于证明输入未漂移、输出未覆盖；该 audit 不进入来源中立 manifest、不拉取到本地，也不作为发布结果。这样把计算完整性检查与发布 provenance 分离。
 
 ### 4.2 MACE E0 提取
+
+该 preflight 是所有标签过滤、composition 和 split 去污染之前的首个数据相关阶段。
 
 对四组实验的每个 raw member 只读加载对应 checkpoint，提取实际 `atomic_energies_fn` 和 head 的 E0，按 checkpoint `atomic_numbers` 固定列顺序保存。不能用 base checkpoint 的 E0 代替训练后的 member E0，不能修改 checkpoint。
 

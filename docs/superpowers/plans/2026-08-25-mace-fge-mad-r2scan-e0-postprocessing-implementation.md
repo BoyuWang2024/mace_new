@@ -430,10 +430,12 @@
   固定顺序：
 
       preflight
-      -> label alignment and within-split uniqueness
+      -> audit every member head, atomic_numbers and E0
+      -> derive and verify the common support closure
+      -> whole-structure filtering and composition/reference alignment
+      -> verify within-split identity uniqueness
       -> remove test-identity overlaps from val
       -> verify split disjointness
-      -> checkpoint E0 extraction
       -> val energy-only prediction when required
       -> calibration
       -> corrected shard application
@@ -679,13 +681,13 @@
 
   验证四组 raw prediction manifest 均为 PASS，并从 manifest 动态读取 K/S/A/shard_count。预期正式 test 为 K=8、S=16072、A=311657、63 shards，但程序不得硬编码这些数字。记录原始 manifest/shard/checkpoint hash。
 
-- [ ] **Step 2：构造确定性 smoke 子集**
+- [ ] **Step 2：执行真实 checkpoint preflight**
 
-  从现有 test raw shards 只读切片 8–16 个结构，不做 test forward；从 val 取不与 test 重复且覆盖所需元素的固定小集合。选择至少提供两个正有限 residual/UQ 点，满足 log 图合同。保存 source index 只在 internal audit。
+  在 CPU 上加载四实验全部 raw member，核对 head、atomic_numbers、member E0 与共同支持元素闭包。任何成员不一致立即硬失败；该步骤必须先于数据过滤、composition 和 smoke 子集选择。
 
-- [ ] **Step 3：执行真实 checkpoint preflight**
+- [ ] **Step 3：构造确定性 smoke 子集**
 
-  在 CPU 上加载四实验全部 raw member，核对 head、atomic_numbers、member E0 与支持元素闭包。任何成员不一致立即硬失败。
+  使用 Step 2 得到的共同支持闭包，从现有 test raw shards 只读切片 8–16 个结构，不做 test forward；从 val 取不与 test 重复且覆盖所需元素的固定小集合。选择至少提供两个正有限 residual/UQ 点，满足 log 图合同。保存 source index 只在 internal audit。
 
 - [ ] **Step 4：执行方法二 val-only energy forward**
 
@@ -719,7 +721,7 @@
       shard_count = 63
       observables = ["energy", "forces"]
 
-  val/test 原始结构数分别从实际 extxyz 读取；支持元素过滤后数量由程序计算，不硬编码。先核对每个 split 内唯一，再从 val 排除与 test 身份重叠的 2 个结构并验证无残留；test 数量、顺序和 raw prediction 均不得改变。随后完成支持元素、head、E0、reference 和 hash 审计。
+  首先对四实验全部 member 完成 checkpoint hash、head、atomic_numbers、E0 和共同支持闭包审计。随后读取 val/test 原始结构数，按共同闭包整结构过滤并构造 composition；过滤后数量由程序计算，不硬编码。再核对每个 split 内唯一，从 val 排除与 test 身份重叠的 2 个结构并验证无残留；test 数量、顺序和 raw prediction 均不得改变。最后完成 reference、shard 对齐和输入 hash 审计。
 
 - [ ] **Step 2：提交唯一 Slurm job**
 
@@ -820,6 +822,7 @@
 - [ ] direct_test_e0 严格使用 test 的 energy - atomization_energy，并在 report/图中标记 test-informed/transductive。
 - [ ] model_aware_val_e0 逐 member 使用 val total energy 拟合 minimum-norm Delta_E0，test 不参与拟合。
 - [ ] 方法二在 val forward 前按无标签结构身份排除 2 个 test overlap；test 保持不变，公开 manifest 只记录规则和数量。
+- [ ] 所有 member checkpoint 的 head/atomic_numbers/E0 审计先于支持元素过滤、composition、标签对齐和 val 去污染。
 - [ ] test model forward 次数为零；val forward 明确 compute_force=False、compute_stress=False。
 - [ ] corrected prediction 通过原 fge.prediction.v1 validator，且只改变 energy_members 和重建的 references。
 - [ ] 两方法 force members、mapping、weights、raw prediction 和 checkpoint 均未改变。
