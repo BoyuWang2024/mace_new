@@ -21,8 +21,16 @@ def _finite_composition(values: ArrayLike) -> NDArray[np.float64]:
     composition = np.asarray(values, dtype=np.float64)
     if composition.ndim != 2:
         raise ValueError("composition must be two-dimensional")
+    if composition.shape[0] == 0 or composition.shape[1] == 0:
+        raise ValueError("composition must not be empty")
     if not np.isfinite(composition).all():
         raise ValueError("composition must contain only finite values")
+    if np.any(composition < 0.0):
+        raise ValueError("composition must contain only non-negative counts")
+    if not np.equal(composition, np.floor(composition)).all():
+        raise ValueError("composition must contain only integer counts")
+    if np.any(np.sum(composition, axis=1) == 0.0):
+        raise ValueError("each composition row must contain at least one atom")
     return composition
 
 
@@ -101,8 +109,6 @@ def fit_model_aware_reestimation(
     reference = _finite_vector(reference_total, "reference_total")
     raw = _finite_vector(raw_total, "raw_total")
     atomic_energies = _finite_vector(model_e0, "model_e0")
-    if counts.shape[0] == 0 or counts.shape[1] == 0:
-        raise ValueError("composition must not be empty")
     if not (counts.shape[0] == reference.shape[0] == raw.shape[0]):
         raise ValueError(
             "structure vectors and composition must have the same number of rows"

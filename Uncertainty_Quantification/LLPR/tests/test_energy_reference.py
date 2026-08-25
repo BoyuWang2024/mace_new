@@ -160,3 +160,93 @@ def test_energy_alpha_rejects_zero_q() -> None:
             num_atoms=np.array([1.0]),
             q=np.array([0.0]),
         )
+
+
+@pytest.mark.parametrize(
+    ("composition", "match"),
+    [
+        (np.array([[-1.0, 1.0], [1.0, 1.0]]), "non-negative"),
+        (np.array([[0.5, 1.0], [1.0, 1.0]]), "integer"),
+        (np.array([[0.0, 0.0], [1.0, 0.0]]), "at least one atom"),
+        (np.empty((0, 2)), "must not be empty"),
+    ],
+)
+@pytest.mark.parametrize("api", ["direct", "model_aware_fit", "model_aware_apply"])
+def test_public_apis_reject_invalid_atomic_compositions(
+    composition: np.ndarray, match: str, api: str
+) -> None:
+    from Uncertainty_Quantification.LLPR.llpr.energy_reference import (
+        apply_direct_test_atomic_baseline,
+        apply_model_aware_correction,
+        fit_model_aware_reestimation,
+    )
+
+    if api == "direct":
+        call = lambda: apply_direct_test_atomic_baseline(
+            raw_total=np.array([1.0, 2.0]),
+            reference_total=np.array([1.0, 2.0]),
+            atomization_total=np.array([0.0, 0.0]),
+            composition=composition,
+            model_e0=np.array([0.0, 0.0]),
+        )
+    elif api == "model_aware_fit":
+        call = lambda: fit_model_aware_reestimation(
+            composition=composition,
+            reference_total=np.array([1.0, 2.0]),
+            raw_total=np.array([1.0, 2.0]),
+            model_e0=np.array([0.0, 0.0]),
+        )
+    else:
+        call = lambda: apply_model_aware_correction(
+            raw_total=np.array([1.0, 2.0]),
+            composition=composition,
+            delta_e0=np.array([0.0, 0.0]),
+        )
+
+    with pytest.raises(ValueError, match=match):
+        call()
+
+
+def test_composition_allows_an_unrepresented_element_column() -> None:
+    from Uncertainty_Quantification.LLPR.llpr.energy_reference import (
+        apply_model_aware_correction,
+    )
+
+    corrected = apply_model_aware_correction(
+        raw_total=np.array([1.0, 2.0]),
+        composition=np.array([[1.0, 0.0], [2.0, 0.0]]),
+        delta_e0=np.array([0.5, 99.0]),
+    )
+
+    np.testing.assert_allclose(corrected, [1.5, 3.0])
+
+
+def test_energy_alpha_floors_small_positive_q() -> None:
+    from Uncertainty_Quantification.LLPR.llpr.energy_reference import (
+        calibrate_energy_alpha,
+    )
+
+    alpha = calibrate_energy_alpha(
+        reference_total=np.array([1.0]),
+        prediction_total=np.array([0.0]),
+        num_atoms=np.array([1.0]),
+        q=np.array([1.0e-8]),
+        min_q=1.0e-4,
+    )
+
+    assert alpha == pytest.approx(100.0)
+
+
+def test_energy_alpha_rejects_non_positive_min_q() -> None:
+    from Uncertainty_Quantification.LLPR.llpr.energy_reference import (
+        calibrate_energy_alpha,
+    )
+
+    with pytest.raises(ValueError, match="min_q must be finite and positive"):
+        calibrate_energy_alpha(
+            reference_total=np.array([1.0]),
+            prediction_total=np.array([0.0]),
+            num_atoms=np.array([1.0]),
+            q=np.array([1.0]),
+            min_q=0.0,
+        )
