@@ -1,0 +1,33 @@
+﻿schema_version: 1
+
+model:
+  atomic_numbers: [1, 2, 3]
+  e0: [-1.0, -0.5, -0.25]
+
+validation:
+  targets: validation/targets.npz
+  matrix: validation/matrix.npz
+  members:
+    - validation/member_000.npz
+    - validation/member_001.npz
+    - validation/member_002.npz
+    - validation/member_003.npz
+    - validation/member_004.npz
+    - validation/member_005.npz
+    - validation/member_006.npz
+    - validation/member_007.npz
+
+test:
+  targets: test/targets.npz
+  matrix: test/matrix.npz
+  members:
+    - test/member_000.npz
+    - test/member_001.npz
+    - test/member_002.npz
+    - test/member_003.npz
+    - test/member_004.npz
+    - test/member_005.npz
+    - test/member_006.npz
+    - test/member_007.npz
+
+output_root: outputs/energy_reference/example

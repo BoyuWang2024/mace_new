@@ -36,3 +36,19 @@ python -m Uncertainty_Quantification.BootStrapping.scripts.build_release dist/ma
 ```
 
 发布包使用 allowlist，不包含 `internal_migration`、tests、outputs、模型、checkpoint 或数组结果。
+
+## MAD-r2SCAN E0 后处理实验
+
+`run_reference_experiments.py` 对已经生成的 validation/test member 预测执行两种 Energy 后处理，不改变原始 prediction 文件：
+
+- `direct_test_mad_e0`：直接从 test 的 `energy - atomization_energy` 恢复 MAD E0，属于 test-informed/oracle baseline，结果必须按此标记解释。
+- `model_aware_val_fit`：只使用 validation 标签和 8 个成员 validation 预测均值拟合组成线性 correction，再应用到 test，是 validation-only calibrated test 结果。
+
+两种方法都会生成独立校准参数、修正后的 8 成员 Energy、Energy 指标和 manifest；Force 结果只生成一套共享产物，MAD 不处理 Stress。远端配置示例见 `configs/mace_bootstrap_mad_e0.yaml`。配置中的 `targets.npz`、`matrix.npz` 和 8 个 member `.npz` 必须是已经审计过的 canonical artifacts：
+
+```bash
+PYTHONPATH=. python -m Uncertainty_Quantification.BootStrapping.scripts.run_reference_experiments \
+  --config Uncertainty_Quantification/BootStrapping/configs/mace_bootstrap_mad_e0.yaml
+```
+
+全量 validation/test 的过滤、推理和运行应在远端 `mace_new` 环境完成；本地仓库只提交代码、测试、配置和文档，`outputs` 继续被 Git 忽略。
