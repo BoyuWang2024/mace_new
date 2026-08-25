@@ -89,6 +89,7 @@ provenance 必须记录：
 correction_method          = model_aware_val_e0
 calibration_split          = val
 application_split          = test
+validation_decontamination = exclude_test_identity_overlap_from_val
 uses_test_reference_labels = false
 evaluation_role            = calibrated_test
 ```
@@ -122,7 +123,11 @@ Uncertainty_Quantification/FGE/postprocessing/e0_correction/
 - 元素计数矩阵与 shard 顺序；
 - reference 的 dtype、shape 和有限性；
 - 支持元素过滤后的闭包。
-- val/test 的 `configuration_id`；缺少稳定 ID 时使用来源中立的规范化结构指纹，确认两个 split 没有重复结构。
+- val/test 的 `configuration_id`；缺少稳定 ID 时使用不含能量、力或其他标签的来源中立结构指纹；
+- 在任何 val model forward 和最小二乘之前，用 test 的结构身份集合从 val 整结构排除跨 split 重复；test 结构、顺序与现有 raw prediction 保持不变；
+- 排除后分别确认 val/test split 内唯一且两个 split 无残留重复。当前已审计输入应从 val 排除 2 个跨 split 重复结构；数量不符视为输入漂移。
+
+该去重只读取结构 ID/几何身份，不读取 test energy、forces 或 atomization_energy，因此 uses_test_reference_labels = false 保持成立。公开结果 manifest 记录固定规则 exclude_test_identity_overlap_from_val 和排除数量，不记录具体 ID；具体 ID 仅进入远端非发布 integrity audit。
 
 结果 manifest 只记录逻辑数据集标签和必要校准摘要，不写旧仓库路径、绝对输入路径、输入内容哈希或旧来源身份。用于幂等检查的来源中立签名只包含方法/schema 版本、逻辑标签、member ID、observable、结构/原子范围、shape 和校准参数。
 
@@ -202,7 +207,7 @@ Uncertainty_Quantification/Plots/FGE/mad_r2scan_e0/
 - prediction shard、manifest、SHA、shape、dtype、结构映射或 finite 校验失败；
 - extxyz 缺少必需字段、结构/原子顺序不对齐或过滤闭包不一致；
 - 标准 extxyz reader 读到非零标签，但 corrected payload 的整套 energy reference 或 force reference 仍为全零；
-- MAD-r2SCAN val/test 存在重复 `configuration_id` 或规范化结构指纹，导致方法二 test 不再独立；
+- 任一 split 内存在重复结构、val 去重后仍有跨 split 重复，或已审计输入的 val 排除数量不是 2；
 - 方法一 test 缺少 `energy` 或 `atomization_energy`；
 - 任一 member 缺少所需元素 E0、head 不一致或 checkpoint 无法只读加载；
 - 方法二 val 缺少校准能量、test correction 不可识别，或误读 test 标签参与拟合；
@@ -232,7 +237,8 @@ Uncertainty_Quantification/Plots/FGE/mad_r2scan_e0/
 - corrected energy 改变而 force/mapping 不变；
 - equal-weight K-1 STD 与原有 validation-weighted 分支正确复算；
 - raw prediction/evaluation 文件哈希在后处理前后不变。
-- val/test 重复结构检测，以及 published manifest 与 internal integrity audit 的字段隔离。
+- val/test 重复结构检测、仅从 val 排除跨 split 重复、test 顺序不变、排除发生在 val forward 前，以及 published count 与 internal ID audit 的字段隔离；
+- 改变 test energy/forces/atomization_energy 后，val 排除集合、val prediction 和 Delta_E0 均不变。
 
 ### 8.2 远端小数据 CPU 闭环
 
