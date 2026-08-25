@@ -373,6 +373,12 @@ def test_legitimate_all_zero_test_labels_do_not_trigger_the_zero_guard() -> None
     [
         pytest.param("energy", _MISSING, id="missing-energy"),
         pytest.param("energy", np.array([1.0, 2.0]), id="energy-shape"),
+        pytest.param(
+            "energy", np.array([1.0]), id="energy-singleton-vector"
+        ),
+        pytest.param(
+            "energy", np.array([[1.0]]), id="energy-singleton-matrix"
+        ),
         pytest.param("energy", float("nan"), id="energy-nan"),
         pytest.param("forces", _MISSING, id="missing-forces"),
         pytest.param("forces", np.zeros((2, 3)), id="forces-shape"),
@@ -388,6 +394,16 @@ def test_legitimate_all_zero_test_labels_do_not_trigger_the_zero_guard() -> None
             "atomization_energy",
             np.array([-1.0, -2.0]),
             id="atomization-shape",
+        ),
+        pytest.param(
+            "atomization_energy",
+            np.array([-1.0]),
+            id="atomization-singleton-vector",
+        ),
+        pytest.param(
+            "atomization_energy",
+            np.array([[-1.0]]),
+            id="atomization-singleton-matrix",
         ),
         pytest.param(
             "atomization_energy", float("-inf"), id="atomization-inf"
@@ -473,6 +489,12 @@ def test_validation_labels_ignore_atomization_and_preserve_forward_structures(
     [
         pytest.param("energy", _MISSING, id="missing-energy"),
         pytest.param("energy", float("inf"), id="energy-inf"),
+        pytest.param(
+            "energy", np.array([1.0]), id="energy-singleton-vector"
+        ),
+        pytest.param(
+            "energy", np.array([[1.0]]), id="energy-singleton-matrix"
+        ),
         pytest.param("forces", _MISSING, id="missing-forces"),
         pytest.param("forces", np.zeros((2, 3)), id="forces-shape"),
         pytest.param(
@@ -729,6 +751,43 @@ def test_label_loaders_reject_duplicate_identity_within_each_split() -> None:
 def test_a_late_noncanonical_payload_hard_fails_during_full_consumption() -> None:
     _, records, shards = _alignment_case()
     shards[1][0]["energy_reference"] = shards[1][0]["energy_reference"].float()
+
+    with pytest.raises(HardFailure):
+        tuple(
+            iter_aligned_test_label_shards(
+                shards,
+                records,
+                atomic_numbers=ATOMIC_NUMBERS,
+                keys=LABEL_KEYS,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "observables-tuple",
+        "member-ids-tuple",
+        "wrong-schema",
+        "missing-field",
+        "extra-field",
+    ],
+)
+def test_raw_signature_must_exactly_match_canonical_builder_output(
+    mutation: str,
+) -> None:
+    _, records, shards = _alignment_case()
+    signature = shards[0][1]
+    if mutation == "observables-tuple":
+        signature["observables"] = ("energy", "forces")
+    elif mutation == "member-ids-tuple":
+        signature["member_ids"] = ("member_01", "member_02")
+    elif mutation == "wrong-schema":
+        signature["schema_version"] = "not-the-canonical-schema"
+    elif mutation == "missing-field":
+        del signature["batch_size"]
+    else:
+        signature["unexpected"] = None
 
     with pytest.raises(HardFailure):
         tuple(

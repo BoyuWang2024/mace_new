@@ -168,7 +168,7 @@ def _finite_float64(
         or not np.issubdtype(raw.dtype, np.number)
     ):
         _fail(f"{context} must be numeric")
-    if scalar and raw.size != 1:
+    if scalar and raw.shape != ():
         _fail(f"{context} must be scalar")
     if expected_shape is not None and raw.shape != expected_shape:
         _fail(f"{context} has invalid shape")
@@ -534,7 +534,7 @@ def _validated_signature(signature: Any) -> dict[str, object]:
     if signature.get("schema_version") != _SIGNATURE_SCHEMA:
         _fail("prediction shard signature has invalid schema")
     try:
-        return build_prediction_shard_signature(
+        canonical = build_prediction_shard_signature(
             dataset=signature["dataset"],
             observables=signature["observables"],
             member_ids=signature["member_ids"],
@@ -545,6 +545,9 @@ def _validated_signature(signature: Any) -> dict[str, object]:
             atom_stop=signature["atom_stop"],
             batch_size=signature["batch_size"],
         )
+        if dict(signature) != canonical:
+            _fail("prediction shard signature is not canonical")
+        return canonical
     except HardFailure:
         raise
     except Exception as exc:
