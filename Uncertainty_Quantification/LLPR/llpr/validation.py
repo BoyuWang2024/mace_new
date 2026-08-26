@@ -735,6 +735,7 @@ def _normalise_identities(identity: Mapping[str, Any]) -> dict[str, Any]:
         "data": data,
         "readout": identity.get("readout"),
         "config": config,
+        **({"energy_reference": identity["energy_reference"]} if "energy_reference" in identity else {}),
     }
 
 
@@ -1189,6 +1190,162 @@ def _validate_calibration_records(
                     f"trusted evaluation progress identity {record_source}.rows is invalid"
                 )
     return variants
+def _identity_lower_sha256(value: Any, source: str) -> str:
+    text = _identity_sha256(value, source)
+    if text != text.lower():
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    return text
+
+
+def _identity_sha_map(value: Any, keys: set[str], source: str) -> Mapping[str, str]:
+    mapping = _identity_mapping(value, keys, source)
+    for key in keys:
+        _identity_lower_sha256(mapping[key], f"{source}.{key}")
+    return mapping
+
+
+def _identity_finite_list(value: Any, source: str, *, length: int | None = None) -> list[float]:
+    if not isinstance(value, list) or (length is not None and len(value) != length):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    result: list[float] = []
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(f"trusted evaluation progress identity {source}[{index}] is invalid")
+        number = float(item)
+        if not math.isfinite(number):
+            raise ValueError(f"trusted evaluation progress identity {source}[{index}] is invalid")
+        result.append(number)
+    return result
+
+
+def _identity_positive_shape(value: Any, source: str, *, length: int) -> list[int]:
+    if not isinstance(value, list) or len(value) != length or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in value):
+        raise ValueError(f"trusted evaluation progress identity {source} is invalid")
+    return value
+
+
+def _energy_q_digest(root: Path, variant: str) -> str:
+    rows = _read_csv(root / variant / "energy.csv", ENERGY_FIELDS)
+    sequence = [[row["structure_id"], _integer(row, "num_atoms", f"{variant}/energy.csv"), _finite(row, "q", f"{variant}/energy.csv")] for row in rows]
+    return hashlib.sha256(_strict_json_bytes(sequence)).hexdigest()
+
+
+def _validate_effective_calibration_records(value: Any, raw_records: Mapping[str, Any], source: str) -> Mapping[str, Any]:
+    records = _identity_mapping(value, set(_VARIANTS), source)
+    for variant in _VARIANTS:
+        targets = _identity_mapping(records[variant], {"energy", "forces"}, f"{source}.{variant}")
+        raw_targets = _identity_mapping(raw_records[variant], {"energy", "forces"}, f"calibration.records.{variant}")
+        for target in ("energy", "forces"):
+            record_source = f"{source}.{variant}.{target}"
+            record = _identity_mapping(targets[target], {"ridge_mode", "ridge", "alpha", "rows"}, record_source)
+            raw_record = raw_targets[target]
+            if record["ridge_mode"] not in {"fixed", "condition_number"}:
+                raise ValueError(f"trusted evaluation progress identity {record_source}.ridge_mode is invalid")
+            _identity_number(record["ridge"], f"{record_source}.ridge", minimum=0.0)
+            _identity_number(record["alpha"], f"{record_source}.alpha", minimum=0.0, strict=True)
+            rows = record["rows"]
+            if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
+                raise ValueError(f"trusted evaluation progress identity {record_source}.rows is invalid")
+            if target == "forces" and _strict_json_bytes(record) != _strict_json_bytes(raw_record):
+                raise ValueError(f"trusted evaluation progress identity {record_source} force record mismatch")
+    return records
+
+
+def _validate_energy_reference_identity(value: Any, root: Path, trusted_identity: Mapping[str, Any], raw_records: Mapping[str, Any]) -> Mapping[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("trusted evaluation progress identity energy_reference is invalid")
+    method = value.get("method")
+    common_fields = {"method", "method_version", "raw_publication", "checkpoint_sha256", "test_dataset_sha256", "atomic_numbers", "chemical_symbols", "model_e0", "energy_q", "force_files", "label_usage", "method_details", "effective_calibration_records"}
+    if method == "model_aware_val_fit":
+        expected_fields = common_fields | {"validation_dataset_sha256"}
+    elif method == "direct_test_atomic_baseline":
+        expected_fields = common_fields
+    else:
+        raise ValueError("trusted evaluation progress identity energy_reference method is invalid")
+    if set(value) != expected_fields:
+        raise ValueError("trusted evaluation progress identity energy_reference schema mismatch")
+    if value["method_version"] != "1":
+        raise ValueError("trusted evaluation progress identity energy_reference method_version is invalid")
+    raw_publication = _identity_mapping(value["raw_publication"], {"progress_sha256", "files_sha256"}, "energy_reference.raw_publication")
+    _identity_lower_sha256(raw_publication["progress_sha256"], "energy_reference.raw_publication.progress_sha256")
+    canonical_keys = {f"{variant}/{filename}" for variant in _VARIANTS for filename in ("energy.csv", "force_components.csv", "force_structure.csv", "summary.json")}
+    _identity_sha_map(raw_publication["files_sha256"], canonical_keys, "energy_reference.raw_publication.files_sha256")
+    checkpoint_sha = _identity_lower_sha256(value["checkpoint_sha256"], "energy_reference.checkpoint_sha256")
+    if checkpoint_sha != trusted_identity["checkpoint"]["sha256"]:
+        raise ValueError("trusted evaluation progress identity energy_reference checkpoint mismatch")
+    test_sha = _identity_lower_sha256(value["test_dataset_sha256"], "energy_reference.test_dataset_sha256")
+    if test_sha != trusted_identity["test"]["sha256"]:
+        raise ValueError("trusted evaluation progress identity energy_reference test dataset mismatch")
+    if method == "model_aware_val_fit":
+        validation_sha = _identity_lower_sha256(value["validation_dataset_sha256"], "energy_reference.validation_dataset_sha256")
+        expected_validation_sha = trusted_identity["calibration"]["identity"]["calibration"]["sha256"]
+        if validation_sha != expected_validation_sha:
+            raise ValueError("trusted evaluation progress identity energy_reference validation dataset mismatch")
+    atomic_numbers = _identity_atomic_numbers(value["atomic_numbers"], "energy_reference.atomic_numbers")
+    symbols = value["chemical_symbols"]
+    if not isinstance(symbols, list) or len(symbols) != len(atomic_numbers) or any(not isinstance(symbol, str) or not symbol.strip() for symbol in symbols):
+        raise ValueError("trusted evaluation progress identity energy_reference.chemical_symbols is invalid")
+    model_e0 = _identity_finite_list(value["model_e0"], "energy_reference.model_e0", length=len(atomic_numbers))
+    energy_q = _identity_mapping(value["energy_q"], {"unchanged_from_raw", "raw_sha256", "derived_sha256"}, "energy_reference.energy_q")
+    if energy_q["unchanged_from_raw"] is not True:
+        raise ValueError("trusted evaluation progress identity energy_reference energy q must be unchanged")
+    q_keys = set(_VARIANTS)
+    raw_q = _identity_sha_map(energy_q["raw_sha256"], q_keys, "energy_reference.energy_q.raw_sha256")
+    derived_q = _identity_sha_map(energy_q["derived_sha256"], q_keys, "energy_reference.energy_q.derived_sha256")
+    if dict(raw_q) != dict(derived_q):
+        raise ValueError("trusted evaluation progress identity energy_reference energy q SHA mismatch")
+    for variant in _VARIANTS:
+        if derived_q[variant] != _energy_q_digest(root, variant):
+            raise ValueError(f"trusted evaluation progress identity energy_reference {variant} energy q digest mismatch")
+    force_keys = {f"{variant}/{filename}" for variant in _VARIANTS for filename in ("force_components.csv", "force_structure.csv")}
+    force_files = _identity_mapping(value["force_files"], {"unchanged_from_raw", "raw_sha256", "derived_sha256"}, "energy_reference.force_files")
+    if force_files["unchanged_from_raw"] is not True:
+        raise ValueError("trusted evaluation progress identity energy_reference force files must be unchanged")
+    raw_force = _identity_sha_map(force_files["raw_sha256"], force_keys, "energy_reference.force_files.raw_sha256")
+    derived_force = _identity_sha_map(force_files["derived_sha256"], force_keys, "energy_reference.force_files.derived_sha256")
+    if dict(raw_force) != dict(derived_force):
+        raise ValueError("trusted evaluation progress identity energy_reference force SHA mismatch")
+    for relative_path in force_keys:
+        if derived_force[relative_path] != sha256_file(root / relative_path):
+            raise ValueError(f"trusted evaluation progress identity energy_reference {relative_path} force SHA mismatch")
+    effective = _validate_effective_calibration_records(value["effective_calibration_records"], raw_records, "energy_reference.effective_calibration_records")
+    if method == "direct_test_atomic_baseline":
+        label_usage = _identity_mapping(value["label_usage"], {"evaluation_protocol", "alpha_calibration_split", "label_fields"}, "energy_reference.label_usage")
+        if label_usage != {"evaluation_protocol": "test_informed_oracle", "alpha_calibration_split": "test", "label_fields": ["energy", "atomization_energy"]}:
+            raise ValueError("trusted evaluation progress identity direct energy_reference label usage is invalid")
+        details = _identity_mapping(value["method_details"], {"baseline", "formula", "structure_count", "composition_shape"}, "energy_reference.method_details")
+        if details["baseline"] != "per_structure_mad_atomic_baseline" or details["formula"] != "raw_total - composition @ model_e0 + (reference_total - atomization_total)":
+            raise ValueError("trusted evaluation progress identity direct energy_reference baseline is invalid")
+        structure_count = details["structure_count"]
+        if isinstance(structure_count, bool) or not isinstance(structure_count, int) or structure_count <= 0:
+            raise ValueError("trusted evaluation progress identity direct energy_reference structure count is invalid")
+        shape = _identity_positive_shape(details["composition_shape"], "energy_reference.method_details.composition_shape", length=2)
+        if shape[0] != structure_count or shape[1] != len(atomic_numbers):
+            raise ValueError("trusted evaluation progress identity direct energy_reference composition shape is invalid")
+    else:
+        label_usage = _identity_mapping(value["label_usage"], {"fit_split", "alpha_calibration_split", "label_fields", "test_labels_used", "atomization_energy_used"}, "energy_reference.label_usage")
+        if label_usage != {"fit_split": "validation", "alpha_calibration_split": "validation", "label_fields": ["energy"], "test_labels_used": False, "atomization_energy_used": False}:
+            raise ValueError("trusted evaluation progress identity model-aware energy_reference label usage is invalid")
+        details = _identity_mapping(value["method_details"], {"solver", "objective", "application_sign", "rcond", "matrix_shape", "rank", "singular_values", "residual_norm", "delta_e0", "new_e0"}, "energy_reference.method_details")
+        if details["solver"] != "numpy.linalg.lstsq" or details["objective"] != "total_energy_least_squares" or details["application_sign"] != "positive" or details["rcond"] is not None:
+            raise ValueError("trusted evaluation progress identity model-aware energy_reference solver contract is invalid")
+        matrix_shape = _identity_positive_shape(details["matrix_shape"], "energy_reference.method_details.matrix_shape", length=2)
+        if matrix_shape[1] != len(atomic_numbers):
+            raise ValueError("trusted evaluation progress identity model-aware energy_reference matrix shape is invalid")
+        rank = details["rank"]
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0 or rank > min(matrix_shape):
+            raise ValueError("trusted evaluation progress identity model-aware energy_reference rank is invalid")
+        singular_values = _identity_finite_list(details["singular_values"], "energy_reference.method_details.singular_values", length=min(matrix_shape))
+        if any(number < 0.0 for number in singular_values):
+            raise ValueError("trusted evaluation progress identity model-aware energy_reference singular values are invalid")
+        _identity_number(details["residual_norm"], "energy_reference.method_details.residual_norm", minimum=0.0)
+        delta_e0 = _identity_finite_list(details["delta_e0"], "energy_reference.method_details.delta_e0", length=len(model_e0))
+        new_e0 = _identity_finite_list(details["new_e0"], "energy_reference.method_details.new_e0", length=len(model_e0))
+        if any(not _scale_aware_same(new, old + delta) for new, old, delta in zip(new_e0, model_e0, delta_e0)):
+            raise ValueError("trusted evaluation progress identity model-aware energy_reference new E0 mismatch")
+    return {"effective_calibration_records": effective}
 
 
 def _regular_file_snapshot(path: Path, source: str) -> bytes:
@@ -1314,7 +1471,7 @@ def _trusted_progress_identity(
     }
     if not required.issubset(identity):
         raise ValueError("trusted evaluation progress identity is missing required fields")
-    optional = {"consumer_limits", "zero_q"}
+    optional = {"consumer_limits", "zero_q", "energy_reference"}
     if not set(identity).issubset(required | optional):
         raise ValueError("trusted evaluation progress identity has unexpected fields")
     _validate_versions(identity, "root")
@@ -1359,6 +1516,7 @@ def _trusted_progress_identity(
     )
     test = _validate_dataset_identity(identity["test"], "test")
     ridge = _validate_ridge_identity(identity["ridge"], "ridge", selected=False)
+    _validate_energy_reference_identity(identity.get("energy_reference"), root, identity, calibration_records)
     min_q = _identity_number(
         identity["min_q"], "min_q", minimum=0.0, strict=True
     )
@@ -2015,6 +2173,9 @@ def _validate_publication_root_locked(
         progress,
     ) = _publication_identities(root, identity)
     calibration_records = trusted_identity["calibration"]["records"]
+    energy_reference = trusted_identity.get("energy_reference")
+    if isinstance(energy_reference, Mapping):
+        calibration_records = energy_reference["effective_calibration_records"]
     policy_bound = "zero_q" in trusted_identity
     consumer_limits = trusted_identity.get(
         "consumer_limits", trusted_identity["limits"]

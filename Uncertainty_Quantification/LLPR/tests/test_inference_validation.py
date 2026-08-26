@@ -50,15 +50,34 @@ from Uncertainty_Quantification.LLPR.llpr.inference import (
 from Uncertainty_Quantification.LLPR.llpr.observables import StructureJacobians
 from Uncertainty_Quantification.LLPR.llpr.readout import ReadoutLayout
 from Uncertainty_Quantification.LLPR.llpr.validation import validate_publication_root
+from Uncertainty_Quantification.LLPR.llpr.validation import _normalise_identities
 
 from Uncertainty_Quantification.LLPR.llpr.calibration_policy import (
     ZERO_Q_POLICY,
 )
+from Uncertainty_Quantification.LLPR.llpr.validation import _validate_energy_reference_identity
 
 _VARIANTS = ("he", "hf", "hef")
+
+
+def test_normalise_identities_preserves_optional_energy_reference_identity() -> None:
+    energy_reference = {"method": "direct_test_atomic_baseline"}
+    source = {
+        "checkpoint": {"sha256": "a" * 64},
+        "data": {"test": {"sha256": "b" * 64}},
+        "readout": {"size": 1},
+        "config": {"ridge": 1.0},
+        "energy_reference": energy_reference,
+    }
+
+    normalized = _normalise_identities(source)
+
+    assert normalized["energy_reference"] is energy_reference
+
 def _formal_output_bytes(evaluation_dir: Path) -> dict[str, bytes]:
     result = {}
     for variant in _VARIANTS:
+
         for filename in (
             "energy.csv",
             "force_components.csv",
@@ -68,7 +87,17 @@ def _formal_output_bytes(evaluation_dir: Path) -> dict[str, bytes]:
             path = evaluation_dir / variant / filename
             if path.exists():
                 result[f"{variant}/{filename}"] = path.read_bytes()
+
     return result
+
+def test_energy_reference_rejects_unknown_method() -> None:
+    with pytest.raises(ValueError, match="method"):
+        _validate_energy_reference_identity(
+            {"method": "direct_test_mad_e0"},
+            Path("."),
+            {},
+            {},
+        )
 def _replace_committed_csv(
     evaluation_dir: Path, relative_path: str, frame: pd.DataFrame
 ) -> None:
