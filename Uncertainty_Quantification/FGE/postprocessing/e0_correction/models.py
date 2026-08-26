@@ -123,7 +123,12 @@ def _require_int(value: Any, path: str, *, minimum: int = 0) -> int:
 def _require_finite_number(value: Any, path: str, *, minimum: float = 0.0) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         _fail(path, "must be a finite number")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError, TypeError) as exc:
+        raise HardFailure(
+            f"{path}: must be finite and >= {minimum}"
+        ) from exc
     if not math.isfinite(result) or result < minimum:
         _fail(path, f"must be finite and >= {minimum}")
     return result
@@ -275,7 +280,10 @@ class E0RunConfig:
 def _require_any_finite_number(value: Any, path: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         _fail(path, "must be a finite number")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError, TypeError) as exc:
+        raise HardFailure(f"{path}: must be a finite number") from exc
     if not math.isfinite(result):
         _fail(path, "must be a finite number")
     return result

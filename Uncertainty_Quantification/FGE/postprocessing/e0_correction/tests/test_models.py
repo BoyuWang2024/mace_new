@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import FrozenInstanceError
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
 
@@ -444,3 +445,28 @@ def test_direct_mad_baseline_summary_requires_finite_ordered_values(
 
     with pytest.raises(HardFailure):
         validate_correction_manifest(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("delta_e0", (10**10000, -0.2)),
+        ("condition_number", Fraction(10**10000, 1)),
+        ("residual_rmse", 10**10000),
+    ],
+    ids=("delta-e0", "condition-number", "residual-rmse"),
+)
+def test_calibration_fit_rejects_unrepresentable_numeric_values_as_hard_failure(
+    field: str, value: Any
+) -> None:
+    values: dict[str, Any] = {
+        "member_id": "member_01",
+        "atomic_numbers": (1, 8),
+        "delta_e0": (0.1, -0.2),
+        "rank": 2,
+        "residual_rmse": 0.05,
+        "condition_number": 3.0,
+    }
+    values[field] = value
+    with pytest.raises(HardFailure):
+        CalibrationFit(**values)
