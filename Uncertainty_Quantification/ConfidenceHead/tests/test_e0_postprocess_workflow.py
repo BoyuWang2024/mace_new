@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +12,11 @@ import pytest
 import torch
 from ase import Atoms
 
+from confidence_head.artifacts import (
+    atomic_json_dump,
+    atomic_torch_save,
+    load_torch_artifact,
+)
 from confidence_head.data import load_dataset
 from confidence_head.evaluation_artifacts import (
     EVALUATION_FORMULA_VERSION,
@@ -18,12 +25,18 @@ from confidence_head.evaluation_artifacts import (
 from confidence_head.identity import sha256_file
 from confidence_head.workflows.postprocess_e0 import (
     DerivedEvaluationPaths,
+    EnergyEvaluationSource,
+    EnergyInputs,
     E0WorkflowError,
+    TestMetadata as E0TestMetadata,
     collect_energy_inputs,
+    compute_e0_corrections,
     derive_energy_predictions,
     energy_metrics_payload,
     extract_model_e0,
     load_test_metadata,
+    publish_shared_inputs,
+    publish_e0_method,
     publish_derived_evaluation,
 )
 
@@ -270,4 +283,278 @@ def test_publish_derived_evaluation_is_idempotent_and_bound(tmp_path: Path) -> N
             method="e0_reestimate",
             head_key="energy_order1",
             input_hashes=hashes,
+        )
+
+
+def _energy_inputs(
+    structure_ids: tuple[str, ...],
+    composition: list[list[float]],
+    raw_total: list[float],
+    reference_total: list[float],
+) -> EnergyInputs:
+    matrix = np.asarray(composition, dtype=np.float64)
+    return EnergyInputs(
+        structure_ids=structure_ids,
+        structure_indices=np.arange(len(structure_ids), dtype=np.int64),
+        num_atoms=matrix.sum(axis=1).astype(np.int64),
+        composition=matrix,
+        raw_total=np.asarray(raw_total, dtype=np.float64),
+        reference_total=np.asarray(reference_total, dtype=np.float64),
+    )
+
+
+def _synthetic_e0_inputs() -> tuple[EnergyInputs, EnergyInputs, E0TestMetadata]:
+    validation = _energy_inputs(
+        ("val-h#0", "val-o#0", "val-ho#0"),
+        [[1, 0], [0, 1], [1, 1]],
+        [10.0, 20.0, 30.0],
+        [11.0, 18.0, 29.0],
+    )
+    test = _energy_inputs(
+        ("first#0", "second#0"),
+        [[2, 0], [0, 4]],
+        [5.0, 13.0],
+        [10.0, 21.0],
+    )
+    metadata = E0TestMetadata(
+        structure_ids=test.structure_ids,
+        source_indices=np.asarray([10, 12], dtype=np.int64),
+        formulas=("H2", "O4"),
+        atomization_total=np.asarray([7.0, 13.0], dtype=np.float64),
+    )
+    return validation, test, metadata
+
+
+def test_compute_e0_corrections_is_reconstructable_and_validation_only() -> None:
+    validation, test, metadata = _synthetic_e0_inputs()
+    model_e0 = np.asarray([2.0, 3.0], dtype=np.float64)
+
+    results = compute_e0_corrections(
+        validation=validation,
+        test=test,
+        metadata=metadata,
+        model_e0=model_e0,
+        supported_atomic_numbers=(1, 8),
+    )
+
+    assert tuple(results) == ("e0_replace", "e0_reestimate")
+    replacement = results["e0_replace"]
+    reestimated = results["e0_reestimate"]
+    replacement_payload = replacement.artifact
+    reestimated_payload = reestimated.artifact
+    np.testing.assert_allclose(
+        replacement.corrected_total,
+        test.raw_total
+        - replacement_payload["model_baseline"].numpy()
+        + replacement_payload["mad_baseline"].numpy(),
+    )
+    np.testing.assert_allclose(
+        reestimated.corrected_total,
+        test.raw_total
+        + test.composition @ reestimated_payload["delta_e0"].numpy(),
+    )
+    np.testing.assert_allclose(
+        reestimated_payload["new_e0"].numpy(),
+        model_e0 + reestimated_payload["delta_e0"].numpy(),
+    )
+
+    changed_test = replace(
+        test,
+        reference_total=test.reference_total + np.asarray([100.0, 200.0]),
+    )
+    changed = compute_e0_corrections(
+        validation=validation,
+        test=changed_test,
+        metadata=metadata,
+        model_e0=model_e0,
+        supported_atomic_numbers=(1, 8),
+    )
+    np.testing.assert_array_equal(
+        changed["e0_reestimate"].artifact["delta_e0"].numpy(),
+        reestimated_payload["delta_e0"].numpy(),
+    )
+    np.testing.assert_array_equal(
+        changed["e0_reestimate"].corrected_total,
+        reestimated.corrected_total,
+    )
+    assert not np.array_equal(
+        changed["e0_replace"].corrected_total,
+        replacement.corrected_total,
+    )
+
+
+def test_publish_shared_inputs_binds_data_checkpoint_cache_and_force(
+    tmp_path: Path,
+) -> None:
+    validation, test, metadata = _synthetic_e0_inputs()
+    inputs_root = tmp_path / "inputs"
+    inputs_root.mkdir()
+    input_files = {
+        name: inputs_root / name
+        for name in (
+            "e0_config.yaml",
+            "validation_config.yaml",
+            "test_config.yaml",
+            "validation_cache_manifest.json",
+            "test_cache_manifest.json",
+            "checkpoint.model",
+        )
+    }
+    for name, path in input_files.items():
+        path.write_text(name, encoding="utf-8")
+    force_predictions = inputs_root / "force_predictions.pt"
+    force_manifest = inputs_root / "force_manifest.json"
+    atomic_torch_save(force_predictions, _prediction())
+    atomic_json_dump(force_manifest, {"schema_version": 1})
+
+    first = publish_shared_inputs(
+        output_root=tmp_path / "outputs",
+        validation=validation,
+        test=test,
+        metadata=metadata,
+        supported_atomic_numbers=(1, 8),
+        model_e0=np.asarray([2.0, 3.0], dtype=np.float64),
+        input_files=input_files,
+        force_predictions_path=force_predictions,
+        force_manifest_path=force_manifest,
+    )
+    second = publish_shared_inputs(
+        output_root=tmp_path / "outputs",
+        validation=validation,
+        test=test,
+        metadata=metadata,
+        supported_atomic_numbers=(1, 8),
+        model_e0=np.asarray([2.0, 3.0], dtype=np.float64),
+        input_files=input_files,
+        force_predictions_path=force_predictions,
+        force_manifest_path=force_manifest,
+    )
+
+    assert first == second
+    payload = load_torch_artifact(first.inputs)
+    assert payload["validation"]["structure_ids"] == validation.structure_ids
+    assert payload["test"]["structure_ids"] == test.structure_ids
+    assert torch.equal(
+        payload["test"]["atomization_total"],
+        torch.tensor([7.0, 13.0], dtype=torch.float64),
+    )
+    force_reference = json.loads(first.force_manifest.read_text(encoding="utf-8"))
+    assert force_reference["source_sha256"]["predictions.pt"] == sha256_file(
+        force_predictions
+    )
+
+    input_files["e0_config.yaml"].write_text("changed", encoding="utf-8")
+    with pytest.raises(E0WorkflowError, match="identity differs"):
+        publish_shared_inputs(
+            output_root=tmp_path / "outputs",
+            validation=validation,
+            test=test,
+            metadata=metadata,
+            supported_atomic_numbers=(1, 8),
+            model_e0=np.asarray([2.0, 3.0], dtype=np.float64),
+            input_files=input_files,
+            force_predictions_path=force_predictions,
+            force_manifest_path=force_manifest,
+        )
+
+
+def _energy_sources(tmp_path: Path) -> dict[int, EnergyEvaluationSource]:
+    sources: dict[int, EnergyEvaluationSource] = {}
+    for order in range(1, 9):
+        prediction = _prediction()
+        identity = {
+            "run_id": f"{order:064x}",
+            "experiment_id": f"{order + 10:064x}",
+            "cache_id": f"{order + 20:064x}",
+            "binning_id": f"{order + 30:064x}",
+        }
+        prediction["identity"] = identity
+        root = tmp_path / "source" / f"order{order}"
+        predictions_path = root / "predictions.pt"
+        manifest_path = root / "evaluation_manifest.json"
+        root.mkdir(parents=True)
+        atomic_torch_save(predictions_path, prediction)
+        atomic_json_dump(manifest_path, {"schema_version": 1, "order": order})
+        sources[order] = EnergyEvaluationSource(
+            head_key=f"energy_order{order}",
+            predictions=prediction,
+            predictions_path=predictions_path,
+            manifest_path=manifest_path,
+            thresholds=torch.tensor([2.0, 4.0], dtype=torch.float64),
+            representatives=torch.tensor([1.0, 3.0, 5.0], dtype=torch.float64),
+        )
+    return sources
+
+
+def test_publish_e0_method_writes_release_artifacts_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    validation, test, metadata = _synthetic_e0_inputs()
+    result = compute_e0_corrections(
+        validation=validation,
+        test=test,
+        metadata=metadata,
+        model_e0=np.asarray([2.0, 3.0], dtype=np.float64),
+        supported_atomic_numbers=(1, 8),
+    )["e0_reestimate"]
+    sources = _energy_sources(tmp_path)
+    shared_inputs = tmp_path / "shared" / "shared_inputs.pt"
+    shared_manifest = tmp_path / "shared" / "manifest.json"
+    shared_inputs.parent.mkdir(parents=True)
+    atomic_torch_save(shared_inputs, {"schema_version": 1})
+    atomic_json_dump(shared_manifest, {"schema_version": 1})
+
+    first = publish_e0_method(
+        output_root=tmp_path / "outputs",
+        result=result,
+        test_inputs=test,
+        metadata=metadata,
+        energy_sources=sources,
+        shared_inputs_path=shared_inputs,
+        shared_manifest_path=shared_manifest,
+    )
+    second = publish_e0_method(
+        output_root=tmp_path / "outputs",
+        result=result,
+        test_inputs=test,
+        metadata=metadata,
+        energy_sources=sources,
+        shared_inputs_path=shared_inputs,
+        shared_manifest_path=shared_manifest,
+    )
+
+    root = tmp_path / "outputs" / "e0_reestimate"
+    assert first == second == root / "manifest.json"
+    assert (root / "correction.pt").is_file()
+    assert (root / "per_structure.csv").is_file()
+    assert (root / "summary_metrics.json").is_file()
+    assert (root / "summary_metrics.csv").is_file()
+    for order in range(1, 9):
+        derived_path = root / "energy" / f"order{order}" / "predictions.pt"
+        derived = load_torch_artifact(derived_path)
+        source_energy = sources[order].predictions["energy"]
+        assert torch.equal(derived["energy"]["logits"], source_energy["logits"])
+        assert torch.equal(
+            derived["energy"]["expected_errors"],
+            source_energy["expected_errors"],
+        )
+    with (root / "per_structure.csv").open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 2
+    assert "energy_order8_expected_error" in rows[0]
+    assert "energy_order8_label" in rows[0]
+    summary = json.loads((root / "summary_metrics.json").read_text(encoding="utf-8"))
+    assert summary["method"] == "e0_reestimate"
+    assert set(summary["orders"]) == {f"energy_order{o}" for o in range(1, 9)}
+
+    atomic_json_dump(shared_manifest, {"schema_version": 2})
+    with pytest.raises(E0WorkflowError, match="identity differs"):
+        publish_e0_method(
+            output_root=tmp_path / "outputs",
+            result=result,
+            test_inputs=test,
+            metadata=metadata,
+            energy_sources=sources,
+            shared_inputs_path=shared_inputs,
+            shared_manifest_path=shared_manifest,
         )
