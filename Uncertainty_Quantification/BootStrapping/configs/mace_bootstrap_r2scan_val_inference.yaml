@@ -1,0 +1,48 @@
+﻿schema_version: 1
+
+source:
+  run: ../outputs/mace_readout_B8_full
+  member_count: 8
+  parameter_mode: raw
+  stage: best
+
+datasets:
+  matpes_test:
+    kind: existing_result
+    source: ../../../data/dataset/matpes_test.extxyz
+    domains: [energy, forces, stress]
+    existing_split: test
+  mad_test:
+    kind: predict
+    source: ../outputs/completed_inference/mad_val_r2scan_filtered/input/mad-val-r2scan-supported.extxyz
+    domains: [energy, forces]
+  matpes_train:
+    kind: predict
+    source: ../../../data/dataset/matpes_train.extxyz
+    domains: [energy, forces, stress]
+
+prediction:
+  batch_size: 1
+  max_structures_per_chunk: 1024
+  max_atoms_per_chunk: 50000
+  device: cpu
+  precision: float64
+  num_workers: 0
+
+uncertainty:
+  ddof: 1
+  compute_std: true
+  compute_gmd: true
+  gmd_pairs: distinct_unordered
+
+plot:
+  output_root: ../../Plots/BootStrapping
+  dpi: 300
+  figure_size: [7.0, 7.0]
+  scatter_max_points: 20000
+  scatter_seed: 20260817
+  grid_size: 160
+  gaussian_sigma: 1.2
+  contour_masses: [0.5, 0.7, 0.85, 0.95, 0.99]
+
+
