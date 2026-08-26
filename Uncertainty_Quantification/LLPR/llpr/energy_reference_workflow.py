@@ -19,7 +19,7 @@ import yaml
 from ase.data import chemical_symbols
 from ase.io import iread
 
-from .artifacts import atomic_json_dump, atomic_torch_save, load_torch_artifact, sha256_file
+from .artifacts import atomic_json_dump, atomic_torch_save, canonical_json, load_torch_artifact, sha256_file
 from .calibration import CholeskyQuadraticForm
 from .checkpoint import LoadedCheckpoint, load_checkpoint
 from .config import LLPRConfig, load_config
@@ -229,6 +229,80 @@ def _records(identity: Mapping[str, Any]) -> Mapping[str, Any]:
     return value
 
 
+def _bind_validation_inputs(
+    *,
+    config: LLPRConfig,
+    raw_identity: Mapping[str, Any],
+    curvature: Any,
+    dataset: Any,
+) -> int:
+    raw_curvature = raw_identity.get("curvature")
+    if not isinstance(raw_curvature, Mapping):
+        raise ValueError("raw curvature identity is missing")
+    if curvature.sha256 != raw_curvature.get("sha256"):
+        raise ValueError("validation curvature SHA differs from raw publication")
+    if canonical_json(curvature.identity) != canonical_json(
+        raw_curvature.get("identity")
+    ):
+        raise ValueError("validation curvature identity differs from raw publication")
+
+    raw_calibration = raw_identity.get("calibration")
+    if not isinstance(raw_calibration, Mapping):
+        raise ValueError("raw calibration identity is missing")
+    calibration_identity = raw_calibration.get("identity")
+    if not isinstance(calibration_identity, Mapping):
+        raise ValueError("raw calibration source identity is missing")
+    actual_dataset = {
+        "sha256": dataset.sha256,
+        "identity": dataset.identity,
+        "size": dataset.size,
+        "atomic_numbers": list(dataset.atomic_numbers),
+        "r_max": dataset.r_max,
+        "head": dataset.head,
+    }
+    if canonical_json(actual_dataset) != canonical_json(
+        calibration_identity.get("calibration")
+    ):
+        raise ValueError(
+            "validation dataset identity differs from raw publication"
+        )
+
+    configured_limits = {
+        "max_structures": config.runtime.effective_consumer_max_structures,
+        "max_force_components_per_structure": (
+            config.runtime.effective_consumer_max_force_components_per_structure
+        ),
+    }
+    evaluation_limits = raw_identity.get(
+        "consumer_limits", raw_identity.get("limits")
+    )
+    calibration_limits = calibration_identity.get(
+        "consumer_limits", calibration_identity.get("limits")
+    )
+    if (
+        not isinstance(evaluation_limits, Mapping)
+        or not isinstance(calibration_limits, Mapping)
+        or dict(evaluation_limits) != configured_limits
+        or dict(calibration_limits) != configured_limits
+    ):
+        raise ValueError(
+            "validation consumer limits differ from raw publication"
+        )
+
+    count = int(dataset.size)
+    if configured_limits["max_structures"] is not None:
+        count = min(count, int(configured_limits["max_structures"]))
+    records = _records(raw_identity)
+    if any(
+        records[variant]["energy"].get("rows") != count
+        for variant in _VARIANTS
+    ):
+        raise ValueError(
+            "validation subset rows differ from raw calibration records"
+        )
+    return count
+
+
 def _collect_validation(config: LLPRConfig, context: ModelContext, raw_identity: Mapping[str, Any]) -> ValidationEnergyData:
     loaded = context.loaded
     requested_device = torch.device(config.runtime.device)
@@ -247,8 +321,10 @@ def _collect_validation(config: LLPRConfig, context: ModelContext, raw_identity:
         loaded.identity.r_max,
         loaded.identity.selected_head,
     )
+    count = _bind_validation_inputs(
+        config=config, raw_identity=raw_identity, curvature=curvature, dataset=dataset
+    )
     limit = config.runtime.effective_consumer_max_structures
-    count = dataset.size if limit is None else min(dataset.size, limit)
     metadata = _metadata(config.calibration.path, loaded.identity.atomic_numbers, count, False)
     predictions: list[float] = []
     q = {variant: [] for variant in _VARIANTS}
@@ -319,6 +395,39 @@ def _align(metadata: DatasetMetadata, rows: Mapping[str, Sequence[Mapping[str, s
     for variant in _VARIANTS:
         if not np.allclose(_float(rows[variant], "reference", variant), expected, rtol=1e-11, atol=1e-10):
             raise ValueError("test reference differs from raw publication")
+
+
+def _direct_result(
+    *,
+    rows: Sequence[Mapping[str, str]],
+    metadata: DatasetMetadata,
+    model_e0: np.ndarray,
+    min_q: float,
+) -> tuple[np.ndarray, float]:
+    if metadata.atomization_total is None:
+        raise ValueError("direct correction requires atomization_energy")
+    canonical_reference_per_atom = _float(
+        rows, "reference", "raw energy.csv"
+    )
+    canonical_reference_total = (
+        canonical_reference_per_atom * metadata.num_atoms
+    )
+    raw_total = _float(rows, "prediction", "raw energy.csv") * metadata.num_atoms
+    corrected = apply_direct_test_atomic_baseline(
+        raw_total=raw_total,
+        reference_total=canonical_reference_total,
+        atomization_total=metadata.atomization_total,
+        composition=metadata.composition,
+        model_e0=model_e0,
+    )
+    alpha = calibrate_energy_alpha(
+        reference_total=canonical_reference_per_atom,
+        prediction_total=corrected / metadata.num_atoms,
+        num_atoms=np.ones_like(metadata.num_atoms, dtype=np.float64),
+        q=_float(rows, "q", "raw energy.csv"),
+        min_q=min_q,
+    )
+    return corrected, alpha
 
 
 def _write_energy(path: Path, rows: Sequence[Mapping[str, str]], totals: np.ndarray, alpha: float) -> None:
@@ -494,19 +603,10 @@ def run_energy_reference_workflow(
         direct: dict[str, np.ndarray] = {}
         direct_alpha: dict[str, float] = {}
         for variant in _VARIANTS:
-            raw_total = _float(rows[variant], "prediction", variant) * test.num_atoms
-            direct[variant] = apply_direct_test_atomic_baseline(
-                raw_total=raw_total,
-                reference_total=test.reference_total,
-                atomization_total=test.atomization_total,
-                composition=test.composition,
+            direct[variant], direct_alpha[variant] = _direct_result(
+                rows=rows[variant],
+                metadata=test,
                 model_e0=context.model_e0,
-            )
-            direct_alpha[variant] = calibrate_energy_alpha(
-                reference_total=test.reference_total,
-                prediction_total=direct[variant],
-                num_atoms=test.num_atoms,
-                q=_float(rows[variant], "q", variant),
                 min_q=llpr.curvature.min_q,
             )
 
