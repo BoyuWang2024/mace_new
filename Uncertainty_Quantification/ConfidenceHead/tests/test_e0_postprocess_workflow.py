@@ -22,22 +22,27 @@ from confidence_head.evaluation_artifacts import (
     EVALUATION_FORMULA_VERSION,
     EVALUATION_SCHEMA_VERSION,
 )
+from confidence_head.external_config import E0PostprocessConfig
 from confidence_head.identity import sha256_file
+from confidence_head.workflows import postprocess_e0 as e0_workflow
 from confidence_head.workflows.postprocess_e0 import (
     DerivedEvaluationPaths,
     EnergyEvaluationSource,
     EnergyInputs,
     E0WorkflowError,
+    E0PostprocessOutputs,
     TestMetadata as E0TestMetadata,
     collect_energy_inputs,
     compute_e0_corrections,
     derive_energy_predictions,
     energy_metrics_payload,
     extract_model_e0,
+    isolate_validation_inputs,
     load_test_metadata,
     publish_shared_inputs,
     publish_e0_method,
     publish_derived_evaluation,
+    run_e0_postprocess,
 )
 
 
@@ -303,6 +308,54 @@ def _energy_inputs(
     )
 
 
+def test_isolate_validation_inputs_removes_test_content_duplicates() -> None:
+    validation = _energy_inputs(
+        ("shared#0", "h-only#0", "o-only#0", "shared#1"),
+        [[1, 1], [1, 0], [0, 1], [1, 1]],
+        [30.0, 10.0, 20.0, 31.0],
+        [29.0, 11.0, 18.0, 29.5],
+    )
+    test = _energy_inputs(
+        ("shared#0",),
+        [[1, 1]],
+        [5.0],
+        [6.0],
+    )
+
+    isolated = isolate_validation_inputs(validation, test)
+
+    assert isolated.inputs.structure_ids == ("h-only#0", "o-only#0")
+    np.testing.assert_array_equal(isolated.inputs.structure_indices, [0, 1])
+    np.testing.assert_array_equal(isolated.inputs.composition, [[1, 0], [0, 1]])
+    assert isolated.excluded_structure_ids == ("shared#0", "shared#1")
+    np.testing.assert_array_equal(isolated.excluded_structure_indices, [0, 3])
+
+    metadata = E0TestMetadata(
+        structure_ids=test.structure_ids,
+        source_indices=np.asarray([10], dtype=np.int64),
+        formulas=("HO",),
+        atomization_total=np.asarray([4.0], dtype=np.float64),
+    )
+    result = compute_e0_corrections(
+        validation=isolated.inputs,
+        test=test,
+        metadata=metadata,
+        model_e0=np.asarray([2.0, 3.0], dtype=np.float64),
+        supported_atomic_numbers=(1, 8),
+        excluded_validation_structure_ids=isolated.excluded_structure_ids,
+        excluded_validation_structure_indices=isolated.excluded_structure_indices,
+    )["e0_reestimate"]
+
+    assert result.artifact["excluded_validation_structure_ids"] == (
+        "shared#0",
+        "shared#1",
+    )
+    torch.testing.assert_close(
+        result.artifact["excluded_validation_structure_indices"],
+        torch.tensor([0, 3], dtype=torch.int64),
+    )
+
+
 def _synthetic_e0_inputs() -> tuple[EnergyInputs, EnergyInputs, E0TestMetadata]:
     validation = _energy_inputs(
         ("val-h#0", "val-o#0", "val-ho#0"),
@@ -558,3 +611,130 @@ def test_publish_e0_method_writes_release_artifacts_and_is_idempotent(
             shared_inputs_path=shared_inputs,
             shared_manifest_path=shared_manifest,
         )
+
+
+def _external_stub(
+    tmp_path: Path,
+    *,
+    name: str,
+    checkpoint: SimpleNamespace,
+) -> SimpleNamespace:
+    source_path = tmp_path / f"{name}.yaml"
+    source_path.write_text(name, encoding="utf-8")
+    return SimpleNamespace(
+        source_path=source_path,
+        dataset=SimpleNamespace(
+            name=name,
+            path=tmp_path / f"{name}.extxyz",
+            expected_sha256="a" * 64,
+            source_index_path=None,
+        ),
+        cache=SimpleNamespace(split="inference"),
+        runtime_device="cpu",
+        head_batch_size=2,
+        force_config=SimpleNamespace(checkpoint=checkpoint),
+        output_root=tmp_path / "external",
+    )
+
+
+def test_run_e0_postprocess_reuses_sources_and_publishes_both_methods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation, test, metadata = _synthetic_e0_inputs()
+    metadata = replace(
+        metadata,
+        atomization_total=np.asarray([6.0, 13.0], dtype=np.float64),
+    )
+    e0_config_path = tmp_path / "e0.yaml"
+    checkpoint_path = tmp_path / "checkpoint.model"
+    e0_config_path.write_text("e0", encoding="utf-8")
+    checkpoint_path.write_text("checkpoint", encoding="utf-8")
+    checkpoint = SimpleNamespace(path=checkpoint_path)
+    validation_config = _external_stub(
+        tmp_path, name="mad_r2scan_val", checkpoint=checkpoint
+    )
+    test_config = _external_stub(
+        tmp_path, name="mad_r2scan_test", checkpoint=checkpoint
+    )
+    config = E0PostprocessConfig(
+        source_path=e0_config_path,
+        validation=validation_config,
+        test=test_config,
+        output_root=tmp_path / "published",
+        plot_root=tmp_path / "plots",
+        methods=("e0_replace", "e0_reestimate"),
+        atomization_energy_key="atomization_energy",
+        build_missing_inputs=False,
+    )
+    validation_cache = SimpleNamespace(root=tmp_path / "validation-cache")
+    test_cache = SimpleNamespace(root=tmp_path / "test-cache")
+    for cache in (validation_cache, test_cache):
+        cache.root.mkdir()
+        (cache.root / "cache_manifest.json").write_text(
+            cache.root.name, encoding="utf-8"
+        )
+    caches = {
+        "mad_r2scan_val": validation_cache,
+        "mad_r2scan_test": test_cache,
+    }
+    def fake_load_external_cache(
+        external, *, build_missing_inputs: bool
+    ):
+        assert build_missing_inputs is False
+        return caches[external.dataset.name]
+
+    monkeypatch.setattr(
+        e0_workflow,
+        "_load_external_cache",
+        fake_load_external_cache,
+    )
+    model = SimpleNamespace(
+        heads=("Default",),
+        atomic_energies_fn=SimpleNamespace(
+            atomic_energies=torch.tensor([[2.0, 3.0]], dtype=torch.float64)
+        ),
+    )
+    monkeypatch.setattr(
+        e0_workflow,
+        "load_frozen_backbone",
+        lambda checkpoint, device: SimpleNamespace(
+            model=model,
+            identity=SimpleNamespace(
+                atomic_numbers=(1, 8), selected_head="Default"
+            ),
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        e0_workflow,
+        "collect_energy_inputs",
+        lambda cache, **kwargs: validation if cache is validation_cache else test,
+    )
+    monkeypatch.setattr(e0_workflow, "load_test_metadata", lambda **kwargs: metadata)
+    force_predictions = tmp_path / "force" / "predictions.pt"
+    force_manifest = tmp_path / "force" / "evaluation_manifest.json"
+    force_predictions.parent.mkdir()
+    atomic_torch_save(force_predictions, _prediction())
+    atomic_json_dump(force_manifest, {"schema_version": 1})
+    monkeypatch.setattr(
+        e0_workflow,
+        "_load_test_evaluations",
+        lambda **kwargs: SimpleNamespace(
+            force_context=None,
+            force_predictions=_prediction(),
+            force_predictions_path=force_predictions,
+            force_manifest_path=force_manifest,
+            energy_sources=_energy_sources(tmp_path),
+        ),
+        raising=False,
+    )
+
+    outputs = run_e0_postprocess(config, plot=False)
+
+    assert isinstance(outputs, E0PostprocessOutputs)
+    assert outputs.shared_manifest == config.output_root / "shared" / "manifest.json"
+    assert tuple(outputs.method_manifests) == config.methods
+    assert outputs.plot_manifests == {}
+    for method in config.methods:
+        assert outputs.method_manifests[method].is_file()

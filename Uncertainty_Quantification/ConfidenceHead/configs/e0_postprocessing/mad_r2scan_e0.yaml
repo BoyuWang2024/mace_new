@@ -1,0 +1,10 @@
+schema_version: 1
+validation_config: ../external_inference/mad_r2scan_val_e0.yaml
+test_config: ../external_inference/mad_r2scan_test_e0.yaml
+output_root: /home/bywang/code/UQ/mace_new/Uncertainty_Quantification/ConfidenceHead/outputs/e0_postprocessing/mad_r2scan
+plot_root: /home/bywang/code/UQ/mace_new/Uncertainty_Quantification/Plots/ConfidenceHead/mad_r2scan_e0
+methods:
+  - e0_replace
+  - e0_reestimate
+atomization_energy_key: atomization_energy
+build_missing_inputs: true

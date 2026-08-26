@@ -1,0 +1,19 @@
+schema_version: 1
+dataset:
+  name: mad_val_r2scan
+  path: /home/bywang/code/UQ/mace_new/data/dataset/mad-val-r2scan-compatible.xyz
+  expected_sha256: 4f4d4807592d75cfedda4a157850d60fc1428e44762e8debf37c012a4fc060aa
+  expected_structures: 16098
+  expected_atoms: 310432
+  source_index_path: /home/bywang/code/UQ/mace_new/data/dataset/mad-val-r2scan-source-index.csv
+production_config_dir: ..
+output_root: /home/bywang/code/UQ/mace_new/Uncertainty_Quantification/ConfidenceHead/outputs/external
+plot_root: /home/bywang/code/UQ/mace_new/Uncertainty_Quantification/Plots/ConfidenceHead
+cache:
+  split: inference
+  build_batch_size: 1
+  shard_max_atoms: 100000
+  resume: true
+runtime:
+  device: cuda
+  head_batch_size: 32

@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 
 import matplotlib
 import numpy as np
@@ -44,6 +45,9 @@ from matplotlib import pyplot as plt
 
 class DensitySuiteError(RuntimeError):
     """Existing evaluation inputs cannot produce a complete density suite."""
+
+
+_SAFE_DATASET = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 
 
 def density_plot_stems() -> dict[str, str]:
@@ -182,6 +186,8 @@ def _publish_suite(
     energy_metrics: dict[int, DensityMetrics] = {}
     sources: dict[str, str] = {}
     for key, stem in density_plot_stems().items():
+        if key not in loaded:
+            continue
         _, predictions, manifest = loaded[key]
         order = None if key == "force" else int(key.removeprefix("energy_order"))
         branch = "force" if key == "force" else "energy"
@@ -197,16 +203,74 @@ def _publish_suite(
         sources[key] = sha256_file(manifest)
         if order is not None:
             energy_metrics[order] = metrics
-    png, pdf = _correlation_plot(energy_metrics, root)
-    publish_artifact_set(
-        root,
-        {
-            "energy_orders_correlation.csv": _correlation_csv(energy_metrics),
-            "energy_orders_correlation.png": png,
-            "energy_orders_correlation.pdf": pdf,
-        },
-    )
+    if energy_metrics:
+        if set(energy_metrics) != set(range(1, 9)):
+            raise DensitySuiteError("density energy order set differs")
+        png, pdf = _correlation_plot(energy_metrics, root)
+        publish_artifact_set(
+            root,
+            {
+                "energy_orders_correlation.csv": _correlation_csv(energy_metrics),
+                "energy_orders_correlation.png": png,
+                "energy_orders_correlation.pdf": pdf,
+            },
+        )
     return write_plot_manifest(root, dataset=dataset, source_manifests=sources)
+
+
+def publish_density_suite_from_predictions(
+    *,
+    dataset: str,
+    plot_root: Path,
+    loaded: Mapping[str, tuple[Any, Mapping[str, Any], Path]],
+    repo_root: Path,
+) -> Path:
+    """Publish one complete force, energy, or combined verified density group."""
+    if type(dataset) is not str or _SAFE_DATASET.fullmatch(dataset) is None:
+        raise DensitySuiteError("density dataset name is invalid")
+    if not isinstance(loaded, Mapping):
+        raise DensitySuiteError("density predictions must be a mapping")
+    force_keys = frozenset({"force"})
+    energy_keys = frozenset(
+        f"energy_order{order}" for order in range(1, 9)
+    )
+    keys = frozenset(loaded)
+    if keys not in {force_keys, energy_keys, force_keys | energy_keys}:
+        raise DensitySuiteError("density prediction key set differs")
+    normalized: dict[str, tuple[Any, dict[str, Any], Path]] = {}
+    for key in density_plot_stems():
+        if key not in loaded:
+            continue
+        entry = loaded[key]
+        if type(entry) is not tuple or len(entry) != 3:
+            raise DensitySuiteError(f"density prediction entry differs: {key}")
+        context, raw_predictions, raw_manifest = entry
+        manifest = Path(raw_manifest)
+        if not manifest.is_file():
+            raise DensitySuiteError(f"density source manifest is missing: {key}")
+        if not isinstance(raw_predictions, Mapping):
+            raise DensitySuiteError(f"density prediction payload differs: {key}")
+        identity = raw_predictions.get("identity")
+        if not isinstance(identity, Mapping):
+            raise DensitySuiteError(f"density prediction identity differs: {key}")
+        try:
+            predictions = validate_prediction_payload(
+                dict(raw_predictions), expected_identity=dict(identity)
+            )
+        except Exception as error:
+            raise DensitySuiteError(
+                f"density prediction payload is invalid for {key}: {error}"
+            ) from error
+        expected_branch = "force" if key == "force" else "energy"
+        if tuple(predictions["enabled_branches"]) != (expected_branch,):
+            raise DensitySuiteError(f"density prediction branch differs: {key}")
+        normalized[key] = (context, predictions, manifest)
+    return _publish_suite(
+        dataset=dataset,
+        plot_root=Path(plot_root),
+        loaded=normalized,
+        repo_root=Path(repo_root),
+    )
 
 
 def run_external_density_suite(config: ExternalInferenceConfig, repo_root: Path) -> Path:

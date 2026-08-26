@@ -16,8 +16,9 @@ import numpy as np
 import torch
 
 from ..artifacts import atomic_json_dump, atomic_torch_save, load_torch_artifact
+from ..backbone import load_frozen_backbone
 from ..binning import labels_from_thresholds
-from ..cache import CacheManifest, iter_cache_batches
+from ..cache import CacheManifest, iter_cache_batches, load_complete_cache
 from ..data import load_dataset
 from ..e0_corrections import (
     apply_e0_reestimate,
@@ -29,10 +30,24 @@ from ..e0_corrections import (
 from ..evaluation_artifacts import (
     EVALUATION_FORMULA_VERSION,
     EVALUATION_SCHEMA_VERSION,
+    validate_or_reuse_evaluation,
     validate_prediction_payload,
 )
+from ..external_config import E0PostprocessConfig, ExternalInferenceConfig
 from ..identity import sha256_file, stable_id
 from ..metrics import branch_metrics, validate_metric_payload
+from .build_cache import REPOSITORY_ROOT
+from .build_external_cache import (
+    external_cache_id,
+    external_cache_root,
+    run_build_external_cache,
+)
+from .evaluate import evaluation_input_hashes, load_evaluation_inputs
+from .evaluate_external import (
+    _paths as external_evaluation_paths,
+    resolve_head_config,
+    run_evaluate_external,
+)
 
 
 E0_FORMULA_VERSION = "confidence_head_e0_postprocess_v1"
@@ -75,6 +90,15 @@ class EnergyInputs:
 
 
 @dataclass(frozen=True)
+class ValidationIsolation:
+    """Validation calibration rows after removing test content overlap."""
+
+    inputs: EnergyInputs
+    excluded_structure_ids: tuple[str, ...]
+    excluded_structure_indices: np.ndarray
+
+
+@dataclass(frozen=True)
 class TestMetadata:
     """Test-only metadata not persisted in the feature cache."""
 
@@ -103,6 +127,37 @@ class E0MethodResult:
     method: str
     corrected_total: np.ndarray
     artifact: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class E0PostprocessOutputs:
+    """Published manifests for one complete two-method E0 experiment."""
+
+    shared_manifest: Path
+    method_manifests: dict[str, Path]
+    plot_manifests: dict[str, Path]
+
+
+@dataclass(frozen=True)
+class _TestEvaluationSources:
+    force_context: Any
+    force_predictions: dict[str, Any]
+    force_predictions_path: Path
+    force_manifest_path: Path
+    energy_sources: dict[int, EnergyEvaluationSource]
+
+
+@dataclass(frozen=True)
+class _PreparedE0Sources:
+    validation: EnergyInputs
+    test: EnergyInputs
+    metadata: TestMetadata
+    supported_atomic_numbers: tuple[int, ...]
+    model_e0: np.ndarray
+    input_files: dict[str, Path]
+    evaluations: _TestEvaluationSources
+    excluded_validation_structure_ids: tuple[str, ...]
+    excluded_validation_structure_indices: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -212,6 +267,72 @@ def collect_energy_inputs(
         ),
         raw_total=raw,
         reference_total=reference,
+    )
+
+
+def _sample_content_id(sample_id: str) -> str:
+    if not isinstance(sample_id, str):
+        raise E0WorkflowError("sample structure ID must be a string")
+    content_id, marker, occurrence = sample_id.rpartition("#")
+    if marker != "#" or not content_id or not occurrence.isdigit():
+        raise E0WorkflowError("sample structure ID format differs")
+    return content_id
+
+
+def isolate_validation_inputs(
+    validation: EnergyInputs, test: EnergyInputs
+) -> ValidationIsolation:
+    """Remove validation structures whose content also appears in test."""
+    _energy_inputs_payload(validation, "validation before isolation")
+    _energy_inputs_payload(test, "test before isolation")
+    test_content = {
+        _sample_content_id(sample_id) for sample_id in test.structure_ids
+    }
+    keep = np.asarray(
+        [
+            _sample_content_id(sample_id) not in test_content
+            for sample_id in validation.structure_ids
+        ],
+        dtype=bool,
+    )
+    excluded = ~keep
+    if not bool(np.any(excluded)):
+        return ValidationIsolation(
+            inputs=validation,
+            excluded_structure_ids=(),
+            excluded_structure_indices=np.empty(0, dtype=np.int64),
+        )
+    if not bool(np.any(keep)):
+        raise E0WorkflowError(
+            "validation/test overlap removes every calibration structure"
+        )
+    isolated = EnergyInputs(
+        structure_ids=tuple(
+            sample_id
+            for sample_id, retained in zip(validation.structure_ids, keep)
+            if retained
+        ),
+        structure_indices=np.arange(int(np.sum(keep)), dtype=np.int64),
+        num_atoms=np.asarray(validation.num_atoms, dtype=np.int64)[keep].copy(),
+        composition=np.asarray(validation.composition, dtype=np.float64)[
+            keep
+        ].copy(),
+        raw_total=np.asarray(validation.raw_total, dtype=np.float64)[keep].copy(),
+        reference_total=np.asarray(
+            validation.reference_total, dtype=np.float64
+        )[keep].copy(),
+    )
+    _energy_inputs_payload(isolated, "validation after isolation")
+    return ValidationIsolation(
+        inputs=isolated,
+        excluded_structure_ids=tuple(
+            sample_id
+            for sample_id, removed in zip(validation.structure_ids, excluded)
+            if removed
+        ),
+        excluded_structure_indices=np.asarray(
+            validation.structure_indices, dtype=np.int64
+        )[excluded].copy(),
     )
 
 
@@ -582,6 +703,14 @@ def _aligned_inputs(
         raise E0WorkflowError("test composition columns differ")
     if test.structure_ids != metadata.structure_ids:
         raise E0WorkflowError("test metadata structure IDs differ")
+    validation_content = {
+        _sample_content_id(sample_id) for sample_id in validation.structure_ids
+    }
+    test_content = {
+        _sample_content_id(sample_id) for sample_id in test.structure_ids
+    }
+    if validation_content & test_content:
+        raise E0WorkflowError("validation and test content overlap")
     return supported
 
 
@@ -592,10 +721,25 @@ def compute_e0_corrections(
     metadata: TestMetadata,
     model_e0: Sequence[float] | np.ndarray,
     supported_atomic_numbers: Sequence[int],
+    excluded_validation_structure_ids: Sequence[str] = (),
+    excluded_validation_structure_indices: Sequence[int] = (),
 ) -> dict[str, E0MethodResult]:
     """Compute both corrections while fitting reestimate on validation only."""
     supported = _aligned_inputs(validation, test, metadata, supported_atomic_numbers)
     checkpoint_e0 = np.asarray(model_e0, dtype=np.float64)
+    excluded_ids = tuple(excluded_validation_structure_ids)
+    excluded_indices = np.asarray(
+        excluded_validation_structure_indices, dtype=np.int64
+    )
+    if (
+        excluded_indices.ndim != 1
+        or excluded_indices.shape != (len(excluded_ids),)
+        or any(not isinstance(sample_id, str) for sample_id in excluded_ids)
+        or len(set(excluded_ids)) != len(excluded_ids)
+        or np.any(excluded_indices < 0)
+        or len(set(excluded_indices.tolist())) != len(excluded_ids)
+    ):
+        raise E0WorkflowError("excluded validation structures are invalid")
     try:
         replacement = apply_e0_replace(
             raw_total=test.raw_total,
@@ -640,6 +784,10 @@ def compute_e0_corrections(
         "fit_split": "validation",
         "fit_weighting": "unweighted_total_energy_ols",
         "validation_structure_count": len(validation.structure_ids),
+        "excluded_validation_structure_ids": excluded_ids,
+        "excluded_validation_structure_indices": torch.from_numpy(
+            excluded_indices.copy()
+        ),
         "delta_e0": _tensor(fit.delta_e0),
         "new_e0": _tensor(checkpoint_e0 + fit.delta_e0),
         "rank": fit.rank,
@@ -1226,12 +1374,325 @@ def publish_e0_method(
     )
 
 
+def _load_external_cache(
+    config: ExternalInferenceConfig,
+    *,
+    build_missing_inputs: bool,
+) -> CacheManifest:
+    if build_missing_inputs:
+        run_build_external_cache(config)
+    cache = load_complete_cache(
+        external_cache_root(config),
+        expected_cache_id=external_cache_id(config),
+    )
+    if set(cache.splits) != {config.cache.split}:
+        raise E0WorkflowError("external cache split set differs")
+    shards = cache.splits[config.cache.split]
+    structures = sum(shard.num_structures for shard in shards)
+    atoms = sum(shard.num_atoms for shard in shards)
+    if (
+        structures != config.dataset.expected_structures
+        or atoms != config.dataset.expected_atoms
+    ):
+        raise E0WorkflowError("external cache counts differ from configuration")
+    return cache
+
+
+def _load_external_evaluation(
+    *,
+    config: ExternalInferenceConfig,
+    cache: CacheManifest,
+    head_key: str,
+    test_inputs: EnergyInputs,
+) -> tuple[Any, dict[str, Any], Path, Path]:
+    training = resolve_head_config(config, head_key)
+    inputs = load_evaluation_inputs(training)
+    paths = external_evaluation_paths(config, head_key)
+    hashes = evaluation_input_hashes(inputs)
+    hashes["cache_manifest.json"] = sha256_file(
+        cache.root / "cache_manifest.json"
+    )
+    if not validate_or_reuse_evaluation(paths, inputs.identity, hashes):
+        raise E0WorkflowError(f"test evaluation is missing: {head_key}")
+    predictions = validate_prediction_payload(
+        load_torch_artifact(paths.predictions),
+        expected_identity=inputs.identity,
+    )
+    expected_branch = "force" if head_key == "force" else "energy"
+    if tuple(predictions["enabled_branches"]) != (expected_branch,):
+        raise E0WorkflowError(f"test evaluation branch differs: {head_key}")
+    if tuple(predictions["structure_ids"]) != test_inputs.structure_ids:
+        raise E0WorkflowError(
+            f"test evaluation structure IDs differ: {head_key}"
+        )
+    offsets = np.concatenate(
+        (
+            np.zeros(1, dtype=np.int64),
+            np.cumsum(test_inputs.num_atoms, dtype=np.int64),
+        )
+    )
+    if not torch.equal(
+        predictions["structure_offsets"], torch.from_numpy(offsets)
+    ):
+        raise E0WorkflowError(
+            f"test evaluation structure offsets differ: {head_key}"
+        )
+    return inputs, predictions, paths.predictions, paths.manifest
+
+
+def _load_test_evaluations(
+    *,
+    config: ExternalInferenceConfig,
+    cache: CacheManifest,
+    test_inputs: EnergyInputs,
+    build_missing_inputs: bool,
+) -> _TestEvaluationSources:
+    keys = ("force", *(f"energy_order{order}" for order in range(1, 9)))
+    if build_missing_inputs:
+        for key in keys:
+            run_evaluate_external(config, key)
+    force_context, force_predictions, force_path, force_manifest = (
+        _load_external_evaluation(
+            config=config,
+            cache=cache,
+            head_key="force",
+            test_inputs=test_inputs,
+        )
+    )
+    energy_sources: dict[int, EnergyEvaluationSource] = {}
+    for order in range(1, 9):
+        head_key = f"energy_order{order}"
+        inputs, predictions, predictions_path, manifest_path = (
+            _load_external_evaluation(
+                config=config,
+                cache=cache,
+                head_key=head_key,
+                test_inputs=test_inputs,
+            )
+        )
+        if set(inputs.binning.branches) != {"energy"}:
+            raise E0WorkflowError(
+                f"energy binning branches differ: {head_key}"
+            )
+        binning = inputs.binning.branches["energy"]
+        energy_sources[order] = EnergyEvaluationSource(
+            head_key=head_key,
+            predictions=predictions,
+            predictions_path=predictions_path,
+            manifest_path=manifest_path,
+            thresholds=binning.thresholds.detach().cpu().to(torch.float64),
+            representatives=binning.representatives.detach().cpu().to(
+                torch.float64
+            ),
+        )
+    return _TestEvaluationSources(
+        force_context=force_context,
+        force_predictions=force_predictions,
+        force_predictions_path=force_path,
+        force_manifest_path=force_manifest,
+        energy_sources=energy_sources,
+    )
+
+
+def _prepare_e0_sources(config: E0PostprocessConfig) -> _PreparedE0Sources:
+    validation_cache = _load_external_cache(
+        config.validation,
+        build_missing_inputs=config.build_missing_inputs,
+    )
+    test_cache = _load_external_cache(
+        config.test,
+        build_missing_inputs=config.build_missing_inputs,
+    )
+    loaded = load_frozen_backbone(
+        config.test.force_config.checkpoint,
+        device="cpu",
+    )
+    supported = tuple(loaded.identity.atomic_numbers)
+    raw_validation = collect_energy_inputs(
+        validation_cache,
+        split=config.validation.cache.split,
+        batch_size=config.validation.head_batch_size,
+        supported_atomic_numbers=supported,
+    )
+    test = collect_energy_inputs(
+        test_cache,
+        split=config.test.cache.split,
+        batch_size=config.test.head_batch_size,
+        supported_atomic_numbers=supported,
+    )
+    validation = isolate_validation_inputs(raw_validation, test)
+    metadata = load_test_metadata(
+        path=config.test.dataset.path,
+        expected_sha256=config.test.dataset.expected_sha256,
+        supported_atomic_numbers=supported,
+        expected_structure_ids=test.structure_ids,
+        atomization_energy_key=config.atomization_energy_key,
+        source_index_path=config.test.dataset.source_index_path,
+    )
+    model_e0 = extract_model_e0(
+        loaded.model,
+        atomic_numbers=supported,
+        selected_head=loaded.identity.selected_head,
+    )
+    evaluations = _load_test_evaluations(
+        config=config.test,
+        cache=test_cache,
+        test_inputs=test,
+        build_missing_inputs=config.build_missing_inputs,
+    )
+    return _PreparedE0Sources(
+        validation=validation.inputs,
+        test=test,
+        metadata=metadata,
+        supported_atomic_numbers=supported,
+        model_e0=model_e0,
+        input_files={
+            "e0_config.yaml": config.source_path,
+            "validation_config.yaml": config.validation.source_path,
+            "test_config.yaml": config.test.source_path,
+            "validation_cache_manifest.json": (
+                validation_cache.root / "cache_manifest.json"
+            ),
+            "test_cache_manifest.json": (
+                test_cache.root / "cache_manifest.json"
+            ),
+            "checkpoint.model": config.test.force_config.checkpoint.path,
+        },
+        evaluations=evaluations,
+        excluded_validation_structure_ids=validation.excluded_structure_ids,
+        excluded_validation_structure_indices=(
+            validation.excluded_structure_indices
+        ),
+    )
+
+
+def _derived_density_sources(
+    *,
+    output_root: Path,
+    method: str,
+    energy_sources: Mapping[int, EnergyEvaluationSource],
+) -> dict[str, tuple[EnergyEvaluationSource, dict[str, Any], Path]]:
+    loaded: dict[
+        str, tuple[EnergyEvaluationSource, dict[str, Any], Path]
+    ] = {}
+    for order in range(1, 9):
+        source = energy_sources[order]
+        paths = DerivedEvaluationPaths.from_root(
+            Path(output_root) / method / "energy" / f"order{order}"
+        )
+        if not all(path.is_file() for path in paths.outputs):
+            raise E0WorkflowError(
+                f"derived energy evaluation is missing: {method}/order{order}"
+            )
+        identity = dict(source.predictions["identity"])
+        predictions = validate_prediction_payload(
+            load_torch_artifact(paths.predictions),
+            expected_identity=identity,
+        )
+        loaded[f"energy_order{order}"] = (
+            source,
+            predictions,
+            paths.manifest,
+        )
+    return loaded
+
+
+def run_e0_postprocess(
+    config: E0PostprocessConfig,
+    *,
+    plot: bool = False,
+) -> E0PostprocessOutputs:
+    """Reuse committed inference to publish both E0 methods and optional plots."""
+    if not isinstance(config, E0PostprocessConfig):
+        raise TypeError("config must be an E0PostprocessConfig")
+    if type(plot) is not bool:
+        raise TypeError("plot must be a boolean")
+    if tuple(config.methods) != ("e0_replace", "e0_reestimate"):
+        raise E0WorkflowError("E0 method order differs")
+    prepared = _prepare_e0_sources(config)
+    shared = publish_shared_inputs(
+        output_root=config.output_root,
+        validation=prepared.validation,
+        test=prepared.test,
+        metadata=prepared.metadata,
+        supported_atomic_numbers=prepared.supported_atomic_numbers,
+        model_e0=prepared.model_e0,
+        input_files=prepared.input_files,
+        force_predictions_path=prepared.evaluations.force_predictions_path,
+        force_manifest_path=prepared.evaluations.force_manifest_path,
+    )
+    corrections = compute_e0_corrections(
+        validation=prepared.validation,
+        test=prepared.test,
+        metadata=prepared.metadata,
+        model_e0=prepared.model_e0,
+        supported_atomic_numbers=prepared.supported_atomic_numbers,
+        excluded_validation_structure_ids=(
+            prepared.excluded_validation_structure_ids
+        ),
+        excluded_validation_structure_indices=(
+            prepared.excluded_validation_structure_indices
+        ),
+    )
+    if tuple(corrections) != tuple(config.methods):
+        raise E0WorkflowError("computed E0 method order differs")
+    method_manifests: dict[str, Path] = {}
+    for method in config.methods:
+        method_manifests[method] = publish_e0_method(
+            output_root=config.output_root,
+            result=corrections[method],
+            test_inputs=prepared.test,
+            metadata=prepared.metadata,
+            energy_sources=prepared.evaluations.energy_sources,
+            shared_inputs_path=shared.inputs,
+            shared_manifest_path=shared.manifest,
+        )
+    plot_manifests: dict[str, Path] = {}
+    if plot:
+        from .plot_density_suite import (
+            publish_density_suite_from_predictions,
+        )
+
+        plot_manifests["force"] = publish_density_suite_from_predictions(
+            dataset="force",
+            plot_root=config.plot_root,
+            loaded={
+                "force": (
+                    prepared.evaluations.force_context,
+                    prepared.evaluations.force_predictions,
+                    prepared.evaluations.force_manifest_path,
+                )
+            },
+            repo_root=REPOSITORY_ROOT,
+        )
+        for method in config.methods:
+            plot_manifests[method] = (
+                publish_density_suite_from_predictions(
+                    dataset=method,
+                    plot_root=config.plot_root,
+                    loaded=_derived_density_sources(
+                        output_root=config.output_root,
+                        method=method,
+                        energy_sources=prepared.evaluations.energy_sources,
+                    ),
+                    repo_root=REPOSITORY_ROOT,
+                )
+            )
+    return E0PostprocessOutputs(
+        shared_manifest=shared.manifest,
+        method_manifests=method_manifests,
+        plot_manifests=plot_manifests,
+    )
+
+
 __all__ = [
     "DerivedEvaluationPaths",
     "E0MethodResult",
+    "E0PostprocessOutputs",
     "E0WorkflowError",
     "EnergyEvaluationSource",
     "EnergyInputs",
+    "ValidationIsolation",
     "SharedArtifactPaths",
     "TestMetadata",
     "collect_energy_inputs",
@@ -1239,8 +1700,10 @@ __all__ = [
     "derive_energy_predictions",
     "energy_metrics_payload",
     "extract_model_e0",
+    "isolate_validation_inputs",
     "load_test_metadata",
     "publish_e0_method",
     "publish_derived_evaluation",
     "publish_shared_inputs",
+    "run_e0_postprocess",
 ]
