@@ -314,7 +314,8 @@ def _align(metadata: DatasetMetadata, rows: Mapping[str, Sequence[Mapping[str, s
     first = rows["he"]
     if metadata.structure_ids != tuple(row["structure_id"] for row in first) or not np.array_equal(metadata.num_atoms, np.asarray([int(row["num_atoms"]) for row in first])):
         raise ValueError("test structure_id/num_atoms differs from raw publication")
-    expected = metadata.reference_total / metadata.num_atoms
+    # AtomicData constructs reference labels in float32 before model-dtype conversion.
+    expected = metadata.reference_total.astype(np.float32).astype(np.float64) / metadata.num_atoms
     for variant in _VARIANTS:
         if not np.allclose(_float(rows[variant], "reference", variant), expected, rtol=1e-11, atol=1e-10):
             raise ValueError("test reference differs from raw publication")
