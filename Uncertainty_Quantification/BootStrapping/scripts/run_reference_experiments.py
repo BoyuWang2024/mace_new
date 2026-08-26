@@ -10,6 +10,7 @@ import numpy as np
 import yaml
 
 from ..bootstrap.dataset_compatibility import filter_supported_structures, extract_targets
+from ..bootstrap.energy_reference import count_matrix
 from ..bootstrap.errors import HardFailure
 from ..bootstrap.reference_experiments import run_reference_experiments
 from ._cli import run_cli
@@ -29,7 +30,7 @@ def _load_config(path: Path) -> dict[str, Any]:
         raise HardFailure(f"could not load reference config {path}: {error}") from error
     if not isinstance(document, dict) or document.get("schema_version") != 1:
         raise HardFailure("reference config schema_version must be 1")
-    required = {"model", "validation", "test", "output_root"}
+    required = {"schema_version", "model", "validation", "test", "output_root"}
     if set(document) != required:
         raise HardFailure(f"reference config keys must be {sorted(required)}")
     return document
@@ -43,20 +44,53 @@ def _load_npz(path: Path) -> dict[str, np.ndarray]:
         raise HardFailure(f"could not load array artifact {path}: {error}") from error
 
 
-def _section(document: dict[str, Any], name: str, base: Path) -> dict[str, Any]:
+def _section(
+    document: dict[str, Any],
+    name: str,
+    base: Path,
+    supported_atomic_numbers: list[int] | None = None,
+) -> dict[str, Any]:
     value = document[name]
     if not isinstance(value, dict):
         raise HardFailure(f"{name} must be a mapping")
-    required = {"targets", "matrix", "members"}
-    if set(value) != required:
-        raise HardFailure(f"{name} keys must be {sorted(required)}")
-    members = value["members"]
-    if not isinstance(members, list) or len(members) != 8 or not all(isinstance(item, str) for item in members):
-        raise HardFailure(f"{name}.members must contain exactly 8 paths")
+    canonical = {"targets", "matrix", "members"}
+    completed = {"dataset", "inference"}
+    if set(value) == canonical:
+        members = value["members"]
+        if not isinstance(members, list) or len(members) != 8 or not all(
+            isinstance(item, str) for item in members
+        ):
+            raise HardFailure(f"{name}.members must contain exactly 8 paths")
+        return {
+            "targets": _path(value["targets"], base, f"{name}.targets"),
+            "matrix": _path(value["matrix"], base, f"{name}.matrix"),
+            "members": [_path(item, base, f"{name}.members") for item in members],
+        }
+    if set(value) != completed:
+        raise HardFailure(f"{name} keys must be {sorted(canonical)} or {sorted(completed)}")
+    if supported_atomic_numbers is None:
+        raise HardFailure(f"{name} completed mode requires model atomic_numbers")
+
+    compatibility = filter_supported_structures(
+        _path(value["dataset"], base, f"{name}.dataset"),
+        supported_atomic_numbers,
+    )
+    if compatibility.retained_count != compatibility.source_count:
+        raise HardFailure(
+            f"{name} retained_count {compatibility.retained_count} != source_count "
+            f"{compatibility.source_count}; completed inference alignment is invalid"
+        )
+    structures = compatibility.structures
+    targets = extract_targets(structures, require_atomization=True)
+    matrix = count_matrix(
+        [np.asarray(atoms.numbers, dtype=int) for atoms in structures],
+        supported_atomic_numbers,
+    )
+    inference = _path(value["inference"], base, f"{name}.inference")
     return {
-        "targets": _path(value["targets"], base, f"{name}.targets"),
-        "matrix": _path(value["matrix"], base, f"{name}.matrix"),
-        "members": [_path(item, base, f"{name}.members") for item in members],
+        "targets": targets,
+        "matrix": matrix,
+        "members": [inference / f"member_{index:03d}.npz" for index in range(8)],
     }
 
 
@@ -80,18 +114,31 @@ def _run(config_path: Path) -> Path:
     e0 = np.asarray(model["e0"], dtype=float)
     if not isinstance(atomic_numbers, list) or len(atomic_numbers) != e0.size:
         raise HardFailure("model atomic_numbers and e0 lengths differ")
-    validation = _section(document, "validation", base)
-    test = _section(document, "test", base)
-    validation_targets = _load_npz(validation["targets"])
-    test_targets = _load_npz(test["targets"])
+    supported_atomic_numbers = [int(value) for value in atomic_numbers]
+    validation = _section(document, "validation", base, supported_atomic_numbers)
+    test = _section(document, "test", base, supported_atomic_numbers)
+    validation_targets = (
+        validation["targets"]
+        if isinstance(validation["targets"], dict)
+        else _load_npz(validation["targets"])
+    )
+    test_targets = (
+        test["targets"] if isinstance(test["targets"], dict) else _load_npz(test["targets"])
+    )
     output = run_reference_experiments(
         test_members=test["members"],
         test_targets=test_targets,
         validation_members=validation["members"],
         validation_targets=validation_targets,
-        test_matrix=_load_matrix(test["matrix"]),
-        validation_matrix=_load_matrix(validation["matrix"]),
-        model_atomic_numbers=[int(value) for value in atomic_numbers],
+        test_matrix=(
+            test["matrix"] if isinstance(test["matrix"], np.ndarray) else _load_matrix(test["matrix"])
+        ),
+        validation_matrix=(
+            validation["matrix"]
+            if isinstance(validation["matrix"], np.ndarray)
+            else _load_matrix(validation["matrix"])
+        ),
+        model_atomic_numbers=supported_atomic_numbers,
         model_e0=e0,
         output_root=_path(document["output_root"], base, "output_root"),
         metadata={"config_path": str(config_path.resolve())},
