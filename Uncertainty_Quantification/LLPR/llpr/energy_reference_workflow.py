@@ -231,6 +231,8 @@ def _records(identity: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _collect_validation(config: LLPRConfig, context: ModelContext, raw_identity: Mapping[str, Any]) -> ValidationEnergyData:
     loaded = context.loaded
+    requested_device = torch.device(config.runtime.device)
+    loaded.model.to(requested_device)
     layout = discover_readout_layout(loaded.model, expected_size=config.expected_readout_size)
     curvature = load_curvature_source(config, loaded.identity, layout)
     records = _records(raw_identity)
@@ -250,7 +252,7 @@ def _collect_validation(config: LLPRConfig, context: ModelContext, raw_identity:
     metadata = _metadata(config.calibration.path, loaded.identity.atomic_numbers, count, False)
     predictions: list[float] = []
     q = {variant: [] for variant in _VARIANTS}
-    for index, sample in enumerate(iter_samples(dataset, torch.device("cpu"), loaded.identity.dtype, max_structures=limit)):
+    for index, sample in enumerate(iter_samples(dataset, requested_device, loaded.identity.dtype, max_structures=limit)):
         if (sample.structure_id, sample.num_atoms) != (metadata.structure_ids[index], int(metadata.num_atoms[index])):
             raise ValueError("validation sample order differs from metadata")
         jacobian = compute_energy_jacobian(loaded.model, sample.batch, layout)

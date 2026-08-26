@@ -5,7 +5,7 @@
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
-  echo "usage: $0 {calibrate|evaluate|validate|plot} CONFIG" >&2
+  echo "usage: $0 {calibrate|evaluate|validate|plot|e0-postprocess} CONFIG" >&2
   exit 64
 fi
 
@@ -13,7 +13,7 @@ stage="$1"
 config="$2"
 
 case "$stage" in
-  calibrate|evaluate|validate|plot) ;;
+  calibrate|evaluate|validate|plot|e0-postprocess) ;;
   *)
     echo "unsupported stage: $stage" >&2
     exit 64

@@ -1,0 +1,6 @@
+llpr_config: gpu_mad_r2scan_shared_curvature_smoke.yaml
+source_publication_root: ../outputs/smoke_mad_r2scan_test_val_alpha/8f147ecffa1d/evaluation/deterministic
+output: ../outputs/e0_correction/smoke_mad_r2scan_20260826
+methods:
+  - direct_test_atomic_baseline
+  - model_aware_val_fit
