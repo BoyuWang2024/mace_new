@@ -1,0 +1,8 @@
+publication_root: ../outputs/e0_correction/smoke_mad_r2scan_20260826/direct_test_atomic_baseline
+output_dir: ../outputs/e0_correction/smoke_mad_r2scan_20260826/plots/direct_test_atomic_baseline
+selected:
+  - [he, energy]
+  - [hf, forces]
+  - [hef, energy]
+  - [hef, forces]
+style: carnet_density

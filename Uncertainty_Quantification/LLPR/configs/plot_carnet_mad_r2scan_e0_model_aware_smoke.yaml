@@ -1,0 +1,8 @@
+publication_root: ../outputs/e0_correction/smoke_mad_r2scan_20260826/model_aware_val_fit
+output_dir: ../outputs/e0_correction/smoke_mad_r2scan_20260826/plots/model_aware_val_fit
+selected:
+  - [he, energy]
+  - [hf, forces]
+  - [hef, energy]
+  - [hef, forces]
+style: carnet_density
