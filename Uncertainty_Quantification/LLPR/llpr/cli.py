@@ -15,6 +15,7 @@ from .curvature import run_build
 from .inference import run_evaluate
 from .plotting import run_plot
 from .validation import run_validate
+from .energy_reference_workflow import load_e0_config, run_energy_reference_workflow
 
 
 _COMPUTING_STAGES = ("build", "calibrate", "evaluate", "validate")
@@ -87,7 +88,7 @@ def _parser() -> argparse.ArgumentParser:
         description="MACE LLPR deterministic workflow",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in (*_COMPUTING_STAGES, "plot", "run"):
+    for command in (*_COMPUTING_STAGES, "plot", "run", "e0-postprocess"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--config", required=True, type=Path)
     return parser
@@ -110,7 +111,9 @@ def _run_computing_stage(command: str, config_path: Path) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments and dispatch one requested workflow operation."""
     arguments = _parser().parse_args(argv)
-    if arguments.command == "plot":
+    if arguments.command == "e0-postprocess":
+        run_energy_reference_workflow(load_e0_config(arguments.config))
+    elif arguments.command == "plot":
         config = _load_plot_config(arguments.config)
         run_plot(
             config.publication_root,
