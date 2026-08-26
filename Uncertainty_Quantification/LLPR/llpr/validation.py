@@ -16,6 +16,7 @@ from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Any, Iterator, Mapping, Sequence
 
 import torch
+from ase.data import chemical_symbols
 
 from .artifacts import (
     FORMULA_VERSION,
@@ -1246,6 +1247,13 @@ def _validate_effective_calibration_records(value: Any, raw_records: Mapping[str
             rows = record["rows"]
             if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
                 raise ValueError(f"trusted evaluation progress identity {record_source}.rows is invalid")
+            if target == "energy" and (
+                record["ridge_mode"] != raw_record["ridge_mode"]
+                or record["ridge"] != raw_record["ridge"]
+            ):
+                raise ValueError(
+                    f"trusted evaluation progress identity {record_source} energy ridge mismatch"
+                )
             if target == "forces" and _strict_json_bytes(record) != _strict_json_bytes(raw_record):
                 raise ValueError(f"trusted evaluation progress identity {record_source} force record mismatch")
     return records
@@ -1284,9 +1292,24 @@ def _validate_energy_reference_identity(value: Any, root: Path, trusted_identity
         if validation_sha != expected_validation_sha:
             raise ValueError("trusted evaluation progress identity energy_reference validation dataset mismatch")
     atomic_numbers = _identity_atomic_numbers(value["atomic_numbers"], "energy_reference.atomic_numbers")
+    checkpoint_atomic_numbers = trusted_identity["checkpoint"]["atomic_numbers"]
+    if atomic_numbers != checkpoint_atomic_numbers:
+        raise ValueError(
+            "trusted evaluation progress identity energy_reference atomic numbers mismatch"
+        )
     symbols = value["chemical_symbols"]
     if not isinstance(symbols, list) or len(symbols) != len(atomic_numbers) or any(not isinstance(symbol, str) or not symbol.strip() for symbol in symbols):
         raise ValueError("trusted evaluation progress identity energy_reference.chemical_symbols is invalid")
+    try:
+        expected_symbols = [chemical_symbols[number] for number in atomic_numbers]
+    except IndexError as error:
+        raise ValueError(
+            "trusted evaluation progress identity energy_reference.atomic_numbers is invalid"
+        ) from error
+    if symbols != expected_symbols:
+        raise ValueError(
+            "trusted evaluation progress identity energy_reference chemical_symbols mismatch"
+        )
     model_e0 = _identity_finite_list(value["model_e0"], "energy_reference.model_e0", length=len(atomic_numbers))
     energy_q = _identity_mapping(value["energy_q"], {"unchanged_from_raw", "raw_sha256", "derived_sha256"}, "energy_reference.energy_q")
     if energy_q["unchanged_from_raw"] is not True:
@@ -1345,6 +1368,16 @@ def _validate_energy_reference_identity(value: Any, root: Path, trusted_identity
         new_e0 = _identity_finite_list(details["new_e0"], "energy_reference.method_details.new_e0", length=len(model_e0))
         if any(not _scale_aware_same(new, old + delta) for new, old, delta in zip(new_e0, model_e0, delta_e0)):
             raise ValueError("trusted evaluation progress identity model-aware energy_reference new E0 mismatch")
+    expected_energy_rows = (
+        details["structure_count"]
+        if method == "direct_test_atomic_baseline"
+        else details["matrix_shape"][0]
+    )
+    for variant in _VARIANTS:
+        if effective[variant]["energy"]["rows"] != expected_energy_rows:
+            raise ValueError(
+                f"trusted evaluation progress identity energy_reference.effective_calibration_records.{variant}.energy rows mismatch"
+            )
     return {"effective_calibration_records": effective}
 
 

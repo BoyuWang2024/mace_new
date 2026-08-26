@@ -1596,6 +1596,220 @@ def _evaluated_publication_root(
     return run_evaluate(config)
 
 
+def _energy_reference_validation_fixture(
+    root: Path, method: str
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    trusted_identity = load_torch_artifact(root / "progress.pt")["identity"]
+    alphas = {
+        "he": {"energy": 2.0, "forces": 3.0},
+        "hf": {"energy": 4.0, "forces": 5.0},
+        "hef": {"energy": 6.0, "forces": 7.0},
+    }
+    raw_records: dict[str, object] = {}
+    effective_records: dict[str, object] = {}
+    q_digests: dict[str, str] = {}
+    for variant in _VARIANTS:
+        raw_energy = {
+            "ridge_mode": "fixed",
+            "ridge": 1.0,
+            "alpha": alphas[variant]["energy"],
+            "rows": 2,
+        }
+        raw_forces = {
+            "ridge_mode": "fixed",
+            "ridge": 1.0,
+            "alpha": alphas[variant]["forces"],
+            "rows": 4,
+        }
+        raw_records[variant] = {
+            "energy": raw_energy,
+            "forces": raw_forces,
+        }
+        effective_records[variant] = {
+            "energy": {**raw_energy, "alpha": 8.0, "rows": 2},
+            "forces": dict(raw_forces),
+        }
+        with (root / variant / "energy.csv").open(
+            encoding="utf-8", newline=""
+        ) as handle:
+            sequence = [
+                [row["structure_id"], int(row["num_atoms"]), float(row["q"])]
+                for row in csv.DictReader(handle)
+            ]
+        q_digests[variant] = hashlib.sha256(
+            json.dumps(
+                sequence,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    canonical_files = {
+        f"{variant}/{filename}": sha256_file(root / variant / filename)
+        for variant in _VARIANTS
+        for filename in (
+            "energy.csv",
+            "force_components.csv",
+            "force_structure.csv",
+            "summary.json",
+        )
+    }
+    force_hashes = {
+        relative_path: digest
+        for relative_path, digest in canonical_files.items()
+        if relative_path.endswith(
+            ("/force_components.csv", "/force_structure.csv")
+        )
+    }
+    energy_reference: dict[str, object] = {
+        "method": method,
+        "method_version": "1",
+        "raw_publication": {
+            "progress_sha256": sha256_file(root / "progress.pt"),
+            "files_sha256": canonical_files,
+        },
+        "checkpoint_sha256": trusted_identity["checkpoint"]["sha256"],
+        "test_dataset_sha256": trusted_identity["test"]["sha256"],
+        "atomic_numbers": [1],
+        "chemical_symbols": ["H"],
+        "model_e0": [0.0],
+        "energy_q": {
+            "unchanged_from_raw": True,
+            "raw_sha256": q_digests,
+            "derived_sha256": dict(q_digests),
+        },
+        "force_files": {
+            "unchanged_from_raw": True,
+            "raw_sha256": force_hashes,
+            "derived_sha256": dict(force_hashes),
+        },
+        "effective_calibration_records": effective_records,
+    }
+    if method == "direct_test_atomic_baseline":
+        energy_reference.update(
+            {
+                "label_usage": {
+                    "evaluation_protocol": "test_informed_oracle",
+                    "alpha_calibration_split": "test",
+                    "label_fields": ["energy", "atomization_energy"],
+                },
+                "method_details": {
+                    "baseline": "per_structure_mad_atomic_baseline",
+                    "formula": "raw_total - composition @ model_e0 + (reference_total - atomization_total)",
+                    "structure_count": 2,
+                    "composition_shape": [2, 1],
+                },
+            }
+        )
+    else:
+        energy_reference.update(
+            {
+                "validation_dataset_sha256": trusted_identity["calibration"][
+                    "identity"
+                ]["calibration"]["sha256"],
+                "label_usage": {
+                    "fit_split": "validation",
+                    "alpha_calibration_split": "validation",
+                    "label_fields": ["energy"],
+                    "test_labels_used": False,
+                    "atomization_energy_used": False,
+                },
+                "method_details": {
+                    "solver": "numpy.linalg.lstsq",
+                    "objective": "total_energy_least_squares",
+                    "application_sign": "positive",
+                    "rcond": None,
+                    "matrix_shape": [2, 1],
+                    "rank": 1,
+                    "singular_values": [1.0],
+                    "residual_norm": 0.0,
+                    "delta_e0": [0.0],
+                    "new_e0": [0.0],
+                },
+            }
+        )
+    return energy_reference, trusted_identity, raw_records
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("ridge_mode", "condition_number"), ("ridge", 2.0)],
+)
+def test_energy_reference_rejects_derived_energy_ridge_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    identity, trusted_identity, raw_records = _energy_reference_validation_fixture(
+        root, "direct_test_atomic_baseline"
+    )
+    identity["effective_calibration_records"]["he"]["energy"][field] = value
+
+    with pytest.raises(ValueError, match="energy ridge mismatch"):
+        _validate_energy_reference_identity(
+            identity, root, trusted_identity, raw_records
+        )
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_rows"),
+    [("direct_test_atomic_baseline", 2), ("model_aware_val_fit", 2)],
+)
+def test_energy_reference_rejects_energy_rows_inconsistent_with_method_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    expected_rows: int,
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    identity, trusted_identity, raw_records = _energy_reference_validation_fixture(
+        root, method
+    )
+    identity["effective_calibration_records"]["he"]["energy"]["rows"] = (
+        expected_rows + 1
+    )
+
+    with pytest.raises(ValueError, match="energy rows mismatch"):
+        _validate_energy_reference_identity(
+            identity, root, trusted_identity, raw_records
+        )
+
+
+def test_energy_reference_rejects_atomic_numbers_different_from_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    identity, trusted_identity, raw_records = _energy_reference_validation_fixture(
+        root, "direct_test_atomic_baseline"
+    )
+    identity["atomic_numbers"] = [2]
+    identity["chemical_symbols"] = ["He"]
+
+    with pytest.raises(ValueError, match="atomic numbers mismatch"):
+        _validate_energy_reference_identity(
+            identity, root, trusted_identity, raw_records
+        )
+
+
+def test_energy_reference_rejects_non_ase_chemical_symbols(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _evaluated_publication_root(tmp_path, monkeypatch)
+    identity, trusted_identity, raw_records = _energy_reference_validation_fixture(
+        root, "direct_test_atomic_baseline"
+    )
+    identity["chemical_symbols"] = ["He"]
+
+    with pytest.raises(ValueError, match="chemical_symbols mismatch"):
+        _validate_energy_reference_identity(
+            identity, root, trusted_identity, raw_records
+        )
+
+
 def _make_variant_predictions_distinct(root: Path) -> None:
     """Keep shared observations while making every variant's predictions valid."""
     for variant_index, variant in enumerate(_VARIANTS, start=1):
